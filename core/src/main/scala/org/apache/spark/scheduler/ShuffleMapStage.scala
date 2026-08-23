@@ -81,6 +81,12 @@ private[spark] class ShuffleMapStage(
    */
   private[this] val pipelinedCompletedPartitions = new HashSet[Int]
 
+  private[this] var _recovered = false
+
+  private[scheduler] def markRecovered(): Unit = _recovered = true
+
+  private[scheduler] def isRecovered: Boolean = _recovered
+
   /** Record a successful map task's partition as completed (pipelined stages only). */
   private[scheduler] def addPipelinedCompletedPartition(partitionId: Int): Unit = {
     pipelinedCompletedPartitions += partitionId

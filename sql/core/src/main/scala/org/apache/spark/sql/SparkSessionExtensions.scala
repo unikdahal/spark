@@ -30,6 +30,7 @@ import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.classic.Strategy
 import org.apache.spark.sql.execution.{ColumnarRule, SparkPlan}
+import org.apache.spark.sql.execution.adaptive.ShuffleStageRecovery
 
 /**
  * :: Experimental ::
@@ -52,6 +53,7 @@ import org.apache.spark.sql.execution.{ColumnarRule, SparkPlan}
  * <li>Adaptive Query Stage Preparation Rules.</li>
  * <li>Adaptive Query Execution Runtime Optimizer Rules.</li>
  * <li>Adaptive Query Stage Optimizer Rules.</li>
+ * <li>Completed Shuffle Stage Recovery.</li>
  * </ul>
  *
  * The extensions can be used by calling `withExtensions` on the [[SparkSession.Builder]], for
@@ -117,6 +119,7 @@ class SparkSessionExtensions {
   type QueryPostPlannerStrategyBuilder = SparkSession => Rule[SparkPlan]
   type QueryStagePrepRuleBuilder = SparkSession => Rule[SparkPlan]
   type QueryStageOptimizerRuleBuilder = SparkSession => Rule[SparkPlan]
+  type ShuffleStageRecoveryBuilder = SparkSession => ShuffleStageRecovery
 
   private[this] val columnarRuleBuilders = mutable.Buffer.empty[ColumnarRuleBuilder]
   private[this] val queryPostPlannerStrategyRuleBuilders =
@@ -125,6 +128,7 @@ class SparkSessionExtensions {
   private[this] val runtimeOptimizerRules = mutable.Buffer.empty[RuleBuilder]
   private[this] val queryStageOptimizerRuleBuilders =
     mutable.Buffer.empty[QueryStageOptimizerRuleBuilder]
+  private[this] val shuffleStageRecoveryBuilders = mutable.Buffer.empty[ShuffleStageRecoveryBuilder]
 
   /**
    * Build the override rules for columnar execution.
@@ -160,6 +164,14 @@ class SparkSessionExtensions {
    */
   private[sql] def buildQueryStageOptimizerRules(session: SparkSession): Seq[Rule[SparkPlan]] = {
     queryStageOptimizerRuleBuilders.map(_.apply(session)).toSeq
+  }
+
+  private[sql] def buildShuffleStageRecovery(
+      session: SparkSession): Option[ShuffleStageRecovery] = {
+    require(
+      shuffleStageRecoveryBuilders.size <= 1,
+      "Only one shuffle stage recovery implementation may be installed in a SparkSession")
+    shuffleStageRecoveryBuilders.headOption.map(_.apply(session))
   }
 
   /**
@@ -205,6 +217,14 @@ class SparkSessionExtensions {
    */
   def injectQueryStageOptimizerRule(builder: QueryStageOptimizerRuleBuilder): Unit = {
     queryStageOptimizerRuleBuilders += builder
+  }
+
+  /**
+   * Inject a session-scoped provider that can recover completed shuffle stages before AQE submits
+   * their map tasks. Only one provider may be installed in a session.
+   */
+  def injectShuffleStageRecovery(builder: ShuffleStageRecoveryBuilder): Unit = {
+    shuffleStageRecoveryBuilders += builder
   }
 
   private[this] val resolutionRuleBuilders = mutable.Buffer.empty[RuleBuilder]

@@ -368,13 +368,14 @@ object Analyzer {
 class Analyzer(
     override val catalogManager: CatalogManager,
     private[sql] val sharedRelationCache: RelationCache = RelationCache.empty,
-    private[sql] val sessionConf: Option[SQLConf] = None)
+    private[sql] val sessionConf: Option[SQLConf] = None,
+    recoveryAnchorResolver: () => Option[RecoveryAnchorResolver] = () => None)
   extends RuleExecutor[LogicalPlan]
   with CheckAnalysis with AliasHelper with SQLConfHelper with ColumnResolutionHelper {
 
   private val v1SessionCatalog: SessionCatalog = catalogManager.v1SessionCatalog
   private val relationResolution =
-    new RelationResolution(catalogManager, sharedRelationCache)
+    new RelationResolution(catalogManager, sharedRelationCache, recoveryAnchorResolver)
   private val functionResolution = new FunctionResolution(catalogManager, relationResolution)
 
   override protected def validatePlanChanges(

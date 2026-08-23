@@ -84,7 +84,11 @@ class HiveSessionStateBuilder(
   /**
    * A logical query plan `Analyzer` with rules specific to Hive.
    */
-  override protected def analyzer: Analyzer = new Analyzer(catalogManager, sharedRelationCache) {
+  override protected def analyzer: Analyzer = new Analyzer(
+      catalogManager,
+      sharedRelationCache,
+      Some(conf),
+      () => shuffleStageRecovery) {
     override val singlePassResolverExtensions: Seq[ResolverExtension] = Seq(
       new LogicalRelationResolver,
       new HiveTableRelationNoopResolver

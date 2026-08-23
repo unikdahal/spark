@@ -33,7 +33,7 @@ import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier
 import org.apache.spark.sql.connector.catalog.transactions.Transaction
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.metric.CustomMetric
-import org.apache.spark.sql.connector.write.{BatchWrite, DataWriter, DataWriterFactory, DeleteSummaryImpl, DeltaWrite, DeltaWriter, InsertSummaryImpl, MergeSummaryImpl, PhysicalWriteInfoImpl, RowLevelOperation, RowLevelOperationTable, UpdateSummaryImpl, Write, WriterCommitMessage, WriteSummary}
+import org.apache.spark.sql.connector.write.{BatchWrite, DataWriter, DataWriterFactory, DeleteSummaryImpl, DeltaWrite, DeltaWriter, InsertSummaryImpl, MergeSummaryImpl, PhysicalWriteInfoImpl, RecoveryDataWriterFactory, RowLevelOperation, RowLevelOperationTable, SupportsBatchWriteRecovery, SupportsRecoveryCommitDiscard, UpdateSummaryImpl, Write, WriterCommitMessage, WriteSummary}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command._
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.{EmptyRDDWithPartitions, QueryExecution, SparkPlan, SQLExecution, UnaryExecNode}
@@ -453,6 +453,8 @@ case class WriteToDataSourceV2Exec(
   override def withTransaction(txn: Option[Transaction]): WriteToDataSourceV2Exec =
     copy(transaction = txn)
 
+  override protected def recoveryTransaction: Option[Transaction] = transaction
+
   override def stringArgs: Iterator[Any] = Iterator(batchWrite, query)
 
   override lazy val customMetrics: Map[String, SQLMetric] =
@@ -483,6 +485,8 @@ trait V2ExistingTableWriteExec extends V2TableWriteExec with TransactionalExec {
   def write: Write
   def tableName: String
 
+  override protected def recoveryTransaction: Option[Transaction] = transaction
+
   override def stringArgs: Iterator[Any] = Iterator(query, write)
 
   override def nodeName: String = s"${super.nodeName} $tableName"
@@ -507,6 +511,9 @@ trait V2ExistingTableWriteExec extends V2TableWriteExec with TransactionalExec {
  */
 trait RowLevelWriteExec extends V2ExistingTableWriteExec {
   def rowLevelCommand: RowLevelOperation.Command
+
+  override protected def recoveryUnsupportedReason: Option[String] = Some(
+    s"Recovery of row-level $rowLevelCommand writes requires durable custom task metrics")
 
   override protected lazy val sparkMetrics: Map[String, SQLMetric] = super.sparkMetrics ++ (
     rowLevelCommand match {
@@ -594,6 +601,9 @@ trait V2TableWriteExec
 
   override def customMetrics: Map[String, SQLMetric] = Map.empty
 
+  protected def recoveryTransaction: Option[Transaction] = None
+  protected def recoveryUnsupportedReason: Option[String] = None
+
   protected lazy val numOutputRowsMetric: SQLMetric =
     SQLMetrics.createMetric(sparkContext, "number of output rows")
 
@@ -611,12 +621,98 @@ trait V2TableWriteExec
         tempRdd
       }
     }
-    // introduce a local var to avoid serializing the whole class
-    val task = writingTask
-    val writerFactory = batchWrite.createBatchWriterFactory(
-      PhysicalWriteInfoImpl(rdd.getNumPartitions))
-    val useCommitCoordinator = batchWrite.useCommitCoordinator
-    val messages = new Array[WriterCommitMessage](rdd.partitions.length)
+    val physicalWriteInfo = PhysicalWriteInfoImpl(rdd.getNumPartitions)
+    if (batchWrite.isInstanceOf[SupportsBatchWriteRecovery]) {
+      require(recoveryTransaction.isEmpty,
+        "Batch write recovery inside a catalog transaction is not yet supported")
+      recoveryUnsupportedReason.foreach(reason => throw new UnsupportedOperationException(reason))
+    }
+    val taskCommitContext = batchWrite match {
+      case recoverable: SupportsBatchWriteRecovery =>
+        val store = batchWrite match {
+          case withStore: HasRecoveryTaskCommitStore => withStore.taskCommitStore
+          case _ => throw new IllegalStateException(
+            "A recoverable batch write has no durable task commit store")
+        }
+        val context = RecoveryTaskCommitContext(
+          store, recoverable.recoveryId(), recoverable.commitMessageCodec())
+        RecoveryTaskCommitEnvelope.validateContext(context)
+        val compatibilityMetadata = Option(
+          recoverable.recoveryCompatibilityMetadata(physicalWriteInfo)).getOrElse {
+          throw new IllegalStateException(
+            "A recoverable batch write returned null compatibility metadata")
+        }
+        val proposedManifest = RecoveryTaskCommitEnvelope.writeManifest(
+          context, rdd.getNumPartitions, compatibilityMetadata)
+        val resolvedManifest = Option(
+          store.resolveWriteManifest(context.recoveryId, proposedManifest)).getOrElse {
+          throw new IllegalStateException("Recovery task commit store returned a null manifest")
+        }
+        require(java.security.MessageDigest.isEqual(proposedManifest, resolvedManifest),
+          "Recovery write manifest differs from the durable manifest")
+        Some(context)
+      case _ => None
+    }
+    val recoveryState = batchWrite match {
+      case recoverable: SupportsBatchWriteRecovery =>
+        Some(Option(recoverable.recover(physicalWriteInfo)).getOrElse {
+          throw new IllegalStateException("A recoverable batch write returned null recovery state")
+        })
+      case _ => None
+    }
+    val messages = recoveryState.map(_.commitMessages()).getOrElse {
+      new Array[WriterCommitMessage](rdd.partitions.length)
+    }
+    require(messages.length == rdd.partitions.length,
+      s"Recovered ${messages.length} write commit messages for ${rdd.partitions.length} partitions")
+    val recoveredRows = recoveryState.map(_.numRows()).getOrElse(Array.fill(messages.length)(-1L))
+    require(recoveredRows.length == messages.length,
+      s"Recovered ${recoveredRows.length} row counts for ${messages.length} partitions")
+    val alreadyCommitted = recoveryState.exists(_.isCommitted())
+    val taskStoreHasCommit = Array.fill(messages.length)(false)
+    taskCommitContext.foreach { context =>
+      val MaxLoadBatch = 1024
+      messages.indices.grouped(MaxLoadBatch).foreach { partitionIds =>
+        val ids = partitionIds.toArray
+        val stored = Option(context.store.load(context.recoveryId, ids)).getOrElse {
+          throw new IllegalStateException("Recovery task commit store returned a null result")
+        }
+        require(stored.length == ids.length,
+          s"Recovery task commit store returned ${stored.length} values for ${ids.length} keys")
+        ids.indices.foreach { resultIndex =>
+          val partitionId = ids(resultIndex)
+          Option(stored(resultIndex)).foreach { envelope =>
+            val decoded = RecoveryTaskCommitEnvelope.decode(context, partitionId, envelope)
+            taskStoreHasCommit(partitionId) = true
+            if (messages(partitionId) != null) {
+              val connectorPayload = Option(context.codec.encode(messages(partitionId))).getOrElse {
+                throw new IllegalStateException(
+                  s"Recovery codec returned null for connector commit $partitionId")
+              }
+              require(java.util.Arrays.equals(connectorPayload, decoded.payload),
+                s"Connector and task store disagree for recovered partition $partitionId")
+              require(recoveredRows(partitionId) < 0 ||
+                recoveredRows(partitionId) == decoded.numRows,
+                s"Connector and task store row counts disagree for partition $partitionId")
+            }
+            messages(partitionId) = decoded.message
+            recoveredRows(partitionId) = decoded.numRows
+          }
+        }
+      }
+    }
+    messages.indices.foreach { index =>
+      require(alreadyCommitted || messages(index) == null || taskStoreHasCommit(index),
+        s"Connector recovered partition $index without an authoritative task store commit")
+      require(messages(index) != null || recoveredRows(index) == -1L || alreadyCommitted,
+        s"Recovered a row count without a commit message for uncommitted partition $index")
+      if (!alreadyCommitted && messages(index) != null && recoveredRows(index) >= 0) {
+        numOutputRowsMetric.add(recoveredRows(index))
+      }
+    }
+    recoveryState.filter(_.isCommitted()).map(_.totalNumRows()).filter(_ >= 0)
+      .foreach(numOutputRowsMetric.add)
+    val partitionsToWrite = messages.indices.filter(messages(_) == null)
 
     logInfo(log"Start processing data source write support: " +
       log"${MDC(LogKeys.BATCH_WRITE, batchWrite)}. The input RDD has " +
@@ -626,36 +722,70 @@ trait V2TableWriteExec
     val writeMetrics: Map[String, SQLMetric] = customMetrics
 
     try {
-      sparkContext.runJob(
-        rdd,
-        (context: TaskContext, iter: Iterator[InternalRow]) =>
-          task.run(writerFactory, context, iter, useCommitCoordinator, writeMetrics),
-        rdd.partitions.indices,
-        (index, result: DataWritingSparkTaskResult) => {
-          val commitMessage = result.writerCommitMessage
-          messages(index) = commitMessage
-          numOutputRowsMetric.add(result.numRows)
-          batchWrite.onDataWriterCommit(commitMessage)
+      if (!alreadyCommitted && partitionsToWrite.nonEmpty) {
+        // introduce local vars to avoid serializing the whole physical plan
+        val task = writingTask
+        val writerFactory = batchWrite.createBatchWriterFactory(physicalWriteInfo)
+        if (taskCommitContext.isDefined && !writerFactory.isInstanceOf[RecoveryDataWriterFactory]) {
+          throw new IllegalStateException(
+            s"Recovery writer factory ${writerFactory.getClass.getName} does not implement " +
+              classOf[RecoveryDataWriterFactory].getName)
         }
-      )
+        // The driver-local OutputCommitCoordinator cannot arbitrate a recovery write. If a writer
+        // commits and its durable-store response is lost, a retry must still reach the immutable
+        // CAS to discover the canonical value. A coordinator denial would wedge the write until
+        // another driver restart. The durable task store is the coordinator here; losing attempts
+        // are reclaimed through SupportsRecoveryCommitDiscard below.
+        val useCommitCoordinator = batchWrite.useCommitCoordinator && taskCommitContext.isEmpty
+        sparkContext.runJob(
+          rdd,
+          (context: TaskContext, iter: Iterator[InternalRow]) =>
+            task.run(
+              writerFactory,
+              context,
+              iter,
+              useCommitCoordinator,
+              writeMetrics,
+              taskCommitContext),
+          partitionsToWrite,
+          (resultIndex, result: DataWritingSparkTaskResult) => {
+            val partitionIndex = partitionsToWrite(resultIndex)
+            val commitMessage = result.writerCommitMessage
+            messages(partitionIndex) = commitMessage
+            numOutputRowsMetric.add(result.numRows)
+            batchWrite.onDataWriterCommit(commitMessage)
+          }
+        )
+      }
 
       val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
       SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, Seq(numOutputRowsMetric))
 
-      val writeSummary = getWriteSummary()
-      logInfo(log"Data source write support ${MDC(LogKeys.BATCH_WRITE, batchWrite)} is committing.")
-      writeSummary match {
-        case Some(summary) => batchWrite.commit(messages, summary)
-        case None => batchWrite.commit(messages)
+      if (!alreadyCommitted) {
+        val writeSummary = getWriteSummary()
+        logInfo(
+          log"Data source write support ${MDC(LogKeys.BATCH_WRITE, batchWrite)} is committing.")
+        writeSummary match {
+          case Some(summary) => batchWrite.commit(messages, summary)
+          case None => batchWrite.commit(messages)
+        }
+        logInfo(log"Data source write support ${MDC(LogKeys.BATCH_WRITE, batchWrite)} committed.")
+      } else {
+        logInfo(
+          log"Data source write support ${MDC(LogKeys.BATCH_WRITE, batchWrite)} was already " +
+            log"committed; skipping all writer tasks and the global commit.")
       }
-      logInfo(log"Data source write support ${MDC(LogKeys.BATCH_WRITE, batchWrite)} committed.")
       commitProgress = Some(StreamWriterCommitProgress(numOutputRowsMetric.value))
     } catch {
       case cause: Throwable =>
         logError(
           log"Data source write support ${MDC(LogKeys.BATCH_WRITE, batchWrite)} is aborting.")
         try {
-          batchWrite.abort(messages)
+          recoveryState match {
+            case Some(_) =>
+              batchWrite.asInstanceOf[SupportsBatchWriteRecovery].abortAfterRecovery(messages)
+            case None => batchWrite.abort(messages)
+          }
         } catch {
           case t: Throwable =>
             logError(log"Data source write support ${MDC(LogKeys.BATCH_WRITE, batchWrite)} " +
@@ -682,13 +812,34 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
       context: TaskContext,
       iter: Iterator[InternalRow],
       useCommitCoordinator: Boolean,
-      customMetrics: Map[String, SQLMetric]): DataWritingSparkTaskResult = {
+      customMetrics: Map[String, SQLMetric],
+      recovery: Option[RecoveryTaskCommitContext] = None): DataWritingSparkTaskResult = {
     val stageId = context.stageId()
     val stageAttempt = context.stageAttemptNumber()
     val partId = context.partitionId()
     val taskId = context.taskAttemptId()
     val attemptId = context.attemptNumber()
+
+    // Recheck immediately on the executor. The driver's recovery snapshot can race with a late
+    // successful attempt, and a retry after an accepted-but-lost publish response must discover
+    // that canonical commit without creating a writer or consuming its input again.
+    recovery.foreach { recoveryContext =>
+      val stored = Option(recoveryContext.store.load(
+        recoveryContext.recoveryId, Array(partId))).getOrElse {
+        throw new IllegalStateException(
+          s"Recovery task commit store returned a null preflight result for partition $partId")
+      }
+      require(stored.length == 1,
+        s"Recovery task commit store returned ${stored.length} preflight values for one key")
+      Option(stored(0)).foreach { envelope =>
+        val decoded = RecoveryTaskCommitEnvelope.decode(recoveryContext, partId, envelope)
+        logInfo(log"Using canonical recovery commit for partition " +
+          log"${MDC(LogKeys.PARTITION_ID, partId)} before creating a data writer.")
+        return DataWritingSparkTaskResult(decoded.numRows, decoded.message)
+      }
+    }
     val dataWriter = writerFactory.createWriter(partId, taskId).asInstanceOf[W]
+    var writerCommitted = false
 
     val iterWithMetrics = IteratorWithMetrics(iter, dataWriter, customMetrics)
 
@@ -723,6 +874,7 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
           log"is committing.")
         dataWriter.commit()
       }
+      writerCommitted = true
 
       logInfo(log"Committed partition ${MDC(LogKeys.PARTITION_ID, partId)} " +
         log"(task ${MDC(LogKeys.TASK_ID, taskId)}, " +
@@ -730,21 +882,47 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
         log"stage ${MDC(LogKeys.STAGE_ID, stageId)}." +
         log"${MDC(LogKeys.STAGE_ATTEMPT_ID, stageAttempt)})")
 
-      DataWritingSparkTaskResult(iterWithMetrics.count, msg)
+      val result = recovery.map { recoveryContext =>
+        val proposed = RecoveryTaskCommitEnvelope.encode(
+          recoveryContext, partId, msg, iterWithMetrics.count)
+        val canonical = Option(recoveryContext.store.publish(
+          recoveryContext.recoveryId,
+          partId,
+          taskId,
+          attemptId,
+          proposed)).getOrElse {
+          throw new IllegalStateException(
+            s"Recovery task commit store returned null for partition $partId")
+        }
+        val decoded = RecoveryTaskCommitEnvelope.decode(recoveryContext, partId, canonical)
+        if (!java.util.Arrays.equals(proposed, canonical)) {
+          dataWriter match {
+            case discardable: SupportsRecoveryCommitDiscard =>
+              discardable.discardCommittedOutput(msg)
+            case _ => throw new IllegalStateException(
+              s"Recovery writer ${dataWriter.getClass.getName} cannot discard losing output")
+          }
+        }
+        DataWritingSparkTaskResult(decoded.numRows, decoded.message)
+      }.getOrElse(DataWritingSparkTaskResult(iterWithMetrics.count, msg))
+
+      result
 
     })(catchBlock = {
-      // If there is an error, abort this writer
-      logError(log"Aborting commit for partition ${MDC(LogKeys.PARTITION_ID, partId)} " +
-        log"(task ${MDC(LogKeys.TASK_ID, taskId)}, " +
-        log"attempt ${MDC(LogKeys.TASK_ATTEMPT_ID, attemptId)}, " +
-        log"stage ${MDC(LogKeys.STAGE_ID, stageId)}." +
-        log"${MDC(LogKeys.STAGE_ATTEMPT_ID, stageAttempt)})")
-      dataWriter.abort()
-      logError(log"Aborted commit for partition ${MDC(LogKeys.PARTITION_ID, partId)} " +
-        log"(task ${MDC(LogKeys.TASK_ID, taskId)}, " +
-        log"attempt ${MDC(LogKeys.TASK_ATTEMPT_ID, attemptId)}, " +
-        log"stage ${MDC(LogKeys.STAGE_ID, stageId)}." +
-        log"${MDC(LogKeys.STAGE_ATTEMPT_ID, stageAttempt)})")
+      if (!writerCommitted) {
+        // DataWriter.abort has undefined semantics after commit and must not be used for cleanup.
+        logError(log"Aborting commit for partition ${MDC(LogKeys.PARTITION_ID, partId)} " +
+          log"(task ${MDC(LogKeys.TASK_ID, taskId)}, " +
+          log"attempt ${MDC(LogKeys.TASK_ATTEMPT_ID, attemptId)}, " +
+          log"stage ${MDC(LogKeys.STAGE_ID, stageId)}." +
+          log"${MDC(LogKeys.STAGE_ATTEMPT_ID, stageAttempt)})")
+        dataWriter.abort()
+        logError(log"Aborted commit for partition ${MDC(LogKeys.PARTITION_ID, partId)} " +
+          log"(task ${MDC(LogKeys.TASK_ID, taskId)}, " +
+          log"attempt ${MDC(LogKeys.TASK_ATTEMPT_ID, attemptId)}, " +
+          log"stage ${MDC(LogKeys.STAGE_ID, stageId)}." +
+          log"${MDC(LogKeys.STAGE_ATTEMPT_ID, stageAttempt)})")
+      }
     }, finallyBlock = {
       dataWriter.close()
     })
@@ -1021,4 +1199,3 @@ private[v2] case class DataWritingSparkTaskResult(
  * Sink progress information collected after commit.
  */
 private[sql] case class StreamWriterCommitProgress(numOutputRows: Long)
-

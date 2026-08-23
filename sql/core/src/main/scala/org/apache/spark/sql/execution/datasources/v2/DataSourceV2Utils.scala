@@ -26,7 +26,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import org.apache.spark.SparkContext
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.analysis.TimeTravelSpec
+import org.apache.spark.sql.catalyst.analysis.{RecoveryAnchorResolver, TimeTravelSpec}
 import org.apache.spark.sql.catalyst.expressions.Literal
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
@@ -148,10 +148,15 @@ private[sql] object DataSourceV2Utils extends Logging {
         val tbl = DataSourceV2Utils.getTableFromProvider(provider, dsOptions, userSpecifiedSchema)
         (tbl, None, None, None)
     }
+    val anchoredTable = sparkSession.sessionState.shuffleStageRecovery match {
+      case Some(resolver) => RecoveryAnchorResolver.resolveTable(table, resolver)
+      case None => table
+    }
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
-    table match {
-      case _: SupportsRead if table.supports(BATCH_READ) =>
-        Option(DataSourceV2Relation.create(table, catalog, ident, dsOptions, timeTravelSpec))
+    anchoredTable match {
+      case _: SupportsRead if anchoredTable.supports(BATCH_READ) =>
+        Option(DataSourceV2Relation.create(
+          anchoredTable, catalog, ident, dsOptions, timeTravelSpec))
       case _ => None
     }
   }

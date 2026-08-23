@@ -39,6 +39,8 @@ import org.apache.spark.sql.catalyst.plans.logical.Statistics
 import org.apache.spark.sql.catalyst.plans.physical._
 import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.execution._
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, ShuffleStageRecovery,
+  ShuffleStageRecoveryInfo}
 import org.apache.spark.sql.execution.metric.{SQLMetric, SQLMetrics, SQLShuffleReadMetricsReporter, SQLShuffleWriteMetricsReporter}
 import org.apache.spark.sql.internal.{SQLConf, StaticSQLConf}
 import org.apache.spark.util.{MutablePair, ThreadUtils}
@@ -49,6 +51,9 @@ import org.apache.spark.util.random.XORShiftRandom
  * Common trait for all shuffle exchange implementations to facilitate pattern matching.
  */
 trait ShuffleExchangeLike extends Exchange {
+  /** Dependency submitted to the DAGScheduler when this exchange materializes. */
+  def shuffleDependency: ShuffleDependency[_, _, _]
+
   /**
    * Returns the number of mappers of this shuffle.
    */
@@ -254,7 +259,7 @@ case class ShuffleExchangeExec(
    * the returned ShuffleDependency will be the input of shuffle.
    */
   @transient
-  lazy val shuffleDependency : ShuffleDependency[Int, InternalRow, InternalRow] = {
+  override lazy val shuffleDependency: ShuffleDependency[Int, InternalRow, InternalRow] = {
     // Wrap in the exchange's RDD scope so that any wrapper RDDs created during shuffle dependency
     // preparation (e.g. by prepareShuffleDependency's mapPartitionsInternal calls) get this
     // exchange's scope ID.
@@ -270,7 +275,32 @@ case class ShuffleExchangeExec(
       val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
       SQLMetrics.postDriverMetricUpdates(
         sparkContext, executionId, metrics("numPartitions") :: Nil)
+      installNonAdaptiveRecovery(dep)
       dep
+    }
+  }
+
+  private def installNonAdaptiveRecovery(
+      dependency: ShuffleDependency[Int, InternalRow, InternalRow]): Unit = {
+    val queryExecution = Option(sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY))
+      .map(_.toLong)
+      .flatMap(id => Option(SQLExecution.getQueryExecution(id)))
+    queryExecution.foreach { qe =>
+      qe.executedPlan match {
+        case _: AdaptiveSparkPlanExec =>
+        case queryPlan =>
+          session.sessionState.shuffleStageRecovery.foreach { provider =>
+            val info = ShuffleStageRecoveryInfo(
+              stageId = -1,
+              shuffleId = dependency.shuffleId,
+              numMappers = dependency.rdd.getNumPartitions,
+              numPartitions = dependency.partitioner.numPartitions,
+              plan = this,
+              canonicalizedPlan = canonicalized,
+              canonicalizedQueryPlan = queryPlan.canonicalized)
+            ShuffleStageRecovery.install(this, dependency, info, provider)
+          }
+      }
     }
   }
 

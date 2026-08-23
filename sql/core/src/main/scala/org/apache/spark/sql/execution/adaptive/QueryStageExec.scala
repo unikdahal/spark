@@ -207,6 +207,12 @@ case class ShuffleQueryStageExec(
       throw SparkException.internalError(s"wrong plan for shuffle stage:\n ${plan.treeString}")
   }
 
+  @transient private var recoveredRuntimeStatistics: Option[Statistics] = None
+
+  private[adaptive] def setRecoveredRuntimeStatistics(statistics: Statistics): Unit = {
+    recoveredRuntimeStatistics = Some(statistics)
+  }
+
   def advisoryPartitionSize: Option[Long] = shuffle.advisoryPartitionSize
 
   override protected def doMaterialize(): Future[Any] = shuffle.submitShuffleJob()
@@ -219,6 +225,7 @@ case class ShuffleQueryStageExec(
       _canonicalized)
     reuse._resultOption = this._resultOption
     reuse._error = this._error
+    reuse.recoveredRuntimeStatistics = this.recoveredRuntimeStatistics
     reuse
   }
 
@@ -234,7 +241,8 @@ case class ShuffleQueryStageExec(
     Option(stats)
   }
 
-  override def getRuntimeStatistics: Statistics = shuffle.runtimeStatistics
+  override def getRuntimeStatistics: Statistics =
+    recoveredRuntimeStatistics.getOrElse(shuffle.runtimeStatistics)
 }
 
 /**

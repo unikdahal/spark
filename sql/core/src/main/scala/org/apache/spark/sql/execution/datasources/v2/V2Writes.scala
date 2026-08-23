@@ -21,14 +21,22 @@ import java.util.UUID
 
 import scala.jdk.CollectionConverters._
 
+import org.apache.spark.sql.catalyst.analysis.{RecoveryAnchorResolver, WriteRecoveryInfo}
 import org.apache.spark.sql.catalyst.expressions.PredicateHelper
 import org.apache.spark.sql.catalyst.plans.logical.{AppendData, InsertOnlyMerge, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic, ReplaceData, WriteDelta}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
 import org.apache.spark.sql.catalyst.util.WriteDeltaProjections
-import org.apache.spark.sql.connector.catalog.Table
+import org.apache.spark.sql.connector.catalog.{SupportsRecoveryWrite, Table}
+import org.apache.spark.sql.connector.distributions.Distribution
+import org.apache.spark.sql.connector.expressions.SortOrder
 import org.apache.spark.sql.connector.expressions.filter.Predicate
-import org.apache.spark.sql.connector.write.{DeltaWriteBuilder, LogicalWriteInfoImpl, SupportsDynamicOverwrite, SupportsOverwriteV2, SupportsTruncate, Write, WriteBuilder}
+import org.apache.spark.sql.connector.metric.{CustomMetric, CustomTaskMetric}
+import org.apache.spark.sql.connector.write.{BatchWrite, DeltaWriteBuilder, LogicalWriteInfoImpl,
+  PhysicalWriteInfo, RecoveryTaskCommitStore, RequiresDistributionAndOrdering,
+  SupportsBatchWriteRecovery, SupportsDynamicOverwrite, SupportsOverwriteV2, SupportsTruncate,
+  Write, WriteBuilder, WriterCommitMessage, WriteSummary}
+import org.apache.spark.sql.connector.write.streaming.StreamingWrite
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.streaming.sources.{MicroBatchWrite, WriteToMicroBatchDataSource}
 import org.apache.spark.sql.internal.connector.SupportsStreamingUpdateAsAppend
@@ -39,22 +47,29 @@ import org.apache.spark.util.ArrayImplicits._
 /**
  * A rule that constructs logical writes.
  */
-object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
+class V2Writes(recoveryResolver: () => Option[RecoveryAnchorResolver])
+  extends Rule[LogicalPlan] with PredicateHelper {
 
   import DataSourceV2Implicits._
 
-  override def apply(plan: LogicalPlan): LogicalPlan = plan transformDown {
+  override def apply(plan: LogicalPlan): LogicalPlan = {
+    // Resolve this once per rule invocation. A provider can be backed by external state and must not
+    // be observed inconsistently while constructing one logical write.
+    val resolver = recoveryResolver()
+    plan transformDown {
     case a @ AppendData(r: DataSourceV2Relation, query, options, _, _, None, _) =>
       val writeOptions = mergeOptions(options, r.options.asCaseSensitiveMap.asScala.toMap)
-      val writeBuilder = newWriteBuilder(r.table, writeOptions, query.schema)
-      val write = writeBuilder.build()
+      val writeBuilder = newWriteBuilder(
+        r.table, writeOptions, query.schema, operation = Some(a), resolver = resolver)
+      val write = requireRecoverableWrite(r.table, writeBuilder.build(), resolver)
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       a.copy(write = Some(write), query = newQuery)
 
     case m @ InsertOnlyMerge(r: DataSourceV2Relation, query, None, _) =>
       val writeOptions = r.options.asCaseSensitiveMap.asScala.toMap
-      val writeBuilder = newWriteBuilder(r.table, writeOptions, query.schema)
-      val write = writeBuilder.build()
+      val writeBuilder = newWriteBuilder(
+        r.table, writeOptions, query.schema, operation = Some(m), resolver = resolver)
+      val write = requireRecoverableWrite(r.table, writeBuilder.build(), resolver)
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       m.copy(write = Some(write), query = newQuery)
 
@@ -71,8 +86,9 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
 
       val table = r.table
       val writeOptions = mergeOptions(options, r.options.asCaseSensitiveMap.asScala.toMap)
-      val writeBuilder = newWriteBuilder(table, writeOptions, query.schema)
-      val write = writeBuilder match {
+      val writeBuilder = newWriteBuilder(
+        table, writeOptions, query.schema, operation = Some(o), resolver = resolver)
+      val connectorWrite = writeBuilder match {
         case builder: SupportsTruncate if isTruncate(predicates) =>
           builder.truncate().build()
         case builder: SupportsOverwriteV2 if builder.canOverwrite(predicates) =>
@@ -80,6 +96,7 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
         case _ =>
           throw QueryExecutionErrors.overwriteTableByUnsupportedExpressionError(table)
       }
+      val write = requireRecoverableWrite(table, connectorWrite, resolver)
 
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       o.copy(write = Some(write), query = newQuery)
@@ -87,13 +104,15 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
     case o @ OverwritePartitionsDynamic(r: DataSourceV2Relation, query, options, _, _, None) =>
       val table = r.table
       val writeOptions = mergeOptions(options, r.options.asCaseSensitiveMap.asScala.toMap)
-      val writeBuilder = newWriteBuilder(table, writeOptions, query.schema)
-      val write = writeBuilder match {
+      val writeBuilder = newWriteBuilder(
+        table, writeOptions, query.schema, operation = Some(o), resolver = resolver)
+      val connectorWrite = writeBuilder match {
         case builder: SupportsDynamicOverwrite =>
           builder.overwriteDynamicPartitions().build()
         case _ =>
           throw QueryExecutionErrors.dynamicPartitionOverwriteUnsupportedByTableError(table)
       }
+      val write = requireRecoverableWrite(table, connectorWrite, resolver)
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       o.copy(write = Some(write), query = newQuery)
 
@@ -101,7 +120,8 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
         r: DataSourceV2Relation, query, queryId, options, outputMode, Some(batchId)) =>
       val table = r.table
       val writeOptions = mergeOptions(options, r.options.asCaseSensitiveMap.asScala.toMap)
-      val writeBuilder = newWriteBuilder(table, writeOptions, query.schema, queryId = queryId)
+      val writeBuilder = newWriteBuilder(
+        table, writeOptions, query.schema, queryId = queryId, resolver = resolver)
       val write = buildWriteForMicroBatch(table, writeBuilder, outputMode)
       val microBatchWrite = new MicroBatchWrite(batchId, write.toStreaming)
       val customMetrics = write.supportedCustomMetrics.toImmutableArraySeq
@@ -112,17 +132,24 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
       val rowSchema = projections.rowProjection.schema
       val metadataSchema = projections.metadataProjection.map(_.schema)
       val writeOptions = mergeOptions(Map.empty, r.options.asCaseSensitiveMap.asScala.toMap)
-      val writeBuilder = newWriteBuilder(r.table, writeOptions, rowSchema, metadataSchema)
-      val write = writeBuilder.build()
+      val writeBuilder = newWriteBuilder(
+        r.table, writeOptions, rowSchema, metadataSchema, operation = Some(rd), resolver = resolver)
+      val write = requireRecoverableWrite(r.table, writeBuilder.build(), resolver)
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       rd.copy(write = Some(write), query = newQuery)
 
     case wd @ WriteDelta(r: DataSourceV2Relation, _, query, _, projections, _, None) =>
       val writeOptions = mergeOptions(Map.empty, r.options.asCaseSensitiveMap.asScala.toMap)
-      val deltaWriteBuilder = newDeltaWriteBuilder(r.table, writeOptions, projections)
+      val deltaWriteBuilder = newDeltaWriteBuilder(
+        r.table, writeOptions, projections, operation = Some(wd), resolver = resolver)
+      if (resolver.isDefined) {
+        throw new UnsupportedOperationException(
+          "Recovery of row-level delta writes requires durable custom task metrics")
+      }
       val deltaWrite = deltaWriteBuilder.build()
       val newQuery = DistributionAndOrderingUtils.prepareQuery(deltaWrite, query, r.funCatalog)
       wd.copy(write = Some(deltaWrite), query = newQuery)
+    }
   }
 
   private def mergeOptions(
@@ -163,14 +190,18 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
       writeOptions: Map[String, String],
       rowSchema: StructType,
       metadataSchema: Option[StructType] = None,
-      queryId: String = UUID.randomUUID().toString): WriteBuilder = {
+      queryId: String = UUID.randomUUID().toString,
+      operation: Option[LogicalPlan] = None,
+      resolver: Option[RecoveryAnchorResolver]): WriteBuilder = {
 
+    val resolvedQueryId = resolveWriteId(table, queryId, operation, resolver)
     val info = LogicalWriteInfoImpl(
-      queryId,
+      resolvedQueryId,
       rowSchema,
       writeOptions.asOptions,
       rowIdSchema = None,
-      metadataSchema)
+      metadataSchema = metadataSchema,
+      isRecoveryEnabled = resolver.isDefined)
     table.asWritable.newWriteBuilder(info)
   }
 
@@ -178,21 +209,140 @@ object V2Writes extends Rule[LogicalPlan] with PredicateHelper {
       table: Table,
       writeOptions: Map[String, String],
       projections: WriteDeltaProjections,
-      queryId: String = UUID.randomUUID().toString): DeltaWriteBuilder = {
+      queryId: String = UUID.randomUUID().toString,
+      operation: Option[LogicalPlan] = None,
+      resolver: Option[RecoveryAnchorResolver]): DeltaWriteBuilder = {
 
     val rowSchema = projections.rowProjection.map(_.schema).getOrElse(StructType(Nil))
     val rowIdSchema = Some(projections.rowIdProjection.schema)
     val metadataSchema = projections.metadataProjection.map(_.schema)
 
     val info = LogicalWriteInfoImpl(
-      queryId,
+      resolveWriteId(table, queryId, operation, resolver),
       rowSchema,
       writeOptions.asOptions,
       rowIdSchema,
-      metadataSchema)
+      metadataSchema,
+      isRecoveryEnabled = resolver.isDefined)
 
     val writeBuilder = table.asWritable.newWriteBuilder(info)
     assert(writeBuilder.isInstanceOf[DeltaWriteBuilder], s"$writeBuilder must be DeltaWriteBuilder")
     writeBuilder.asInstanceOf[DeltaWriteBuilder]
   }
+
+  private def resolveWriteId(
+      table: Table,
+      currentWriteId: String,
+      operation: Option[LogicalPlan],
+      resolver: Option[RecoveryAnchorResolver]): String = {
+    resolver match {
+      case None => currentWriteId
+      case Some(resolver) =>
+        val sink = table match {
+          case recoverable: SupportsRecoveryWrite => recoverable
+          case _ => throw new IllegalStateException(
+            s"Recovery is enabled but write table ${table.name()} does not implement " +
+              classOf[SupportsRecoveryWrite].getName)
+        }
+        val logicalOperation = operation.getOrElse {
+          throw new IllegalStateException(
+            s"Recovery is enabled but write to ${sink.recoverySinkId()} has no logical identity")
+        }
+        val sinkId = sink.recoverySinkId()
+        require(sinkId != null && sinkId.nonEmpty, "A recovery sink identity must not be empty")
+        val resolved = resolver.resolveWriteId(WriteRecoveryInfo(
+          sinkId, currentWriteId, logicalOperation, logicalOperation.canonicalized))
+        require(resolved != null && resolved.nonEmpty,
+          s"Recovery resolver returned an empty write ID for sink $sinkId")
+        resolved
+    }
+  }
+
+  private def requireRecoverableWrite(
+      table: Table,
+      write: Write,
+      resolver: Option[RecoveryAnchorResolver]): Write = {
+    resolver.map { recoveryResolver =>
+      val store = recoveryResolver.taskCommitStore.getOrElse {
+        throw new IllegalStateException(
+          s"Recovery is enabled but no durable task commit store is configured for ${table.name()}")
+      }
+      RecoveryRequiredWrite(write, table.name(), store)
+    }.getOrElse(write)
+  }
+}
+
+/** Marks a batch write as recovery-required without calling `toBatch` during logical planning. */
+private object RecoveryRequiredWrite {
+  def apply(delegate: Write, tableName: String, store: RecoveryTaskCommitStore): Write =
+      delegate match {
+    case ordered: RequiresDistributionAndOrdering =>
+      new OrderedRecoveryRequiredWrite(ordered, tableName, store)
+    case _ => new RecoveryRequiredWrite(delegate, tableName, store)
+  }
+}
+
+private class RecoveryRequiredWrite(
+    protected val delegate: Write,
+    tableName: String,
+    store: RecoveryTaskCommitStore) extends Write {
+  override def description(): String = delegate.description()
+  override def supportedCustomMetrics(): Array[CustomMetric] = delegate.supportedCustomMetrics()
+  override def reportDriverMetrics(): Array[CustomTaskMetric] = delegate.reportDriverMetrics()
+  override def toStreaming(): StreamingWrite = delegate.toStreaming()
+
+  override def toBatch(): BatchWrite = delegate.toBatch() match {
+    case recoverable: SupportsBatchWriteRecovery =>
+      new RecoveryRequiredBatchWrite(recoverable, store)
+    case other => throw new IllegalStateException(
+      s"Recovery is enabled but batch write ${other.getClass.getName} for table $tableName does " +
+        s"not implement ${classOf[SupportsBatchWriteRecovery].getName}")
+  }
+}
+
+private class OrderedRecoveryRequiredWrite(
+    ordered: RequiresDistributionAndOrdering,
+    tableName: String,
+    store: RecoveryTaskCommitStore)
+  extends RecoveryRequiredWrite(ordered, tableName, store) with RequiresDistributionAndOrdering {
+
+  override def requiredDistribution(): Distribution = ordered.requiredDistribution()
+  override def distributionStrictlyRequired(): Boolean = ordered.distributionStrictlyRequired()
+  override def requiredNumPartitions(): Int = ordered.requiredNumPartitions()
+  override def advisoryPartitionSizeInBytes(): Long = ordered.advisoryPartitionSizeInBytes()
+  override def requiredOrdering(): Array[SortOrder] = ordered.requiredOrdering()
+}
+
+private[datasources] trait HasRecoveryTaskCommitStore {
+  def taskCommitStore: RecoveryTaskCommitStore
+}
+
+private class RecoveryRequiredBatchWrite(
+    delegate: SupportsBatchWriteRecovery,
+    override val taskCommitStore: RecoveryTaskCommitStore)
+  extends SupportsBatchWriteRecovery with HasRecoveryTaskCommitStore {
+
+  override def recoveryId(): String = delegate.recoveryId()
+  override def commitMessageCodec() = delegate.commitMessageCodec()
+  override def recoveryCompatibilityMetadata(info: PhysicalWriteInfo) =
+    delegate.recoveryCompatibilityMetadata(info)
+  override def recover(info: PhysicalWriteInfo) = delegate.recover(info)
+  override def abortAfterRecovery(messages: Array[WriterCommitMessage]) =
+    delegate.abortAfterRecovery(messages)
+  override def createBatchWriterFactory(info: PhysicalWriteInfo) =
+    delegate.createBatchWriterFactory(info)
+  override def useCommitCoordinator(): Boolean = delegate.useCommitCoordinator()
+  override def onDataWriterCommit(message: WriterCommitMessage) =
+    delegate.onDataWriterCommit(message)
+  override def commit(messages: Array[WriterCommitMessage]) =
+    delegate.commit(messages)
+  override def commit(
+      messages: Array[WriterCommitMessage],
+      summary: WriteSummary) = delegate.commit(messages, summary)
+  override def abort(messages: Array[WriterCommitMessage]) =
+    delegate.abort(messages)
+}
+
+object V2Writes {
+  val ruleName: String = classOf[V2Writes].getName
 }

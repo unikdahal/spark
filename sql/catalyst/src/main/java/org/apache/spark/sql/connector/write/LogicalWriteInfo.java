@@ -46,6 +46,15 @@ public interface LogicalWriteInfo {
   String queryId();
 
   /**
+   * Whether Spark may resume this batch write after a driver restart. When true, {@link #queryId()}
+   * is a durable identity selected before task execution and the connector must return a
+   * {@link SupportsBatchWriteRecovery} implementation from its batch write.
+   */
+  default boolean isRecoveryEnabled() {
+    return false;
+  }
+
+  /**
    * the schema of the input data from Spark to data source.
    */
   StructType schema();

@@ -17,20 +17,24 @@
 package org.apache.spark.sql
 
 import java.util.{Locale, UUID}
+import java.nio.ByteBuffer
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.collection.mutable.ListBuffer
 import scala.concurrent.Future
 
-import org.apache.spark.{MapOutputStatistics, TaskContext}
+import org.apache.spark.{MapOutputStatistics, ShuffleDependency, SparkException, TaskContext}
 import org.apache.spark.broadcast.Broadcast
 import org.apache.spark.internal.Logging
 import org.apache.spark.rdd.RDD
+import org.apache.spark.scheduler.{SparkListener, SparkListenerTaskStart}
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow, TableIdentifier}
 import org.apache.spark.sql.catalyst.analysis.{UnresolvedAttribute, UnresolvedRelation}
 import org.apache.spark.sql.catalyst.catalog.BucketSpec
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, Final, Max, Partial}
+import org.apache.spark.sql.catalyst.analysis.{SourceRecoveryInfo, WriteRecoveryInfo}
 import org.apache.spark.sql.catalyst.parser.{CatalystSqlParser, ParserInterface, SqlStatementSplitResult}
 import org.apache.spark.sql.catalyst.plans.PlanTest
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, AggregateHint, ColumnStat, Limit, LocalRelation, LogicalPlan, Project, Range, Sort, SortHint, Statistics, UnresolvedHint}
@@ -39,12 +43,25 @@ import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreeNodeTag
 import org.apache.spark.sql.classic.ClassicConversions._
 import org.apache.spark.sql.classic.Dataset
-import org.apache.spark.sql.connector.catalog.CatalogManager
-import org.apache.spark.sql.connector.write.WriterCommitMessage
+import org.apache.spark.sql.connector.catalog.{CatalogManager, SupportsRecoveryAnchor,
+  SupportsRecoveryWrite, SupportsWrite, Table, TableCapability}
+import org.apache.spark.sql.connector.catalog.TableCapability.{BATCH_READ, BATCH_WRITE}
+import org.apache.spark.sql.connector.{RangeInputPartition, SimpleBatchTable, SimpleScanBuilder,
+  TestingV2Source}
+import org.apache.spark.sql.connector.read.{InputPartition, ScanBuilder}
+import org.apache.spark.sql.connector.write.{BatchWrite, BatchWriteRecoveryState,
+  DataWriterFactory, LogicalWriteInfo, PhysicalWriteInfo, RecoveryCommitMessageCodec,
+  RecoveryDataWriter, RecoveryDataWriterFactory, RecoveryTaskCommitStore,
+  SupportsBatchWriteRecovery,
+  WriteBuilder, WriterCommitMessage}
 import org.apache.spark.sql.execution._
-import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AdaptiveSparkPlanHelper, AQEShuffleReadExec, QueryStageExec, ShuffleQueryStageExec}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AdaptiveSparkPlanHelper,
+  AQEShuffleReadExec, QueryStageExec, RecoveredShuffleStage, ShuffleQueryStageExec,
+  ShuffleStageRecovery, ShuffleStageRecoveryInfo}
 import org.apache.spark.sql.execution.aggregate.HashAggregateExec
 import org.apache.spark.sql.execution.datasources.{FileFormat, WriteFilesExec, WriteFilesExecBase, WriteFilesSpec}
+import org.apache.spark.sql.execution.datasources.v2.{RecoveryTaskCommitContext,
+  RecoveryTaskCommitEnvelope}
 import org.apache.spark.sql.execution.exchange.{BroadcastExchangeExec, BroadcastExchangeLike, ShuffleExchangeExec, ShuffleExchangeLike, ShuffleOrigin}
 import org.apache.spark.sql.execution.vectorized.OnHeapColumnVector
 import org.apache.spark.sql.functions._
@@ -243,6 +260,335 @@ class SparkSessionExtensionSuite extends PlanTest with AdaptiveSparkPlanHelper {
       val data = Seq((100L), (200L), (300L)).toDF("vals").repartition(1)
       val df = data.selectExpr("vals + 1")
       df.collect()
+    }
+  }
+
+  test("inject shuffle stage recovery provider") {
+    val recoveryAttempts = new AtomicInteger()
+    val completedStages = new AtomicInteger()
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = {
+            recoveryAttempts.incrementAndGet()
+            None
+          }
+
+          override def onStageCompleted(
+              info: ShuffleStageRecoveryInfo,
+              result: RecoveredShuffleStage): Unit = {
+            assert(result.bytesByPartitionId.length === info.numPartitions)
+            completedStages.incrementAndGet()
+          }
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      session.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
+      session.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
+      assert(session.range(10).repartition(2).groupBy().count().head().getLong(0) === 10L)
+      assert(recoveryAttempts.get() > 0)
+      assert(completedStages.get() > 0)
+    }
+  }
+
+  test("invalid shuffle stage recovery is rolled back and fails closed") {
+    val aborts = new AtomicInteger()
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = {
+            Some(RecoveredShuffleStage(Seq.empty, 0L, Some(0L)))
+          }
+
+          override def abortRecovery(info: ShuffleStageRecoveryInfo, cause: Throwable): Unit = {
+            aborts.incrementAndGet()
+          }
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      session.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
+      session.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
+      val error = intercept[SparkException] {
+        session.range(10).repartition(2).groupBy().count().collect()
+      }
+      assert(error.getMessage.contains("refusing to recompute"))
+      assert(aborts.get() > 0)
+    }
+  }
+
+  test("shuffle stage recovery provider failure is aborted and fails closed") {
+    val aborts = new AtomicInteger()
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = {
+            throw new IllegalStateException("partial external adoption")
+          }
+
+          override def abortRecovery(info: ShuffleStageRecoveryInfo, cause: Throwable): Unit = {
+            assert(cause.getMessage === "partial external adoption")
+            aborts.incrementAndGet()
+          }
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      session.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
+      session.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
+      val error = intercept[SparkException] {
+        session.range(10).repartition(2).groupBy().count().collect()
+      }
+      assert(error.getMessage.contains("refusing to recompute"))
+      assert(aborts.get() > 0)
+    }
+  }
+
+  test("shuffle stage recovery fails rather than mixing state when rollback fails") {
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = {
+            throw new IllegalStateException("partial external adoption")
+          }
+
+          override def abortRecovery(info: ShuffleStageRecoveryInfo, cause: Throwable): Unit = {
+            throw new IllegalStateException("external rollback failed")
+          }
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      session.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
+      session.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
+      val error = intercept[SparkException] {
+        session.range(10).repartition(2).groupBy().count().collect()
+      }
+      assert(error.getMessage.contains("refusing to recompute"))
+      assert(error.getCause.getSuppressed.exists(
+        _.getMessage.contains("external rollback failed")))
+    }
+  }
+
+  test("accepted empty shuffle recovery bypasses map tasks") {
+    val recoveredStages = new AtomicInteger()
+    val taskStarts = new AtomicInteger()
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = {
+            recoveredStages.incrementAndGet()
+            Some(RecoveredShuffleStage(Seq.fill(info.numPartitions)(0L), 0L, Some(0L)))
+          }
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      val listener = new SparkListener {
+        override def onTaskStart(taskStart: SparkListenerTaskStart): Unit = {
+          taskStarts.incrementAndGet()
+        }
+      }
+      session.sparkContext.addSparkListener(listener)
+      try {
+        session.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, true)
+        session.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
+        val empty = session.range(10).where("id < 0").repartition(2)
+        assert(empty.groupBy().count().head().getLong(0) === 0L)
+        assert(recoveredStages.get() > 0)
+        assert(taskStarts.get() === 1)
+      } finally {
+        session.sparkContext.removeSparkListener(listener)
+      }
+    }
+  }
+
+  test("non-AQE shuffle recovery bypasses map tasks") {
+    val recoveredStages = new AtomicInteger()
+    val taskStarts = new AtomicInteger()
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = {
+            assert(info.stageId === -1)
+            recoveredStages.incrementAndGet()
+            Some(RecoveredShuffleStage(Seq.fill(info.numPartitions)(0L), 0L, Some(0L)))
+          }
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      val listener = new SparkListener {
+        override def onTaskStart(taskStart: SparkListenerTaskStart): Unit = {
+          taskStarts.incrementAndGet()
+        }
+      }
+      session.sparkContext.addSparkListener(listener)
+      try {
+        session.conf.set(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key, false)
+        session.conf.set(SQLConf.SHUFFLE_PARTITIONS.key, 2)
+        val empty = session.range(10).where("id < 0").repartition(2)
+        assert(empty.groupBy().count().head().getLong(0) === 0L)
+        assert(recoveredStages.get() > 0)
+        assert(taskStarts.get() === 1)
+      } finally {
+        session.sparkContext.removeSparkListener(listener)
+      }
+    }
+  }
+
+  test("recovery provider durably selects a V2 source anchor before scan build") {
+    RecoveryAnchorDataSource.appliedAnchor.set(null)
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def resolveSourceAnchor(info: SourceRecoveryInfo): String = {
+            assert(info.sourceId === "recovery-anchor-source")
+            assert(info.currentAnchor === "current-version")
+            "stored-version"
+          }
+
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = None
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      val rows = session.read.format(classOf[RecoveryAnchorDataSource].getName).load().collect()
+      assert(rows.length === 1)
+      assert(RecoveryAnchorDataSource.appliedAnchor.get() === "stored-version")
+    }
+  }
+
+  test("recovery provider durably selects a V2 connector write ID") {
+    RecoveryWriteDataSource.reset()
+    val extensions = create { extensions =>
+      extensions.injectShuffleStageRecovery { _ =>
+        new ShuffleStageRecovery {
+          override def resolveSourceAnchor(info: SourceRecoveryInfo): String = info.currentAnchor
+
+          override def resolveWriteId(info: WriteRecoveryInfo): String = {
+            assert(info.sinkId === "recovery-write-sink")
+            assert(info.currentWriteId.nonEmpty)
+            assert(info.operation.canonicalized === info.canonicalizedOperation)
+            "durable-write-id"
+          }
+
+          override def taskCommitStore: Option[RecoveryTaskCommitStore] =
+            Some(new RecoveryTestTaskCommitStore)
+
+          override def tryRecover(
+              info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = None
+        }
+      }
+    }
+    withSession(extensions) { session =>
+      session.range(2).write.format(classOf[RecoveryWriteDataSource].getName).mode("append").save()
+      assert(RecoveryWriteDataSource.resolvedWriteId.get() === "durable-write-id")
+    }
+  }
+
+  test("recoverable V2 write runs only partitions without durable commit messages") {
+    RecoveryWriteDataSource.reset(recoveredPartitions = Set(0, 2))
+    withSession(recoveryWriteExtensions) { session =>
+      session.range(8).repartition(4).write
+        .format(classOf[RecoveryWriteDataSource].getName).mode("append").save()
+      assert(RecoveryWriteDataSource.writerCommits.get() === 2)
+      assert(RecoveryWriteDataSource.globalCommits.get() === 1)
+      assert(RecoveryWriteDataSource.factoryCreations.get() === 1)
+    }
+  }
+
+  test("recoverable V2 write runs no tasks or global commit when already committed") {
+    RecoveryWriteDataSource.reset(committed = true)
+    withSession(recoveryWriteExtensions) { session =>
+      session.range(8).repartition(4).write
+        .format(classOf[RecoveryWriteDataSource].getName).mode("append").save()
+      assert(RecoveryWriteDataSource.writerCommits.get() === 0)
+      assert(RecoveryWriteDataSource.globalCommits.get() === 0)
+      assert(RecoveryWriteDataSource.factoryCreations.get() === 0)
+    }
+  }
+
+  test("recovery-enabled V2 write fails closed for a non-recoverable batch writer") {
+    NonRecoverableWriteDataSource.factoryCreations.set(0)
+    withSession(recoveryWriteExtensions) { session =>
+      val error = intercept[IllegalStateException] {
+        session.range(2).write.format(classOf[NonRecoverableWriteDataSource].getName)
+          .mode("append").save()
+      }
+      assert(error.getMessage.contains(classOf[SupportsBatchWriteRecovery].getName))
+      assert(NonRecoverableWriteDataSource.factoryCreations.get() === 0)
+    }
+  }
+
+  test("recoverable V2 write uses recovery-aware abort after a resumed failure") {
+    RecoveryWriteDataSource.reset(recoveredPartitions = Set(0), failGlobalCommit = true)
+    withSession(recoveryWriteExtensions) { session =>
+      intercept[RuntimeException] {
+        session.range(4).repartition(2).write
+          .format(classOf[RecoveryWriteDataSource].getName).mode("append").save()
+      }
+      assert(RecoveryWriteDataSource.recoveryAborts.get() === 1)
+      assert(RecoveryWriteDataSource.normalAborts.get() === 0)
+    }
+  }
+
+  test("recoverable V2 write discards speculative output and commits the canonical winner") {
+    RecoveryWriteDataSource.reset(forceCanonicalLoser = true)
+    withSession(recoveryWriteExtensions) { session =>
+      session.range(2).repartition(1).write
+        .format(classOf[RecoveryWriteDataSource].getName).mode("append").save()
+      assert(RecoveryWriteDataSource.writerCommits.get() === 1)
+      assert(RecoveryWriteDataSource.discardedOutputs.get() === 1)
+      assert(RecoveryWriteDataSource.committedPartitionIds.get().toSeq === Seq(1000))
+    }
+  }
+
+  test("recoverable V2 task preflight observes a late winner without creating a writer") {
+    RecoveryWriteDataSource.reset(publishBeforeExecutorPreflight = true)
+    withSession(recoveryWriteExtensions) { session =>
+      session.range(2).repartition(1).write
+        .format(classOf[RecoveryWriteDataSource].getName).mode("append").save()
+      assert(RecoveryWriteDataSource.factoryCreations.get() === 1)
+      assert(RecoveryWriteDataSource.writerCreations.get() === 0)
+      assert(RecoveryWriteDataSource.writerCommits.get() === 0)
+      assert(RecoveryWriteDataSource.committedPartitionIds.get().toSeq === Seq(2000))
+    }
+  }
+
+  test("recoverable V2 write rejects malformed durable state before starting tasks") {
+    withSession(recoveryWriteExtensions) { session =>
+      Seq("null-state", "message-length", "row-length", "row-without-message").foreach { mode =>
+        RecoveryWriteDataSource.reset(malformedState = mode)
+        withClue(s"malformed state mode $mode: ") {
+          intercept[RuntimeException] {
+            session.range(4).repartition(2).write
+              .format(classOf[RecoveryWriteDataSource].getName).mode("append").save()
+          }
+          assert(RecoveryWriteDataSource.factoryCreations.get() === 0)
+        }
+      }
+    }
+  }
+
+  private def recoveryWriteExtensions: Seq[SparkSessionExtensionsProvider] = create { extensions =>
+    extensions.injectShuffleStageRecovery { _ =>
+      new ShuffleStageRecovery {
+        override def resolveSourceAnchor(info: SourceRecoveryInfo): String = info.currentAnchor
+        override def resolveWriteId(info: WriteRecoveryInfo): String = "durable-write-id"
+        override def taskCommitStore: Option[RecoveryTaskCommitStore] =
+          Some(new RecoveryTestTaskCommitStore)
+        override def tryRecover(
+            info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = None
+      }
     }
   }
 
@@ -1154,6 +1500,7 @@ case class PreRuleReplaceAddWithBrokenVersion() extends Rule[SparkPlan] {
  * whether AQE is enabled.
  */
 case class MyShuffleExchangeExec(delegate: ShuffleExchangeExec) extends ShuffleExchangeLike {
+  override def shuffleDependency: ShuffleDependency[_, _, _] = delegate.shuffleDependency
   override def numMappers: Int = delegate.numMappers
   override def numPartitions: Int = delegate.numPartitions
   override def advisoryPartitionSize: Option[Long] = delegate.advisoryPartitionSize
@@ -1177,6 +1524,277 @@ case class MyShuffleExchangeExec(delegate: ShuffleExchangeExec) extends ShuffleE
   override def outputPartitioning: Partitioning = delegate.outputPartitioning
   override protected def withNewChildInternal(newChild: SparkPlan): SparkPlan =
     super.legacyWithNewChildren(Seq(newChild))
+}
+
+object RecoveryAnchorDataSource {
+  val appliedAnchor = new AtomicReference[String]()
+}
+
+class RecoveryAnchorDataSource extends TestingV2Source {
+  override def getTable(options: org.apache.spark.sql.util.CaseInsensitiveStringMap) = {
+    new RecoveryAnchorTable("current-version")
+  }
+}
+
+class RecoveryAnchorTable(anchor: String)
+  extends SimpleBatchTable with SupportsRecoveryAnchor {
+
+  override def recoverySourceId(): String = "recovery-anchor-source"
+
+  override def currentRecoveryAnchor(): String = anchor
+
+  override def withRecoveryAnchor(newAnchor: String): Table = {
+    RecoveryAnchorDataSource.appliedAnchor.set(newAnchor)
+    new RecoveryAnchorTable(newAnchor)
+  }
+
+  override def newScanBuilder(
+      options: org.apache.spark.sql.util.CaseInsensitiveStringMap): ScanBuilder = {
+    new SimpleScanBuilder {
+      override def planInputPartitions(): Array[InputPartition] = {
+        Array(RangeInputPartition(0, 1))
+      }
+    }
+  }
+}
+
+object RecoveryWriteDataSource {
+  val resolvedWriteId = new AtomicReference[String]()
+  val writerCommits = new AtomicInteger()
+  val globalCommits = new AtomicInteger()
+  val factoryCreations = new AtomicInteger()
+  val writerCreations = new AtomicInteger()
+  val recoveryAborts = new AtomicInteger()
+  val normalAborts = new AtomicInteger()
+  val discardedOutputs = new AtomicInteger()
+  val committedPartitionIds = new AtomicReference[Array[Int]](Array.emptyIntArray)
+  val failGlobalCommit = new AtomicBoolean()
+  val forceCanonicalLoser = new AtomicBoolean()
+  val publishBeforeExecutorPreflight = new AtomicBoolean()
+  @volatile var recoveredPartitions: Set[Int] = Set.empty
+  @volatile var committed: Boolean = false
+  @volatile var malformedState: String = ""
+
+  def reset(
+      recoveredPartitions: Set[Int] = Set.empty,
+      committed: Boolean = false,
+      failGlobalCommit: Boolean = false,
+      forceCanonicalLoser: Boolean = false,
+      publishBeforeExecutorPreflight: Boolean = false,
+      malformedState: String = ""): Unit = {
+    resolvedWriteId.set(null)
+    writerCommits.set(0)
+    globalCommits.set(0)
+    factoryCreations.set(0)
+    writerCreations.set(0)
+    recoveryAborts.set(0)
+    normalAborts.set(0)
+    discardedOutputs.set(0)
+    committedPartitionIds.set(Array.emptyIntArray)
+    this.failGlobalCommit.set(failGlobalCommit)
+    this.forceCanonicalLoser.set(forceCanonicalLoser)
+    this.publishBeforeExecutorPreflight.set(publishBeforeExecutorPreflight)
+    this.recoveredPartitions = recoveredPartitions
+    this.committed = committed
+    this.malformedState = malformedState
+    RecoveryTestTaskCommitStore.clear()
+  }
+}
+
+case class RecoveryWriterCommitMessage(partitionId: Int) extends WriterCommitMessage
+
+object RecoveryTestCommitCodec extends RecoveryCommitMessageCodec {
+  override def codecId(): String = "spark-test-recovery-commit"
+  override def version(): Int = 1
+  override def encode(message: WriterCommitMessage): Array[Byte] = {
+    ByteBuffer.allocate(4).putInt(
+      message.asInstanceOf[RecoveryWriterCommitMessage].partitionId).array()
+  }
+  override def decode(version: Int, payload: Array[Byte]): WriterCommitMessage = {
+    require(version == 1)
+    require(payload.length == 4)
+    RecoveryWriterCommitMessage(ByteBuffer.wrap(payload).getInt)
+  }
+}
+
+object RecoveryTestTaskCommitStore {
+  private var manifest: Array[Byte] = _
+  private val commits = scala.collection.mutable.Map.empty[Int, Array[Byte]]
+  private var loadCalls = 0
+
+  def clear(): Unit = synchronized {
+    manifest = null
+    commits.clear()
+    loadCalls = 0
+  }
+
+  def resolve(proposed: Array[Byte]): Array[Byte] = synchronized {
+    if (manifest == null) manifest = proposed.clone()
+    manifest.clone()
+  }
+
+  def load(recoveryId: String, partitionIds: Array[Int]): Array[Array[Byte]] = synchronized {
+    loadCalls += 1
+    partitionIds.map { partitionId =>
+      if (!commits.contains(partitionId) && loadCalls > 1 &&
+          RecoveryWriteDataSource.publishBeforeExecutorPreflight.get()) {
+        val context = RecoveryTaskCommitContext(
+          new RecoveryTestTaskCommitStore, recoveryId, RecoveryTestCommitCodec)
+        commits(partitionId) = RecoveryTaskCommitEnvelope.encode(
+          context, partitionId, RecoveryWriterCommitMessage(partitionId + 2000), 2L)
+      }
+      if (!commits.contains(partitionId) &&
+          RecoveryWriteDataSource.recoveredPartitions.contains(partitionId)) {
+        val context = RecoveryTaskCommitContext(
+          new RecoveryTestTaskCommitStore, recoveryId, RecoveryTestCommitCodec)
+        commits(partitionId) = RecoveryTaskCommitEnvelope.encode(
+          context, partitionId, RecoveryWriterCommitMessage(partitionId), 1L)
+      }
+      commits.get(partitionId).map(_.clone()).orNull
+    }
+  }
+
+  def publish(partitionId: Int, proposed: Array[Byte]): Array[Byte] = synchronized {
+    if (!commits.contains(partitionId) && RecoveryWriteDataSource.forceCanonicalLoser.get()) {
+      val context = RecoveryTaskCommitContext(
+        new RecoveryTestTaskCommitStore, "durable-write-id", RecoveryTestCommitCodec)
+      commits(partitionId) = RecoveryTaskCommitEnvelope.encode(
+        context, partitionId, RecoveryWriterCommitMessage(partitionId + 1000), 2L)
+    }
+    commits.getOrElseUpdate(partitionId, proposed.clone()).clone()
+  }
+}
+
+class RecoveryTestTaskCommitStore extends RecoveryTaskCommitStore {
+  override def resolveWriteManifest(recoveryId: String, proposedValue: Array[Byte]): Array[Byte] =
+    RecoveryTestTaskCommitStore.resolve(proposedValue)
+  override def load(recoveryId: String, partitionIds: Array[Int]): Array[Array[Byte]] =
+    RecoveryTestTaskCommitStore.load(recoveryId, partitionIds)
+  override def publish(
+      recoveryId: String,
+      partitionId: Int,
+      taskAttemptId: Long,
+      attemptNumber: Int,
+      value: Array[Byte]): Array[Byte] = RecoveryTestTaskCommitStore.publish(partitionId, value)
+}
+
+class RecoveryWriteDataSource extends TestingV2Source {
+  override def getTable(options: org.apache.spark.sql.util.CaseInsensitiveStringMap) = {
+    new RecoveryWriteTable
+  }
+}
+
+class RecoveryWriteTable extends RecoveryAnchorTable("write-source-anchor")
+  with SupportsWrite with SupportsRecoveryWrite {
+
+  override def schema(): StructType = new StructType().add("id", LongType, nullable = false)
+
+  override def recoverySinkId(): String = "recovery-write-sink"
+
+  override def capabilities(): java.util.Set[TableCapability] = {
+    java.util.EnumSet.of(BATCH_READ, BATCH_WRITE)
+  }
+
+  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = {
+    RecoveryWriteDataSource.resolvedWriteId.set(info.queryId())
+    new WriteBuilder {
+      override def buildForBatch(): BatchWrite = new SupportsBatchWriteRecovery {
+        override def recoveryId(): String = info.queryId()
+        override def commitMessageCodec(): RecoveryCommitMessageCodec = RecoveryTestCommitCodec
+        override def recoveryCompatibilityMetadata(info: PhysicalWriteInfo): Array[Byte] =
+          s"sink=recovery-write-sink;partitions=${info.numPartitions()}".getBytes("UTF-8")
+
+        override def recover(info: PhysicalWriteInfo): BatchWriteRecoveryState = {
+          if (RecoveryWriteDataSource.malformedState == "null-state") {
+            return null
+          }
+          val recovered = new Array[WriterCommitMessage](info.numPartitions())
+          val messages = if (RecoveryWriteDataSource.malformedState == "message-length") {
+            recovered.dropRight(1)
+          } else {
+            recovered
+          }
+          val rowCounts = recovered.map(message => if (message == null) -1L else 1L)
+          if (RecoveryWriteDataSource.malformedState == "row-without-message") {
+            rowCounts(0) = 1L
+          }
+          new BatchWriteRecoveryState {
+            override def isCommitted(): Boolean = RecoveryWriteDataSource.committed
+            override def commitMessages(): Array[WriterCommitMessage] = messages
+            override def numRows(): Array[Long] = {
+              if (RecoveryWriteDataSource.malformedState == "row-length") {
+                rowCounts.dropRight(1)
+              } else {
+                rowCounts
+              }
+            }
+          }
+        }
+
+        override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory = {
+          RecoveryWriteDataSource.factoryCreations.incrementAndGet()
+          new RecoveryDataWriterFactory {
+            override def createWriter(
+                partitionId: Int,
+                taskId: Long): RecoveryDataWriter = {
+              RecoveryWriteDataSource.writerCreations.incrementAndGet()
+              new RecoveryDataWriter {
+                override def write(record: InternalRow): Unit = {}
+                override def commit(): WriterCommitMessage = {
+                  RecoveryWriteDataSource.writerCommits.incrementAndGet()
+                  RecoveryWriterCommitMessage(partitionId)
+                }
+                override def discardCommittedOutput(message: WriterCommitMessage): Unit = {
+                  RecoveryWriteDataSource.discardedOutputs.incrementAndGet()
+                }
+                override def abort(): Unit = {}
+                override def close(): Unit = {}
+              }
+            }
+          }
+        }
+
+        override def commit(messages: Array[WriterCommitMessage]): Unit = {
+          assert(messages.forall(_ != null))
+          RecoveryWriteDataSource.committedPartitionIds.set(messages.map(
+            _.asInstanceOf[RecoveryWriterCommitMessage].partitionId))
+          RecoveryWriteDataSource.globalCommits.incrementAndGet()
+          if (RecoveryWriteDataSource.failGlobalCommit.get()) {
+            throw new RuntimeException("injected global commit failure")
+          }
+        }
+        override def abortAfterRecovery(messages: Array[WriterCommitMessage]): Unit = {
+          RecoveryWriteDataSource.recoveryAborts.incrementAndGet()
+        }
+        override def abort(messages: Array[WriterCommitMessage]): Unit = {
+          RecoveryWriteDataSource.normalAborts.incrementAndGet()
+        }
+      }
+    }
+  }
+}
+
+object NonRecoverableWriteDataSource {
+  val factoryCreations = new AtomicInteger()
+}
+
+class NonRecoverableWriteDataSource extends TestingV2Source {
+  override def getTable(options: org.apache.spark.sql.util.CaseInsensitiveStringMap): Table = {
+    new NonRecoverableWriteTable
+  }
+}
+
+class NonRecoverableWriteTable extends RecoveryWriteTable {
+  override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = new WriteBuilder {
+    override def buildForBatch(): BatchWrite = new BatchWrite {
+      override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory = {
+        NonRecoverableWriteDataSource.factoryCreations.incrementAndGet()
+        throw new AssertionError("a non-recoverable writer factory must not be created")
+      }
+      override def commit(messages: Array[WriterCommitMessage]): Unit = {}
+      override def abort(messages: Array[WriterCommitMessage]): Unit = {}
+    }
+  }
 }
 
 /**

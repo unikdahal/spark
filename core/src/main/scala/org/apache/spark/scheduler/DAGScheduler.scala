@@ -735,15 +735,49 @@ private[spark] class DAGScheduler(
     val outputTracker = outputTrackerMaster(shuffleDep)
     val numTasks = rdd.partitions.length
     val parents = getOrCreateParentStages(shuffleDeps, jobId)
-    val id = nextStageId.getAndIncrement()
-    val stage = new ShuffleMapStage(
-      id, rdd, numTasks, parents, jobId, rdd.creationSite, shuffleDep, mapOutputTracker,
-      resourceProfile.id)
 
-    stageIdToStage(id) = stage
-    shuffleIdToMapStage(shuffleDep.shuffleId) = stage
-    updateJobIdStageIdMaps(jobId, stage)
+    if (shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]] &&
+        shuffleDep.stageRecoveryHandler.nonEmpty) {
+      throw new SparkException(
+        s"Pipelined shuffle ${shuffleDep.shuffleId} cannot be recovered because it has no " +
+          "durable addressable output")
+    }
 
+    val trackerAlreadyRegistered = outputTracker.containsShuffle(shuffleDep.shuffleId)
+    val recovered = if (trackerAlreadyRegistered) {
+      None
+    } else shuffleDep.stageRecoveryHandler.flatMap { handler =>
+      var adoptionStarted = false
+      try {
+        adoptionStarted = true
+        handler.tryRecover(
+          shuffleDep.shuffleId, numTasks, shuffleDep.partitioner.numPartitions).map { output =>
+          require(output.bytesByPartitionId.length == shuffleDep.partitioner.numPartitions,
+            s"Recovered shuffle ${shuffleDep.shuffleId} has " +
+              s"${output.bytesByPartitionId.length} reducers, expected " +
+              shuffleDep.partitioner.numPartitions)
+          require(output.bytesByPartitionId.forall(_ >= 0),
+            s"Recovered shuffle ${shuffleDep.shuffleId} has a negative partition size")
+          require(output.dataSize >= 0,
+            s"Recovered shuffle ${shuffleDep.shuffleId} has a negative data size")
+          require(output.rowCount.forall(_ >= 0),
+            s"Recovered shuffle ${shuffleDep.shuffleId} has a negative row count")
+          output
+        }
+      } catch {
+        case NonFatal(e) =>
+          if (adoptionStarted) {
+            try handler.abortRecovery(shuffleDep.shuffleId, e)
+            catch {
+              case NonFatal(abortError) => e.addSuppressed(abortError)
+            }
+          }
+          throw new SparkException(
+            s"Shuffle recovery failed closed for shuffle ${shuffleDep.shuffleId}; refusing to " +
+              "recompute because an authoritative committed generation may exist",
+            e)
+      }
+    }
     // Register the shuffle with its own tracker (a pipelined shuffle in the
     // StreamingShuffleOutputTracker, a regular one in the MapOutputTracker -- split by dependency
     // type, no overlap). Self-guarded on the tracker's own membership: createShuffleMapStage runs
@@ -757,13 +791,44 @@ private[spark] class DAGScheduler(
     // before addActiveJob (its sole populator) runs, so a pipelined stage's mapStageJobs is always
     // empty; and checkAndScheduleShuffleMergeFinalize's getStatistics is on the push-based-merge
     // path, which a pipelined dependency rejects up front (checkPipelinedProducerSupported).
-    if (!outputTracker.containsShuffle(shuffleDep.shuffleId)) {
+    if (!trackerAlreadyRegistered) {
       logInfo(log"Registering RDD ${MDC(RDD_ID, rdd.id)} " +
         log"(${MDC(CREATION_SITE, rdd.getCreationSite)}) as input to " +
         log"shuffle ${MDC(SHUFFLE_ID, shuffleDep.shuffleId)}")
-      outputTracker.registerShuffle(shuffleDep.shuffleId, rdd.partitions.length,
-        shuffleDep.partitioner.numPartitions, jobId)
+      recovered match {
+        case Some(output) =>
+          try {
+            mapOutputTracker.registerRecoveredShuffle(
+              shuffleDep.shuffleId, numTasks, output.bytesByPartitionId)
+          } catch {
+            case NonFatal(e) =>
+              shuffleDep.stageRecoveryHandler.foreach { handler =>
+                try handler.abortRecovery(shuffleDep.shuffleId, e)
+                catch {
+                  case NonFatal(abortError) => e.addSuppressed(abortError)
+                }
+              }
+              throw new SparkException(
+                s"Failed to install recovered scheduler state for shuffle " +
+                  s"${shuffleDep.shuffleId}; refusing to recompute",
+                e)
+          }
+        case None =>
+          outputTracker.registerShuffle(shuffleDep.shuffleId, rdd.partitions.length,
+            shuffleDep.partitioner.numPartitions, jobId)
+      }
     }
+
+    val id = nextStageId.getAndIncrement()
+    val stage = new ShuffleMapStage(
+      id, rdd, numTasks, parents, jobId, rdd.creationSite, shuffleDep, mapOutputTracker,
+      resourceProfile.id)
+    if (recovered.nonEmpty) {
+      stage.markRecovered()
+    }
+    stageIdToStage(id) = stage
+    shuffleIdToMapStage(shuffleDep.shuffleId) = stage
+    updateJobIdStageIdMaps(jobId, stage)
     stage
   }
 
@@ -3498,6 +3563,13 @@ private[spark] class DAGScheduler(
             log"${MDC(STAGE_ATTEMPT_ID, task.stageAttemptId)} and there is a more recent attempt for " +
             log"that stage (attempt " +
             log"${MDC(NUM_ATTEMPT, failedStage.latestInfo.attemptNumber())}) running")
+        } else if (mapStage.isRecovered) {
+          failedStage.failedAttemptIds.add(task.stageAttemptId)
+          abortStage(
+            failedStage,
+            s"Recovered shuffle $shuffleId became unreadable; refusing to recompute its map " +
+              s"stage because that could mix durable generations: $failureMessage",
+            None)
         } else if (activeJobForStage(failedStage).flatMap(jobIdToActiveJob.get)
             .exists(_.hasPipelinedDependency) &&
             (isPipelinedGroupMember(failedStage) || isPipelinedGroupMember(mapStage))) {
@@ -4084,6 +4156,21 @@ private[spark] class DAGScheduler(
         log"${MDC(PARTITION_IDS, shuffleStage.findMissingPartitions().mkString(", "))}")
       submitStage(shuffleStage)
     } else {
+      if (!shuffleStage.isRecovered) {
+        shuffleStage.shuffleDep.stageRecoveryHandler.foreach { handler =>
+          try {
+            handler.onStageCompleted(
+              shuffleStage.shuffleDep.shuffleId,
+              mapOutputTracker.getStatistics(shuffleStage.shuffleDep))
+          } catch {
+            case NonFatal(e) =>
+              logWarning(
+                log"Failed to publish durable recovery metadata for shuffle " +
+                  log"${MDC(SHUFFLE_ID, shuffleStage.shuffleDep.shuffleId)}",
+                e)
+          }
+        }
+      }
       markMapStageJobsAsFinished(shuffleStage)
       submitWaitingChildStages(shuffleStage)
     }

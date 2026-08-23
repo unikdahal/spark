@@ -336,6 +336,7 @@ case class AdaptiveSparkPlanExec(
             // Start materialization of all new stages and fail fast if any stages failed eagerly
             reorderedNewStages.foreach { stage =>
               try {
+                installShuffleStageRecovery(stage)
                 stage.materialize().onComplete { res =>
                   if (res.isSuccess) {
                     // record shuffle IDs for successful stages for cleanup
@@ -436,6 +437,36 @@ case class AdaptiveSparkPlanExec(
     // `withFinalPlanUpdate` and pass another result handler and we will create a new result stage.
     currentPhysicalPlan.asInstanceOf[ResultQueryStageExec].resultOption.getAndUpdate(_ => None)
       .get.asInstanceOf[T]
+  }
+
+  private def recoveryInfo(stage: ShuffleQueryStageExec): ShuffleStageRecoveryInfo = {
+    val shuffle = stage.shuffle
+    ShuffleStageRecoveryInfo(
+      stage.id,
+      shuffle.shuffleId,
+      shuffle.numMappers,
+      shuffle.numPartitions,
+      stage.plan,
+      stage._canonicalized,
+      initialPlan.canonicalized)
+  }
+
+  /** Install recovery before `materialize()` submits the shuffle map job. */
+  private def installShuffleStageRecovery(stage: QueryStageExec): Unit = {
+    (stage, context.session.sessionState.adaptiveRulesHolder.shuffleStageRecovery) match {
+      case (shuffleStage: ShuffleQueryStageExec, Some(provider)) =>
+        val info = recoveryInfo(shuffleStage)
+        if (info.numMappers == 0) {
+          return
+        }
+        ShuffleStageRecovery.install(
+          shuffleStage.shuffle,
+          shuffleStage.shuffle.shuffleDependency,
+          info,
+          provider,
+          shuffleStage.setRecoveredRuntimeStatistics)
+      case _ =>
+    }
   }
 
   /** Include stages retained by earlier adopted plans as well as newly created query stages. */

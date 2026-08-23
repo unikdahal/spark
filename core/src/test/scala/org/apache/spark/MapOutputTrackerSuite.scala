@@ -109,6 +109,27 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
     rpcEnv.shutdown()
   }
 
+  test("master register recovered shuffle") {
+    val tracker = newTrackerMaster()
+    val partitionBytes = Array(7L, 0L, 13L)
+
+    val statistics = tracker.registerRecoveredShuffle(10, 3, partitionBytes)
+
+    assert(statistics.shuffleId === 10)
+    assert(statistics.bytesByPartitionId === partitionBytes)
+    assert(tracker.containsShuffle(10))
+    assert(tracker.getNumAvailableOutputs(10) === 3)
+    assert(tracker.findMissingPartitions(10).contains(Seq.empty))
+    assert(tracker.getMapSizesByExecutorId(10, 0, 3, 0, 3).nonEmpty)
+
+    intercept[IllegalArgumentException] {
+      tracker.registerRecoveredShuffle(10, 3, partitionBytes)
+    }
+    tracker.unregisterShuffle(10)
+    assert(!tracker.containsShuffle(10))
+    tracker.stop()
+  }
+
   test("master register shuffle and unregister map output and fetch") {
     val rpcEnv = createRpcEnv("test")
     val tracker = newTrackerMaster()

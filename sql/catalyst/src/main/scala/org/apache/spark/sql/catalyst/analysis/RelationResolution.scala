@@ -53,13 +53,24 @@ import org.apache.spark.util.ArrayImplicits._
 
 class RelationResolution(
     override val catalogManager: CatalogManager,
-    sharedRelationCache: RelationCache)
+    sharedRelationCache: RelationCache,
+    recoveryAnchorResolver: () => Option[RecoveryAnchorResolver] = () => None)
     extends DataTypeErrorsBase
     with Logging
     with LookupCatalog
     with SQLConfHelper {
 
   val v1SessionCatalog = catalogManager.v1SessionCatalog
+
+  private def resolveRecoveryAnchor(relation: Relation): Relation = {
+    recoveryAnchorResolver() match {
+      case None => relation
+      case Some(resolver) => relation match {
+        case table: Table => RecoveryAnchorResolver.resolveTable(table, resolver)
+        case other => other
+      }
+    }
+  }
 
   private def relationCache = AnalysisContext.get.relationCache
   private def tableCache = AnalysisContext.get.tableCache
@@ -286,7 +297,7 @@ class RelationResolution(
             // Skip the table-side lookup entirely for view-only catalogs (no `TableCatalog`
             // mixin): `CatalogV2Util.loadTable` would call `asTableCatalog` and throw
             // MISSING_CATALOG_ABILITY.TABLES, masking the legitimate view-resolution path.
-            val relation: Option[Relation] = pinnedTable.orElse {
+            val loadedRelation: Option[Relation] = pinnedTable.orElse {
               catalog match {
                 case mc: RelationCatalog
                     if finalTimeTravelSpec.isEmpty && writePrivileges == null =>
@@ -329,6 +340,12 @@ class RelationResolution(
                   }
               }
             }
+            val relation = if (writePrivileges == null) {
+              loadedRelation.map(resolveRecoveryAnchor)
+            } else {
+              loadedRelation
+            }
+
             // `table` is `relation` filtered to tables only -- used for cache lookup since
             // we don't share-cache views.
             val table: Option[Table] = relation.collect { case t: Table => t }

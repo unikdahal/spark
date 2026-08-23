@@ -18,6 +18,7 @@
 package org.apache.spark.sql.execution
 
 import org.apache.spark.sql.ExperimentalMethods
+import org.apache.spark.sql.catalyst.analysis.RecoveryAnchorResolver
 import org.apache.spark.sql.catalyst.catalog.SessionCatalog
 import org.apache.spark.sql.catalyst.optimizer._
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
@@ -32,7 +33,8 @@ import org.apache.spark.sql.execution.python.{ExtractGroupingPythonUDFFromAggreg
 class SparkOptimizer(
     catalogManager: CatalogManager,
     catalog: SessionCatalog,
-    experimentalMethods: ExperimentalMethods)
+    experimentalMethods: ExperimentalMethods,
+    recoveryResolver: () => Option[RecoveryAnchorResolver] = () => None)
   extends Optimizer(catalogManager) {
 
   override def earlyScanPushDownRules: Seq[Rule[LogicalPlan]] =
@@ -51,7 +53,7 @@ class SparkOptimizer(
       CollapseGroupedSumOfCount,
       SchemaPruning,
       V2ScanPartitioningAndOrdering,
-      V2Writes,
+      new V2Writes(recoveryResolver),
       PruneFileSourcePartitions,
       PushVariantIntoScan)
 

@@ -29,7 +29,8 @@ private[sql] case class LogicalWriteInfoImpl(
     schema: StructType,
     options: CaseInsensitiveStringMap,
     override val rowIdSchema: Optional[StructType] = Optional.empty[StructType],
-    override val metadataSchema: Optional[StructType] = Optional.empty[StructType])
+    override val metadataSchema: Optional[StructType] = Optional.empty[StructType],
+    override val isRecoveryEnabled: Boolean = false)
   extends LogicalWriteInfo
 
 object LogicalWriteInfoImpl {
@@ -39,11 +40,22 @@ object LogicalWriteInfoImpl {
       options: CaseInsensitiveStringMap,
       rowIdSchema: Option[StructType],
       metadataSchema: Option[StructType]): LogicalWriteInfoImpl = {
+    apply(queryId, schema, options, rowIdSchema, metadataSchema, isRecoveryEnabled = false)
+  }
+
+  def apply(
+      queryId: String,
+      schema: StructType,
+      options: CaseInsensitiveStringMap,
+      rowIdSchema: Option[StructType],
+      metadataSchema: Option[StructType],
+      isRecoveryEnabled: Boolean): LogicalWriteInfoImpl = {
     LogicalWriteInfoImpl(
       queryId,
       schema,
       options,
       rowIdSchema.toJava,
-      metadataSchema.toJava)
+      metadataSchema.toJava,
+      isRecoveryEnabled)
   }
 }

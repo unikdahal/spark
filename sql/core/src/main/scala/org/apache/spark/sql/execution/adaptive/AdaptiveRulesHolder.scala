@@ -36,5 +36,6 @@ class AdaptiveRulesHolder(
     val queryStagePrepRules: Seq[Rule[SparkPlan]],
     val runtimeOptimizerRules: Seq[Rule[LogicalPlan]],
     val queryStageOptimizerRules: Seq[Rule[SparkPlan]],
-    val queryPostPlannerStrategyRules: Seq[Rule[SparkPlan]]) {
+    val queryPostPlannerStrategyRules: Seq[Rule[SparkPlan]],
+    val shuffleStageRecovery: Option[ShuffleStageRecovery]) {
 }

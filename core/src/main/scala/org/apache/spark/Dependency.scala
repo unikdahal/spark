@@ -28,7 +28,7 @@ import org.apache.spark.internal.Logging
 import org.apache.spark.internal.LogKeys._
 import org.apache.spark.rdd.RDD
 import org.apache.spark.serializer.Serializer
-import org.apache.spark.shuffle.{ShuffleHandle, ShuffleWriteProcessor}
+import org.apache.spark.shuffle.{ShuffleHandle, ShuffleStageRecoveryHandler, ShuffleWriteProcessor}
 import org.apache.spark.shuffle.checksum.RowBasedChecksum
 import org.apache.spark.storage.BlockManagerId
 import org.apache.spark.util.Utils
@@ -127,6 +127,17 @@ class ShuffleDependency[K: ClassTag, V: ClassTag, C: ClassTag](
     Option(reflect.classTag[C]).map(_.runtimeClass.getName)
 
   val shuffleId: Int = _rdd.context.newShuffleId()
+
+  @transient private[this] var _stageRecoveryHandler: Option[ShuffleStageRecoveryHandler] = None
+
+  /** Attach recovery before this dependency is submitted to the DAGScheduler. */
+  private[spark] def setStageRecoveryHandler(handler: ShuffleStageRecoveryHandler): Unit = {
+    require(_stageRecoveryHandler.isEmpty, s"Shuffle $shuffleId already has a recovery handler")
+    _stageRecoveryHandler = Some(handler)
+  }
+
+  private[spark] def stageRecoveryHandler: Option[ShuffleStageRecoveryHandler] =
+    _stageRecoveryHandler
 
   private[this] val numPartitions = rdd.partitions.length
 

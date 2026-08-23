@@ -32,7 +32,7 @@ import org.apache.spark.sql.classic.{SparkSession, Strategy, StreamingCheckpoint
 import org.apache.spark.sql.connector.catalog.DefaultCatalogManager
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.{ColumnarRule, CommandExecutionMode, QueryExecution, SparkOptimizer, SparkPlanner, SparkSqlParser}
-import org.apache.spark.sql.execution.adaptive.AdaptiveRulesHolder
+import org.apache.spark.sql.execution.adaptive.{AdaptiveRulesHolder, ShuffleStageRecovery}
 import org.apache.spark.sql.execution.aggregate.{ResolveEncodersInScalaAgg, ScalaUDAF}
 import org.apache.spark.sql.execution.analysis.DetectAmbiguousSelfJoin
 import org.apache.spark.sql.execution.command.{CheckViewReferences, CommandCheck}
@@ -196,7 +196,11 @@ abstract class BaseSessionStateBuilder(
    *
    * Note: this depends on the `conf` and `catalog` fields.
    */
-  protected def analyzer: Analyzer = new Analyzer(catalogManager, sharedRelationCache, Some(conf)) {
+  protected def analyzer: Analyzer = new Analyzer(
+      catalogManager,
+      sharedRelationCache,
+      Some(conf),
+      () => shuffleStageRecovery) {
     override val hintResolutionRules: Seq[Rule[LogicalPlan]] =
       customHintResolutionRules
 
@@ -328,7 +332,7 @@ abstract class BaseSessionStateBuilder(
    * Note: this depends on `catalog` and `experimentalMethods` fields.
    */
   protected def optimizer: Optimizer = {
-    new SparkOptimizer(catalogManager, catalog, experimentalMethods) {
+    new SparkOptimizer(catalogManager, catalog, experimentalMethods, () => shuffleStageRecovery) {
       override def earlyScanPushDownRules: Seq[Rule[LogicalPlan]] =
         super.earlyScanPushDownRules ++ customEarlyScanPushDownRules
 
@@ -407,12 +411,17 @@ abstract class BaseSessionStateBuilder(
     extensions.buildColumnarRules(session)
   }
 
+  protected lazy val shuffleStageRecovery: Option[ShuffleStageRecovery] = {
+    extensions.buildShuffleStageRecovery(session)
+  }
+
   protected def adaptiveRulesHolder: AdaptiveRulesHolder = {
     new AdaptiveRulesHolder(
       extensions.buildQueryStagePrepRules(session),
       extensions.buildRuntimeOptimizerRules(session),
       extensions.buildQueryStageOptimizerRules(session),
-      extensions.buildQueryPostPlannerStrategyRules(session))
+      extensions.buildQueryPostPlannerStrategyRules(session),
+      shuffleStageRecovery)
   }
 
   /**
@@ -507,6 +516,7 @@ abstract class BaseSessionStateBuilder(
       createQueryExecution,
       createClone,
       columnarRules,
+      shuffleStageRecovery,
       adaptiveRulesHolder,
       planNormalizationRules,
       () => artifactManager,

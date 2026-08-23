@@ -943,6 +943,49 @@ private[spark] class MapOutputTrackerMaster(
     }
   }
 
+  /**
+   * Register a shuffle recovered from an external shuffle service as fully available.
+   *
+   * External shuffle readers do not use these synthetic locations to find their data; their
+   * shuffle manager must have made the recovered data readable before this method is called. The
+   * statuses provide the scheduler's availability invariant and an even approximation of the
+   * per-map distribution for AQE rules. The exact reducer totals are returned separately.
+   */
+  private[spark] def registerRecoveredShuffle(
+      shuffleId: Int,
+      numMaps: Int,
+      bytesByPartitionId: Array[Long]): MapOutputStatistics = synchronized {
+    require(numMaps > 0, s"Recovered shuffle $shuffleId must have at least one mapper")
+    require(bytesByPartitionId.nonEmpty,
+      s"Recovered shuffle $shuffleId must have at least one reducer partition")
+    require(bytesByPartitionId.forall(_ >= 0),
+      s"Recovered shuffle $shuffleId contains a negative partition size")
+    require(!containsShuffle(shuffleId), s"Shuffle ID $shuffleId registered twice")
+
+    val recoveredLocation = BlockManagerId("recovered-shuffle", "external", 1)
+    registerShuffle(shuffleId, numMaps, bytesByPartitionId.length)
+    try {
+      val baseSizes = bytesByPartitionId.map(_ / numMaps)
+      val remainders = bytesByPartitionId.map(_ % numMaps)
+      var mapIndex = 0
+      while (mapIndex < numMaps) {
+        val sizes = Array.tabulate(bytesByPartitionId.length) { partitionId =>
+          baseSizes(partitionId) + (if (mapIndex < remainders(partitionId)) 1L else 0L)
+        }
+        registerMapOutput(
+          shuffleId,
+          mapIndex,
+          MapStatus(recoveredLocation, sizes, mapIndex.toLong))
+        mapIndex += 1
+      }
+      new MapOutputStatistics(shuffleId, bytesByPartitionId.clone())
+    } catch {
+      case NonFatal(e) =>
+        unregisterShuffle(shuffleId)
+        throw e
+    }
+  }
+
   // ShuffleOutputTrackerMaster: a regular shuffle has no per-job registration, so jobId is ignored.
   override def registerShuffle(shuffleId: Int, numMaps: Int, numReduces: Int, jobId: Int): Unit =
     registerShuffle(shuffleId, numMaps, numReduces)
