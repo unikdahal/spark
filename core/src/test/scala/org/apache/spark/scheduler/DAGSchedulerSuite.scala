@@ -1048,13 +1048,16 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
   }
 
   test("repeated late fetch failures cannot resubmit a recovered shuffle producer") {
-    val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(1))
+    // Two mappers, two reducer partitions, and a consumer whose partition count matches the
+    // partitioner: a real ShuffledRDD can never have more partitions than its dependency produces
+    // outputs for, so the fixture must not either.
+    val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(2))
     shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
       override def tryRecover(
           shuffleId: Int,
           numMappers: Int,
           numPartitions: Int): Option[RecoveredShuffleOutput] = {
-        Some(RecoveredShuffleOutput(Array(10L), 10L, Some(2L)))
+        Some(RecoveredShuffleOutput(Array(10L, 20L), 30L, Some(4L)))
       }
 
       override def onStageCompleted(
