@@ -1,0 +1,31 @@
+# Public and developer recovery API classes included in the integration artifact.
+# Keep this list sorted by binary class name. Nested and companion classes are included
+# automatically by dev/create-recovery-api-artifact.sh.
+org.apache.spark.sql.SparkSessionExtensions
+org.apache.spark.sql.catalyst.analysis.RecoveryAnchorResolver
+org.apache.spark.sql.catalyst.analysis.SourceRecoveryInfo
+org.apache.spark.sql.catalyst.analysis.WriteRecoveryInfo
+org.apache.spark.sql.connector.catalog.SupportsRecoveryAnchor
+org.apache.spark.sql.connector.catalog.SupportsRecoveryWrite
+org.apache.spark.sql.connector.catalog.SupportsTransactionRecovery
+org.apache.spark.sql.connector.catalog.transactions.TransactionRecoveryInfo
+org.apache.spark.sql.connector.catalog.transactions.TransactionRecoveryResult
+org.apache.spark.sql.connector.catalog.transactions.TransactionRecoveryState
+org.apache.spark.sql.connector.recovery.RecoveryTaskCommitStore
+org.apache.spark.sql.connector.write.BatchWriteRecoveryState
+org.apache.spark.sql.connector.write.LogicalWriteInfo
+org.apache.spark.sql.connector.write.RecoveryCommitMessageCodec
+org.apache.spark.sql.connector.write.RecoveryDataWriter
+org.apache.spark.sql.connector.write.RecoveryDataWriterFactory
+org.apache.spark.sql.connector.write.RecoveryDeltaWriter
+org.apache.spark.sql.connector.write.RecoveryDeltaWriterFactory
+org.apache.spark.sql.connector.write.RecoveryTaskMetricDescriptor
+org.apache.spark.sql.connector.write.RecoveryTaskMetricSchema
+org.apache.spark.sql.connector.write.RowLevelTaskSummary
+org.apache.spark.sql.connector.write.SupportsBatchWriteRecovery
+org.apache.spark.sql.connector.write.SupportsDeltaBatchWriteRecovery
+org.apache.spark.sql.connector.write.SupportsRecoveryCommitDiscard
+org.apache.spark.sql.connector.write.SupportsRecoveryTaskMetrics
+org.apache.spark.sql.execution.adaptive.RecoveredShuffleStage
+org.apache.spark.sql.execution.adaptive.ShuffleStageRecovery
+org.apache.spark.sql.execution.adaptive.ShuffleStageRecoveryInfo

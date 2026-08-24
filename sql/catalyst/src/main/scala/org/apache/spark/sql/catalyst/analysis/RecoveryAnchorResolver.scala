@@ -20,7 +20,7 @@ package org.apache.spark.sql.catalyst.analysis
 import org.apache.spark.annotation.{DeveloperApi, Experimental}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.connector.catalog.{SupportsRecoveryAnchor, Table}
-import org.apache.spark.sql.connector.write.RecoveryTaskCommitStore
+import org.apache.spark.sql.connector.recovery.RecoveryTaskCommitStore
 
 /** Immutable source state considered while resolving a resumable batch query relation. */
 @DeveloperApi
@@ -40,6 +40,17 @@ case class WriteRecoveryInfo(
 @DeveloperApi
 @Experimental
 trait RecoveryAnchorResolver {
+  /**
+   * Stable identity of this logical execution across replacement drivers.
+   *
+   * Providers that enable transactional write recovery must override this method. The value must
+   * never be reused for a different logical execution.
+   */
+  def recoveryExecutionId: String = {
+    throw new UnsupportedOperationException(
+      "Recovery provider does not expose a stable execution identity")
+  }
+
   def resolveSourceAnchor(info: SourceRecoveryInfo): String
 
   /** Atomically chooses one durable connector write ID for this logical execution and sink. */
@@ -52,7 +63,7 @@ trait RecoveryAnchorResolver {
   def taskCommitStore: Option[RecoveryTaskCommitStore] = None
 }
 
-private[sql] object RecoveryAnchorResolver {
+private[sql] object RecoveryAnchorUtils {
   def resolveTable(table: Table, resolver: RecoveryAnchorResolver): Table = table match {
     case recoverable: SupportsRecoveryAnchor =>
       val sourceId = recoverable.recoverySourceId()

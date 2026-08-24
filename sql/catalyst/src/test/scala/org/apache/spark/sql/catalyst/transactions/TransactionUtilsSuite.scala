@@ -17,9 +17,19 @@
 
 package org.apache.spark.sql.catalyst.transactions
 
+import java.nio.charset.StandardCharsets
+
 import org.apache.spark.{SparkException, SparkFunSuite}
-import org.apache.spark.sql.connector.catalog.{CatalogPlugin, TransactionalCatalogPlugin}
-import org.apache.spark.sql.connector.catalog.transactions.{Transaction, TransactionInfo}
+import org.apache.spark.sql.connector.catalog.{
+  CatalogPlugin,
+  SupportsTransactionRecovery,
+  TransactionalCatalogPlugin}
+import org.apache.spark.sql.connector.catalog.transactions.{
+  Transaction,
+  TransactionInfo,
+  TransactionRecoveryInfo,
+  TransactionRecoveryResult,
+  TransactionRecoveryState}
 import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
@@ -58,6 +68,25 @@ class TransactionUtilsSuite extends SparkFunSuite {
       override def name(): String = catalogName
       override def beginTransaction(info: TransactionInfo): Transaction =
         new TestTransaction(resolvedTxnCatalogName)
+    }
+  }
+
+  private def bytes(value: String): Array[Byte] = value.getBytes(StandardCharsets.UTF_8)
+
+  private def mockRecoveryCatalog(
+      result: TransactionRecoveryResult,
+      catalogName: String = testCatalogName,
+      onBegin: () => Unit = emptyFunction): SupportsTransactionRecovery = {
+    new SupportsTransactionRecovery {
+      override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = ()
+      override def name(): String = catalogName
+      override def beginTransaction(info: TransactionInfo): Transaction = {
+        onBegin()
+        new TestTransaction(catalogName)
+      }
+      override def resolveTransaction(info: TransactionRecoveryInfo): TransactionRecoveryResult = {
+        result
+      }
     }
   }
 
@@ -122,5 +151,185 @@ class TransactionUtilsSuite extends SparkFunSuite {
     intercept[SparkException] { TransactionUtils.beginTransaction(catalog) }
     assert(aborted)
     assert(closed)
+  }
+
+  // --- Stable Transaction Identity ------------------------------------------
+  test("stableTransactionInfo: is deterministic across driver incarnations") {
+    val first = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("MERGE(table=t,condition=id=source.id)"))
+    val second = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("MERGE(table=t,condition=id=source.id)"))
+
+    assert(first == second)
+    assert(first.id.startsWith("spark-txn-v1-"))
+    assert(first.id.length == "spark-txn-v1-".length + 64)
+    assert(first.canonicalOperationDigest.length == 64)
+  }
+
+  test("stableTransactionInfo: binds every identity component") {
+    val baseline = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("UPDATE(table=t,set=value+1)"))
+    val differentExecution = TransactionUtils.stableTransactionInfo(
+      "execution-2", testCatalogName, bytes("UPDATE(table=t,set=value+1)"))
+    val differentCatalog = TransactionUtils.stableTransactionInfo(
+      "execution-1", "other_catalog", bytes("UPDATE(table=t,set=value+1)"))
+    val differentOperation = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("DELETE(table=t,condition=true)"))
+
+    assert(baseline.id != differentExecution.id)
+    assert(baseline.id != differentCatalog.id)
+    assert(baseline.id != differentOperation.id)
+    assert(baseline.canonicalOperationDigest != differentOperation.canonicalOperationDigest)
+  }
+
+  test("stableTransactionInfo: length prefixes prevent field-boundary aliases") {
+    val first = TransactionUtils.stableTransactionInfo("ab", "c", bytes("d"))
+    val second = TransactionUtils.stableTransactionInfo("a", "bc", bytes("d"))
+
+    assert(first.id != second.id)
+  }
+
+  test("stableTransactionInfo: rejects incomplete identity") {
+    intercept[SparkException] {
+      TransactionUtils.stableTransactionInfo(" ", testCatalogName, bytes("operation"))
+    }
+    intercept[SparkException] {
+      TransactionUtils.stableTransactionInfo("execution-1", null, bytes("operation"))
+    }
+    intercept[SparkException] {
+      TransactionUtils.stableTransactionInfo("execution-1", testCatalogName, Array.emptyByteArray)
+    }
+    intercept[SparkException] {
+      TransactionUtils.stableTransactionInfo("execution-1", testCatalogName, null)
+    }
+  }
+
+  // --- Recover Transaction --------------------------------------------------
+  test("TransactionRecoveryResult: state determines transaction presence") {
+    val txn = new TestTransaction(testCatalogName)
+    val open = TransactionRecoveryResult.open(txn)
+
+    assert(open.state() == TransactionRecoveryState.OPEN)
+    assert(open.transaction().orElseThrow() eq txn)
+    Seq(
+      TransactionRecoveryResult.committed(),
+      TransactionRecoveryResult.aborted(),
+      TransactionRecoveryResult.unknown()).foreach { result =>
+      assert(result.state() != TransactionRecoveryState.OPEN)
+      assert(result.transaction().isEmpty)
+    }
+    intercept[NullPointerException] {
+      TransactionRecoveryResult.open(null)
+    }
+  }
+
+  test("resolveTransaction: returns authoritative open and terminal states") {
+    val info = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("operation"))
+    val txn = new TestTransaction(testCatalogName)
+    val open = TransactionUtils.resolveTransaction(
+      mockRecoveryCatalog(TransactionRecoveryResult.open(txn)), info)
+    val committed = TransactionUtils.resolveTransaction(
+      mockRecoveryCatalog(TransactionRecoveryResult.committed()), info)
+    val aborted = TransactionUtils.resolveTransaction(
+      mockRecoveryCatalog(TransactionRecoveryResult.aborted()), info)
+
+    assert(open.transaction().orElseThrow() eq txn)
+    assert(committed.state() == TransactionRecoveryState.COMMITTED)
+    assert(aborted.state() == TransactionRecoveryState.ABORTED)
+  }
+
+  test("resolveTransaction: unknown outcome fails without beginning a transaction") {
+    var beginCalls = 0
+    val catalog = mockRecoveryCatalog(
+      TransactionRecoveryResult.unknown(), onBegin = () => beginCalls += 1)
+    val info = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("operation"))
+
+    val error = intercept[SparkException] {
+      TransactionUtils.resolveTransaction(catalog, info)
+    }
+    assert(error.getMessage.contains("unknown durable outcome"))
+    assert(beginCalls == 0)
+  }
+
+  test("resolveTransaction: connector resolution failure does not begin a transaction") {
+    var beginCalls = 0
+    val catalog = new SupportsTransactionRecovery {
+      override def initialize(name: String, options: CaseInsensitiveStringMap): Unit = ()
+      override def name(): String = testCatalogName
+      override def beginTransaction(info: TransactionInfo): Transaction = {
+        beginCalls += 1
+        new TestTransaction(testCatalogName)
+      }
+      override def resolveTransaction(
+          info: TransactionRecoveryInfo): TransactionRecoveryResult = {
+        throw new RuntimeException("state store unavailable")
+      }
+    }
+    val info = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("operation"))
+
+    val error = intercept[RuntimeException] {
+      TransactionUtils.resolveTransaction(catalog, info)
+    }
+    assert(error.getMessage == "state store unavailable")
+    assert(beginCalls == 0)
+  }
+
+  test("resolveTransaction: rejects null and mismatched connector results") {
+    val info = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("operation"))
+    val nullResultCatalog = mockRecoveryCatalog(null)
+    intercept[SparkException] {
+      TransactionUtils.resolveTransaction(nullResultCatalog, info)
+    }
+
+    val mismatchedCatalog = mockRecoveryCatalog(
+      TransactionRecoveryResult.committed(), catalogName = "other_catalog")
+    intercept[SparkException] {
+      TransactionUtils.resolveTransaction(mismatchedCatalog, info)
+    }
+  }
+
+  test("resolveTransaction: closes an open transaction from a mismatched catalog") {
+    val info = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("operation"))
+    val txn = new TestTransaction("other_catalog")
+
+    intercept[SparkException] {
+      TransactionUtils.resolveTransaction(
+        mockRecoveryCatalog(TransactionRecoveryResult.open(txn)), info)
+    }
+    assert(txn.closed)
+    assert(!txn.aborted)
+  }
+
+  test("resolveTransaction: closes an open transaction with a null catalog") {
+    val info = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("operation"))
+    val txn = new TestTransaction(testCatalogName) {
+      override def catalog(): CatalogPlugin = null
+    }
+
+    intercept[SparkException] {
+      TransactionUtils.resolveTransaction(
+        mockRecoveryCatalog(TransactionRecoveryResult.open(txn)), info)
+    }
+    assert(txn.closed)
+    assert(!txn.aborted)
+  }
+
+  test("resolveTransaction: closes an open transaction with a null catalog name") {
+    val info = TransactionUtils.stableTransactionInfo(
+      "execution-1", testCatalogName, bytes("operation"))
+    val txn = new TestTransaction(null)
+
+    intercept[SparkException] {
+      TransactionUtils.resolveTransaction(
+        mockRecoveryCatalog(TransactionRecoveryResult.open(txn)), info)
+    }
+    assert(txn.closed)
+    assert(!txn.aborted)
   }
 }

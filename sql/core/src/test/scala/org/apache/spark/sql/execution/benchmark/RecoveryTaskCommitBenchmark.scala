@@ -18,10 +18,11 @@
 package org.apache.spark.sql.execution.benchmark
 
 import java.nio.charset.StandardCharsets
+import java.util.{List => JList, Optional}
 
 import org.apache.spark.benchmark.{Benchmark, BenchmarkBase}
-import org.apache.spark.sql.connector.write.{RecoveryCommitMessageCodec, RecoveryTaskCommitStore,
-  WriterCommitMessage}
+import org.apache.spark.sql.connector.recovery.RecoveryTaskCommitStore
+import org.apache.spark.sql.connector.write.{RecoveryCommitMessageCodec, WriterCommitMessage}
 import org.apache.spark.sql.execution.datasources.v2.{RecoveryTaskCommitContext,
   RecoveryTaskCommitEnvelope}
 
@@ -67,16 +68,27 @@ object RecoveryTaskCommitBenchmark extends BenchmarkBase {
 
   /** The envelope never calls the store, so a benchmark does not need a durable one. */
   private object NoopStore extends RecoveryTaskCommitStore {
+    override def capabilities(): RecoveryTaskCommitStore.Capabilities =
+      BenchmarkStoreCapabilities
     override def resolveWriteManifest(recoveryId: String, proposedValue: Array[Byte]): Array[Byte] =
       proposedValue
-    override def load(recoveryId: String, partitionIds: Array[Int]): Array[Array[Byte]] =
-      Array.fill(partitionIds.length)(null)
+    override def load(
+        recoveryId: String,
+        partitionIds: Array[Int]): JList[Optional[Array[Byte]]] =
+      java.util.Collections.nCopies(partitionIds.length, Optional.empty[Array[Byte]]())
     override def publish(
         recoveryId: String,
         partitionId: Int,
         taskAttemptId: Long,
         attemptNumber: Int,
         value: Array[Byte]): Array[Byte] = value
+  }
+
+  private object BenchmarkStoreCapabilities extends RecoveryTaskCommitStore.Capabilities {
+    override def semanticsVersion(): Int = RecoveryTaskCommitStore.SEMANTICS_VERSION
+    override def maxLoadBatchSize(): Int = 1024
+    override def maxManifestBytes(): Int = 2 * 1024 * 1024
+    override def maxTaskCommitBytes(): Int = 32 * 1024 * 1024
   }
 
   private def context(payloadBytes: Int): RecoveryTaskCommitContext =

@@ -40,11 +40,27 @@ import org.apache.spark.util.ArrayImplicits._
 trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
 
   private final val OPERATIONS_WITH_ROW =
-    Set(UPDATE_OPERATION, REINSERT_OPERATION, INSERT_OPERATION, COPY_OPERATION)
+    Set(UPDATE_OPERATION, REINSERT_OPERATION, INSERT_OPERATION, COPY_OPERATION,
+      NO_WRITE_OPERATION, DELETE_CONTROL_OPERATION, MATCHED_UPDATE_OPERATION,
+      NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION, MATCHED_DELETE_CONTROL_OPERATION,
+      NOT_MATCHED_BY_SOURCE_DELETE_CONTROL_OPERATION, SPLIT_UPDATE_REINSERT_OPERATION,
+      MATCHED_SPLIT_UPDATE_REINSERT_OPERATION,
+      NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_REINSERT_OPERATION)
   private final val OPERATIONS_WITH_METADATA =
-    Set(DELETE_OPERATION, UPDATE_OPERATION, REINSERT_OPERATION, COPY_OPERATION)
+    Set(DELETE_OPERATION, UPDATE_OPERATION, REINSERT_OPERATION, COPY_OPERATION,
+      NO_WRITE_OPERATION, DELETE_CONTROL_OPERATION, MATCHED_UPDATE_OPERATION,
+      MATCHED_DELETE_OPERATION,
+      NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION, NOT_MATCHED_BY_SOURCE_DELETE_OPERATION,
+      MATCHED_DELETE_CONTROL_OPERATION, NOT_MATCHED_BY_SOURCE_DELETE_CONTROL_OPERATION,
+      SPLIT_UPDATE_DELETE_OPERATION, SPLIT_UPDATE_REINSERT_OPERATION,
+      MATCHED_SPLIT_UPDATE_DELETE_OPERATION, MATCHED_SPLIT_UPDATE_REINSERT_OPERATION,
+      NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_DELETE_OPERATION,
+      NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_REINSERT_OPERATION)
   private final val OPERATIONS_WITH_ROW_ID =
-    Set(DELETE_OPERATION, UPDATE_OPERATION)
+    Set(DELETE_OPERATION, UPDATE_OPERATION, MATCHED_UPDATE_OPERATION, MATCHED_DELETE_OPERATION,
+      NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION, NOT_MATCHED_BY_SOURCE_DELETE_OPERATION,
+      SPLIT_UPDATE_DELETE_OPERATION, MATCHED_SPLIT_UPDATE_DELETE_OPERATION,
+      NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_DELETE_OPERATION)
 
   protected def groupFilterEnabled: Boolean = conf.runtimeRowLevelOperationGroupFilterEnabled
 
@@ -133,10 +149,11 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
       rowAttrs: Seq[Attribute],
       rowIdAttrs: Seq[Attribute],
       metadataAttrs: Seq[Attribute],
-      originalRowIdValues: Seq[Expression] = Seq.empty): Seq[Expression] = {
+      originalRowIdValues: Seq[Expression] = Seq.empty,
+      operation: Int = DELETE_OPERATION): Seq[Expression] = {
     val rowValues = buildDeltaDeleteRowValues(rowAttrs, rowIdAttrs)
     val metadataValues = nullifyMetadataOnDelete(metadataAttrs)
-    Seq(Literal(DELETE_OPERATION)) ++ rowValues ++ metadataValues ++ originalRowIdValues
+    Seq(Literal(operation)) ++ rowValues ++ metadataValues ++ originalRowIdValues
   }
 
   protected def nullifyMetadataOnDelete(attrs: Seq[Attribute]): Seq[NamedExpression] = {
@@ -186,20 +203,22 @@ trait RewriteRowLevelCommand extends Rule[LogicalPlan] {
   protected def deltaUpdateOutput(
       assignments: Seq[Assignment],
       metadataAttrs: Seq[Attribute],
-      originalRowIdValues: Seq[Expression]): Seq[Expression] = {
+      originalRowIdValues: Seq[Expression],
+      operation: Int = UPDATE_OPERATION): Seq[Expression] = {
     val rowValues = assignments.map(_.value)
     val metadataValues = nullifyMetadataOnUpdate(metadataAttrs)
-    Seq(Literal(UPDATE_OPERATION)) ++ rowValues ++ metadataValues ++ originalRowIdValues
+    Seq(Literal(operation)) ++ rowValues ++ metadataValues ++ originalRowIdValues
   }
 
   protected def deltaReinsertOutput(
       assignments: Seq[Assignment],
       metadataAttrs: Seq[Attribute],
-      originalRowIdValues: Seq[Expression] = Seq.empty): Seq[Expression] = {
+      originalRowIdValues: Seq[Expression] = Seq.empty,
+      operation: Int = REINSERT_OPERATION): Seq[Expression] = {
     val rowValues = assignments.map(_.value)
     val metadataValues = nullifyMetadataOnReinsert(metadataAttrs)
     val extraNullValues = originalRowIdValues.map(e => Literal(null, e.dataType))
-    Seq(Literal(REINSERT_OPERATION)) ++ rowValues ++ metadataValues ++ extraNullValues
+    Seq(Literal(operation)) ++ rowValues ++ metadataValues ++ extraNullValues
   }
 
   protected def addOperationColumn(operation: Int, plan: LogicalPlan): LogicalPlan = {

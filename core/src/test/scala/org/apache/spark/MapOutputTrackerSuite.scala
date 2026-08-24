@@ -35,7 +35,8 @@ import org.apache.spark.internal.config.Network.{RPC_ASK_TIMEOUT, RPC_MESSAGE_MA
 import org.apache.spark.internal.config.Tests.IS_TESTING
 import org.apache.spark.network.shuffle.ExternalBlockStoreClient
 import org.apache.spark.rpc.{RpcAddress, RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
-import org.apache.spark.scheduler.{CompressedMapStatus, HighlyCompressedMapStatus, MapStatus, MergeStatus}
+import org.apache.spark.scheduler.{CompressedMapStatus, HighlyCompressedMapStatus, MapStatus,
+  MergeStatus, RecoveredMapStatus}
 import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.storage.{BlockManagerId, BlockManagerMasterEndpoint, ShuffleBlockId, ShuffleMergedBlockId}
 import org.apache.spark.util.collection.Utils.createArray
@@ -69,6 +70,7 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
       new MapOutputTrackerMasterEndpoint(rpcEnv, tracker, conf))
     tracker.registerShuffle(10, 2, MergeStatus.SHUFFLE_PUSH_DUMMY_NUM_REDUCES)
     assert(tracker.containsShuffle(10))
+    assert(!tracker.isRecoveredShuffle(10))
     val size1000 = MapStatus.decompressSize(MapStatus.compressSize(1000L))
     val size10000 = MapStatus.decompressSize(MapStatus.compressSize(10000L))
     tracker.registerMapOutput(10, 0, MapStatus(BlockManagerId("a", "hostA", 1000),
@@ -103,6 +105,7 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
     assert(0 == tracker.getNumCachedSerializedBroadcast)
     tracker.unregisterShuffle(10)
     assert(!tracker.containsShuffle(10))
+    assert(!tracker.isRecoveredShuffle(10))
     assert(tracker.getMapSizesByExecutorId(10, 0).isEmpty)
 
     tracker.stop()
@@ -118,15 +121,59 @@ class MapOutputTrackerSuite extends SparkFunSuite with LocalSparkContext {
     assert(statistics.shuffleId === 10)
     assert(statistics.bytesByPartitionId === partitionBytes)
     assert(tracker.containsShuffle(10))
+    assert(tracker.isRecoveredShuffle(10))
     assert(tracker.getNumAvailableOutputs(10) === 3)
     assert(tracker.findMissingPartitions(10).contains(Seq.empty))
     assert(tracker.getMapSizesByExecutorId(10, 0, 3, 0, 3).nonEmpty)
+
+    val statuses = tracker.shuffleStatuses(10).mapStatuses.map {
+      case status: RecoveredMapStatus => status
+      case other => fail(s"expected a compact recovered status, found ${other.getClass.getName}")
+    }
+    assert(statuses.tail.forall(_.sharesRecoveryMetadata(statuses.head)))
+    statuses.indices.foreach { mapIndex =>
+      partitionBytes.indices.foreach { reduceId =>
+        val uncompressedSize = partitionBytes(reduceId) / statuses.length +
+          (if (mapIndex < partitionBytes(reduceId) % statuses.length) 1L else 0L)
+        val expectedSize = MapStatus.decompressSize(MapStatus.compressSize(uncompressedSize))
+        assert(statuses(mapIndex).getSizeForBlock(reduceId) === expectedSize)
+      }
+    }
 
     intercept[IllegalArgumentException] {
       tracker.registerRecoveredShuffle(10, 3, partitionBytes)
     }
     tracker.unregisterShuffle(10)
     assert(!tracker.containsShuffle(10))
+    assert(!tracker.isRecoveredShuffle(10))
+    tracker.stop()
+  }
+
+  test("recovered shuffle status serialization preserves shared compact metadata") {
+    val tracker = newTrackerMaster()
+    val shuffleId = 11
+    val numMaps = 1000
+    val partitionBytes = Array.tabulate(1000)(partitionId => partitionId.toLong * 1000L)
+    tracker.registerRecoveredShuffle(shuffleId, numMaps, partitionBytes)
+    val statuses = tracker.shuffleStatuses(shuffleId).mapStatuses
+
+    assert(statuses.length === numMaps)
+    assert(statuses.forall(_.isInstanceOf[RecoveredMapStatus]))
+    val recoveredStatuses = statuses.map(_.asInstanceOf[RecoveredMapStatus])
+    assert(recoveredStatuses.tail.forall(_.sharesRecoveryMetadata(recoveredStatuses.head)))
+
+    val (serialized, broadcast) = MapOutputTracker.serializeOutputStatuses[MapStatus](
+      statuses, tracker.broadcastManager, tracker.isLocal, Int.MaxValue, conf)
+    assert(broadcast === null)
+    val restored = MapOutputTracker.deserializeOutputStatuses[MapStatus](serialized, conf)
+      .map(_.asInstanceOf[RecoveredMapStatus])
+
+    assert(restored.length === numMaps)
+    assert(restored.tail.forall(_.sharesRecoveryMetadata(restored.head)))
+    assert(restored(0).getSizeForBlock(999) === recoveredStatuses(0).getSizeForBlock(999))
+    assert(restored(999).getSizeForBlock(999) === recoveredStatuses(999).getSizeForBlock(999))
+
+    tracker.unregisterShuffle(shuffleId)
     tracker.stop()
   }
 

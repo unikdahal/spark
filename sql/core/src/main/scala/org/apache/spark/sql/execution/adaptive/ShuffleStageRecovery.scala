@@ -17,6 +17,9 @@
 
 package org.apache.spark.sql.execution.adaptive
 
+import java.nio.charset.StandardCharsets
+import java.security.MessageDigest
+
 import org.apache.spark.{MapOutputStatistics, ShuffleDependency}
 import org.apache.spark.annotation.{DeveloperApi, Experimental}
 import org.apache.spark.shuffle.{RecoveredShuffleOutput, ShuffleStageRecoveryHandler}
@@ -36,7 +39,10 @@ case class ShuffleStageRecoveryInfo(
     numPartitions: Int,
     plan: SparkPlan,
     canonicalizedPlan: SparkPlan,
-    canonicalizedQueryPlan: SparkPlan)
+    canonicalizedQueryPlan: SparkPlan,
+    protocolVersion: Int,
+    planFingerprint: String,
+    queryPlanFingerprint: String)
 
 /**
  * Runtime statistics for a shuffle whose data was recovered by an external shuffle service.
@@ -48,7 +54,8 @@ case class ShuffleStageRecoveryInfo(
 case class RecoveredShuffleStage(
     bytesByPartitionId: Seq[Long],
     dataSize: Long,
-    rowCount: Option[Long])
+    rowCount: Option[Long],
+    protocolVersion: Int)
 
 /**
  * Session-scoped extension for recovering completed shuffle stages after a driver restart.
@@ -65,16 +72,24 @@ case class RecoveredShuffleStage(
  *
  * A returned recovery must already be readable through the active shuffle manager. Spark
  * validates the statistics and installs scheduler state only after this method returns
- * successfully. Providers may use `canonicalizedPlan` together with their durable execution ID
- * to derive a restart-stable key. The key should include `canonicalizedQueryPlan`, so a changed
- * query cannot recover only the structurally unchanged stages of an older execution and mix them
- * with newly computed stages. `stageId` and `shuffleId` are local to the current driver. A durable
- * execution ID must identify one immutable logical execution and must not be reused for a later
- * independent run. Providers must tolerate concurrent calls from independently executing plans.
+ * successfully. Providers should use `planFingerprint` and `queryPlanFingerprint`, together with
+ * their durable execution ID, to derive a restart-stable key. The query fingerprint prevents a
+ * changed query from recovering only the structurally unchanged stages of an older execution and
+ * mixing them with newly computed stages. Providers must not render the plans for durable keys;
+ * display rendering is intentionally lossy. `stageId` and `shuffleId` are local to the current
+ * driver. A durable execution ID must identify one immutable logical execution and must not be
+ * reused for a later independent run. Providers must tolerate concurrent calls from independently
+ * executing plans.
  */
 @DeveloperApi
 @Experimental
 trait ShuffleStageRecovery extends RecoveryAnchorResolver {
+
+  /**
+   * The exact Spark shuffle-recovery protocol version implemented by this provider.
+   * Spark validates this before allowing the provider to inspect or adopt external state.
+   */
+  def protocolVersion: Int
 
   /**
    * Durably resolve the input version for this execution. The first driver must atomically store
@@ -105,7 +120,21 @@ trait ShuffleStageRecovery extends RecoveryAnchorResolver {
       result: RecoveredShuffleStage): Unit = {}
 }
 
-private[sql] object ShuffleStageRecovery {
+@DeveloperApi
+@Experimental
+object ShuffleStageRecovery {
+
+  val PROTOCOL_VERSION: Int = 1
+
+  /** A collision-resistant digest of the complete canonical plan, without display truncation. */
+  private[sql] def fingerprint(canonicalizedPlan: SparkPlan): String = {
+    // Unlike treeString, asCode walks every constructor argument and does not consult
+    // spark.sql.debug.maxToStringFields. The input is already canonicalized by the caller.
+    val bytes = canonicalizedPlan.asCode.getBytes(StandardCharsets.UTF_8)
+    MessageDigest.getInstance("SHA-256").digest(bytes).map { byte =>
+      f"${byte & 0xff}%02x"
+    }.mkString
+  }
 
   def install(
       exchange: ShuffleExchangeLike,
@@ -121,7 +150,19 @@ private[sql] object ShuffleStageRecovery {
           shuffleId: Int,
           numMappers: Int,
           numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        require(
+          info.protocolVersion == PROTOCOL_VERSION,
+          s"Shuffle recovery request protocol ${info.protocolVersion} does not match Spark " +
+            s"protocol $PROTOCOL_VERSION")
+        require(
+          provider.protocolVersion == info.protocolVersion,
+          s"Shuffle recovery provider protocol ${provider.protocolVersion} does not match " +
+            s"Spark protocol ${info.protocolVersion}")
         provider.tryRecover(info).map { recovered =>
+          require(
+            recovered.protocolVersion == info.protocolVersion,
+            s"Recovered shuffle protocol ${recovered.protocolVersion} does not match request " +
+              s"protocol ${info.protocolVersion}")
           recovered.rowCount.foreach { rowCount =>
             exchange.metrics(
               SQLShuffleWriteMetricsReporter.SHUFFLE_RECORDS_WRITTEN).set(rowCount)
@@ -144,7 +185,8 @@ private[sql] object ShuffleStageRecovery {
           RecoveredShuffleStage(
             statistics.bytesByPartitionId.clone().toIndexedSeq,
             runtimeStatistics.sizeInBytes.toLong,
-            runtimeStatistics.rowCount.map(_.toLong)))
+            runtimeStatistics.rowCount.map(_.toLong),
+            info.protocolVersion))
       }
 
       override def abortRecovery(shuffleId: Int, cause: Throwable): Unit = {

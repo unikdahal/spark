@@ -17,21 +17,20 @@
 
 package org.apache.spark.sql.execution.adaptive
 
-import java.nio.charset.StandardCharsets
-import java.security.MessageDigest
-
+import org.apache.spark.sql.QueryTest
 import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.functions
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.sql.QueryTest
 
 /**
  * A recovery provider derives its durable stage key from the canonicalized plans handed to it in
- * [[ShuffleStageRecoveryInfo]]. Celeborn's provider builds that key by hashing
- * `canonicalizedQueryPlan.treeString` and `canonicalizedPlan.treeString`.
+ * [[ShuffleStageRecoveryInfo]]. Spark supplies collision-resistant fingerprints of both the
+ * canonical query plan and canonical stage plan, so providers do not need to render plans.
  *
- * `TreeNode.treeString` renders at most `spark.sql.debug.maxToStringFields` (default 25) elements of
- * a sequence-like field and replaces the rest with a `"... N more fields"` placeholder. On a wide
+ * `TreeNode.treeString` renders at most `spark.sql.debug.maxToStringFields` (default 25)
+ * elements of a sequence-like field and replaces the rest with a `"... N more fields"`
+ * placeholder. On a wide
  * table, the elided elements are exactly the ones that distinguish two otherwise identical stages,
  * so a plan-string-derived key can collide across queries that produce different output. Adopting a
  * shuffle under a colliding key is a false-positive recovery: a replacement driver reuses output
@@ -50,18 +49,16 @@ class RecoveryKeyDiscriminationSuite extends QueryTest with SharedSparkSession {
     base.select(columns: _*)
   }
 
-  /** The recovery-key recipe used by Celeborn's ShuffleStageRecovery provider. */
+  /** A provider key assembled only from immutable values supplied by Spark. */
   private def recoveryKey(
       recoveryId: String,
       numMappers: Int,
       numPartitions: Int,
       canonicalizedQueryPlan: SparkPlan,
       canonicalizedPlan: SparkPlan): String = {
-    val material = spark.version + '\n' + recoveryId + '\n' + numMappers + '\n' +
-      numPartitions + '\n' + canonicalizedQueryPlan.treeString + '\n' + canonicalizedPlan.treeString
-    val digest = MessageDigest.getInstance("SHA-256")
-      .digest(material.getBytes(StandardCharsets.UTF_8))
-    recoveryId + "/" + digest.map(b => f"${b & 0xff}%02x").mkString
+    recoveryId + "/" + spark.version + "/" + numMappers + "/" + numPartitions + "/" +
+      ShuffleStageRecovery.fingerprint(canonicalizedQueryPlan) + "/" +
+      ShuffleStageRecovery.fingerprint(canonicalizedPlan)
   }
 
   /**
@@ -71,7 +68,8 @@ class RecoveryKeyDiscriminationSuite extends QueryTest with SharedSparkSession {
    * `maxToStringFields` cut-off of the plan string.
    */
   private def shuffleStagePlan(tail: String): SparkPlan = {
-    val aggregates = (1 until numColumns - 1).map(i => s"sum(c$i) as s$i") :+ tail
+    val aggregates =
+      ((1 until numColumns - 1).map(i => s"sum(c$i) as s$i") :+ tail).map(functions.expr)
     val df = wideDf().groupBy("c0").agg(aggregates.head, aggregates.tail: _*)
     df.queryExecution.sparkPlan
   }
@@ -99,17 +97,41 @@ class RecoveryKeyDiscriminationSuite extends QueryTest with SharedSparkSession {
         "different projection")
   }
 
-  test("recovery keys discriminate the same plans when the plan string is not truncated") {
+  test("recovery fingerprints are independent of maxToStringFields") {
+    val planA = shuffleStagePlan(s"sum(c${numColumns - 1}) as tail")
+    val planB = shuffleStagePlan(s"sum(c${numColumns - 1} + 1) as tail")
+    val truncatedA = ShuffleStageRecovery.fingerprint(planA.canonicalized)
+    val truncatedB = ShuffleStageRecovery.fingerprint(planB.canonicalized)
+
     withSQLConf(SQLConf.MAX_TO_STRING_FIELDS.key -> Int.MaxValue.toString) {
-      val planA = shuffleStagePlan(s"sum(c${numColumns - 1}) as tail")
-      val planB = shuffleStagePlan(s"sum(c${numColumns - 1} + 1) as tail")
-
-      val keyA = recoveryKey("RUN-1", 8, 4, planA.canonicalized, planA.canonicalized)
-      val keyB = recoveryKey("RUN-1", 8, 4, planB.canonicalized, planB.canonicalized)
-
-      assert(keyA != keyB,
-        "recovery keys collided even with truncation disabled; the plan string is not a usable " +
-          "discriminator at all")
+      assert(ShuffleStageRecovery.fingerprint(planA.canonicalized) === truncatedA)
+      assert(ShuffleStageRecovery.fingerprint(planB.canonicalized) === truncatedB)
     }
+  }
+
+  test("representative canonical plans have deterministic distinct recovery fingerprints") {
+    val representativePlans = Seq[(String, () => SparkPlan)](
+      "filter" -> (() => spark.range(32).where("id % 3 = 0").queryExecution.sparkPlan),
+      "aggregate" -> (() => spark.range(32)
+        .selectExpr("id % 4 AS bucket", "id")
+        .groupBy("bucket")
+        .sum("id")
+        .queryExecution.sparkPlan),
+      "shuffle" -> (() => spark.range(32).repartition(4).queryExecution.sparkPlan))
+
+    val firstConstruction = representativePlans.map { case (name, createPlan) =>
+      name -> ShuffleStageRecovery.fingerprint(createPlan().canonicalized)
+    }
+    val independentConstruction = representativePlans.map { case (name, createPlan) =>
+      name -> ShuffleStageRecovery.fingerprint(createPlan().canonicalized)
+    }
+
+    assert(firstConstruction === independentConstruction)
+    assert(firstConstruction.map(_._2).distinct.size === firstConstruction.size)
+    firstConstruction.foreach { case (_, fingerprint) =>
+      assert(fingerprint.matches("[0-9a-f]{64}"))
+    }
+    assert(ShuffleStageRecovery.PROTOCOL_VERSION === 1,
+      "changing the canonical fingerprint contract requires a recovery protocol version bump")
   }
 }

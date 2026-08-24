@@ -290,14 +290,19 @@ case class ShuffleExchangeExec(
         case _: AdaptiveSparkPlanExec =>
         case queryPlan =>
           session.sessionState.shuffleStageRecovery.foreach { provider =>
+            val canonicalizedPlan = canonicalized
+            val canonicalizedQueryPlan = queryPlan.canonicalized
             val info = ShuffleStageRecoveryInfo(
               stageId = -1,
               shuffleId = dependency.shuffleId,
               numMappers = dependency.rdd.getNumPartitions,
               numPartitions = dependency.partitioner.numPartitions,
               plan = this,
-              canonicalizedPlan = canonicalized,
-              canonicalizedQueryPlan = queryPlan.canonicalized)
+              canonicalizedPlan = canonicalizedPlan,
+              canonicalizedQueryPlan = canonicalizedQueryPlan,
+              protocolVersion = ShuffleStageRecovery.PROTOCOL_VERSION,
+              planFingerprint = ShuffleStageRecovery.fingerprint(canonicalizedPlan),
+              queryPlanFingerprint = ShuffleStageRecovery.fingerprint(canonicalizedQueryPlan))
             ShuffleStageRecovery.install(this, dependency, info, provider)
           }
       }

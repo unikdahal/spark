@@ -441,14 +441,19 @@ case class AdaptiveSparkPlanExec(
 
   private def recoveryInfo(stage: ShuffleQueryStageExec): ShuffleStageRecoveryInfo = {
     val shuffle = stage.shuffle
+    val canonicalizedPlan = stage._canonicalized
+    val canonicalizedQueryPlan = initialPlan.canonicalized
     ShuffleStageRecoveryInfo(
       stage.id,
       shuffle.shuffleId,
       shuffle.numMappers,
       shuffle.numPartitions,
       stage.plan,
-      stage._canonicalized,
-      initialPlan.canonicalized)
+      canonicalizedPlan,
+      canonicalizedQueryPlan,
+      ShuffleStageRecovery.PROTOCOL_VERSION,
+      ShuffleStageRecovery.fingerprint(canonicalizedPlan),
+      ShuffleStageRecovery.fingerprint(canonicalizedQueryPlan))
   }
 
   /** Install recovery before `materialize()` submits the shuffle map job. */

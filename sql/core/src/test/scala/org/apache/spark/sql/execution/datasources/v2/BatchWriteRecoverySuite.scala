@@ -22,7 +22,7 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, StandardOpenOption}
 import java.util
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicInteger, AtomicReference}
 
 import scala.jdk.CollectionConverters._
 
@@ -33,14 +33,17 @@ import org.apache.spark.sql.catalyst.analysis.{SourceRecoveryInfo, WriteRecovery
 import org.apache.spark.sql.connector.catalog.{SupportsRecoveryWrite, SupportsWrite, Table,
   TableCapability, TableProvider}
 import org.apache.spark.sql.connector.expressions.Transform
+import org.apache.spark.sql.connector.metric.{CustomMetric, CustomTaskMetric}
+import org.apache.spark.sql.connector.recovery.RecoveryTaskCommitStore
 import org.apache.spark.sql.connector.write.{BatchWrite, BatchWriteRecoveryState, DataWriterFactory,
   LogicalWriteInfo, PhysicalWriteInfo, RecoveryCommitMessageCodec, RecoveryDataWriter,
-  RecoveryDataWriterFactory, RecoveryTaskCommitStore, SupportsBatchWriteRecovery, Write,
-  WriteBuilder, WriterCommitMessage}
+  RecoveryDataWriterFactory, RecoveryTaskMetricDescriptor, RecoveryTaskMetricSchema,
+  SupportsRecoveryTaskMetrics, Write, WriteBuilder, WriterCommitMessage}
+import org.apache.spark.sql.execution.{CommandResultExec, QueryExecution}
 import org.apache.spark.sql.execution.adaptive.{RecoveredShuffleStage, ShuffleStageRecovery,
   ShuffleStageRecoveryInfo}
 import org.apache.spark.sql.types.{LongType, StructType}
-import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.sql.util.{CaseInsensitiveStringMap, QueryExecutionListener}
 import org.apache.spark.util.Utils
 
 /**
@@ -84,7 +87,7 @@ class BatchWriteRecoverySuite extends SparkFunSuite {
   }
 
   private def withRecoveringSession[T](fault: StoreFault = NoFault)(body: SparkSession => T): T = {
-    val store = new DirectoryRecoveryTaskCommitStore(storeDir.toPath, fault)
+    val store = new DirectoryRecoveryTaskCommitStore(storeDir.getAbsolutePath, fault)
     val session = SparkSession.builder()
       // Four task attempts: the lost-reply scenario depends on Spark retrying a failed task, and
       // a plain "local[N]" master allows exactly one attempt.
@@ -107,15 +110,44 @@ class BatchWriteRecoverySuite extends SparkFunSuite {
     }
   }
 
-  private def runWrite(session: SparkSession, numPartitions: Int, numRows: Long): Unit = {
-    session.range(0, numRows)
-      .repartition(numPartitions)
-      .write
-      .format(classOf[TestRecoverableSinkProvider].getName)
-      .option("path", sinkDir.getAbsolutePath)
-      .option("sinkId", "test-sink")
-      .mode("append")
-      .save()
+  private def runWrite(
+      session: SparkSession,
+      numPartitions: Int,
+      numRows: Long): V2TableWriteExec = {
+    val captured = new AtomicReference[V2TableWriteExec]()
+    val listener = new QueryExecutionListener {
+      override def onSuccess(
+          funcName: String, qe: QueryExecution, durationNs: Long): Unit = capture(qe)
+
+      override def onFailure(
+          funcName: String, qe: QueryExecution, exception: Exception): Unit = capture(qe)
+
+      private def capture(qe: QueryExecution): Unit = {
+        val commandPlan = qe.executedPlan match {
+          case command: CommandResultExec => command.commandPhysicalPlan
+          case plan => plan
+        }
+        commandPlan.collectFirst { case write: V2TableWriteExec => write }
+          .foreach(write => captured.compareAndSet(null, write))
+      }
+    }
+    session.listenerManager.register(listener)
+    try {
+      session.range(0, numRows)
+        .repartition(numPartitions)
+        .write
+        .format(classOf[TestRecoverableSinkProvider].getName)
+        .option("path", sinkDir.getAbsolutePath)
+        .option("sinkId", "test-sink")
+        .mode("append")
+        .save()
+      session.sparkContext.listenerBus.waitUntilEmpty()
+      Option(captured.get()).getOrElse {
+        fail("the query execution listener did not capture V2TableWriteExec")
+      }
+    } finally {
+      session.listenerManager.unregister(listener)
+    }
   }
 
   private def committedRows(): Long = {
@@ -143,22 +175,28 @@ class BatchWriteRecoverySuite extends SparkFunSuite {
       "the failed write must leave exactly the accepted commits durable")
 
     TestWriterCounters.reset()
-    withRecoveringSession() { session =>
+    val replacementExec = withRecoveringSession() { session =>
       runWrite(session, numPartitions = 6, numRows = 600)
     }
     assert(TestWriterCounters.writersCreated.get() === 6 - accepted,
       "the replacement driver must create writers only for partitions with no durable commit")
+    assert(replacementExec.customMetrics(TestRecoveryMetrics.Rows).value === 600L,
+      "recovered and newly written partition metrics must be aggregated exactly once")
     assert(committedRows() === 600L)
   }
 
   test("an executor adopts the canonical commit when its publish reply is lost") {
-    withRecoveringSession(DropReplyAfterPublish(1)) { session =>
+    val writeExec = withRecoveringSession(DropReplyAfterPublish(1)) { session =>
       runWrite(session, numPartitions = 4, numRows = 400)
     }
     assert(TestWriterCounters.writersCreated.get() === 4,
       "the retry of the partition whose reply was lost must not create a second writer")
     assert(TestWriterCounters.preflightHits.get() === 1,
       "the retry must observe the canonical commit before creating a writer")
+    assert(TestWriterCounters.driverCommitCallbacks.get() === 0,
+      "recovery writes must not replay non-durable per-task driver callbacks")
+    assert(writeExec.customMetrics(TestRecoveryMetrics.Rows).value === 400L,
+      "a retry that adopts an accepted commit must not add its metric twice")
     assert(committedRows() === 400L)
   }
 
@@ -178,6 +216,41 @@ class BatchWriteRecoverySuite extends SparkFunSuite {
     assert(TestWriterCounters.globalCommits.get() === 0,
       "an already committed write must not commit again")
     assert(util.Arrays.equals(firstCommit, Files.readAllBytes(marker)))
+  }
+
+  test("a globally committed write does not depend on task-record lookup availability") {
+    withRecoveringSession() { session =>
+      runWrite(session, numPartitions = 4, numRows = 400)
+    }
+
+    TestWriterCounters.reset()
+    val recoveredExec = withRecoveringSession(
+        FailLoad(RecoveryTaskCommitStore.FailureReason.UNAVAILABLE)) { session =>
+      runWrite(session, numPartitions = 4, numRows = 400)
+    }
+    assert(TestWriterCounters.writersCreated.get() === 0)
+    assert(TestWriterCounters.globalCommits.get() === 0)
+    assert(recoveredExec.customMetrics(TestRecoveryMetrics.Rows).value === 400L,
+      "a globally committed write must restore connector-owned durable metric totals")
+  }
+
+  test("a globally committed write fails closed when durable metric totals are missing") {
+    withRecoveringSession() { session =>
+      runWrite(session, numPartitions = 4, numRows = 400)
+    }
+
+    TestWriterCounters.reset()
+    TestWriterCounters.omitCommittedMetricTotals.set(true)
+    val error = intercept[Exception] {
+      withRecoveringSession() { session =>
+        runWrite(session, numPartitions = 4, numRows = 400)
+      }
+    }
+    assert(Utils.exceptionString(error).contains("do not match the durable schema"),
+      "expected missing durable metric totals to fail closed, got: " +
+        Utils.exceptionString(error))
+    assert(TestWriterCounters.writersCreated.get() === 0)
+    assert(TestWriterCounters.globalCommits.get() === 0)
   }
 
   test("a replacement driver with a different partition count fails closed") {
@@ -209,10 +282,27 @@ class BatchWriteRecoverySuite extends SparkFunSuite {
     assert(Utils.exceptionString(error).contains("checksum"),
       s"expected a checksum failure, got: ${Utils.exceptionString(error)}")
   }
+
+  test("non-authoritative store failures never start a writer") {
+    Seq(
+      RecoveryTaskCommitStore.FailureReason.UNAVAILABLE,
+      RecoveryTaskCommitStore.FailureReason.FENCED,
+      RecoveryTaskCommitStore.FailureReason.AMBIGUOUS).foreach { reason =>
+      TestWriterCounters.reset()
+      intercept[Exception] {
+        withRecoveringSession(FailLoad(reason)) { session =>
+          runWrite(session, numPartitions = 2, numRows = 20)
+        }
+      }
+      assert(TestWriterCounters.writersCreated.get() === 0,
+        s"$reason store failure must happen before writer creation")
+    }
+  }
 }
 
 /** A fault injected into the durable store. None of these weaken what the store guarantees. */
 private sealed trait StoreFault extends Serializable {
+  def beforeLoad(): Unit = {}
   def beforePublish(partitionId: Int): Unit = {}
   def afterPublish(partitionId: Int): Unit = {}
   def onRead(partitionId: Int, value: Array[Byte]): Array[Byte] = value
@@ -248,6 +338,12 @@ private case object CorruptOnRead extends StoreFault {
   }
 }
 
+private case class FailLoad(reason: RecoveryTaskCommitStore.FailureReason) extends StoreFault {
+  override def beforeLoad(): Unit = {
+    throw new RecoveryTaskCommitStore.StoreException(reason, s"injected $reason lookup failure")
+  }
+}
+
 /**
  * Counters shared by the driver and its local executors. They are JVM-global because a `local[N]`
  * executor runs in this JVM but not in this suite instance.
@@ -258,6 +354,8 @@ private object TestWriterCounters {
   val globalCommits = new AtomicInteger(0)
   val publishes = new AtomicInteger(0)
   val droppedReplies = new AtomicInteger(0)
+  val driverCommitCallbacks = new AtomicInteger(0)
+  val omitCommittedMetricTotals = new AtomicBoolean(false)
 
   def reset(): Unit = {
     writersCreated.set(0)
@@ -265,6 +363,8 @@ private object TestWriterCounters {
     globalCommits.set(0)
     publishes.set(0)
     droppedReplies.set(0)
+    driverCommitCallbacks.set(0)
+    omitCommittedMetricTotals.set(false)
   }
 }
 
@@ -276,11 +376,14 @@ private object TestWriterCounters {
  * `ATOMIC_MOVE`: it lowers to `rename(2)`, which replaces the target, and the existence check the
  * JDK performs without `REPLACE_EXISTING` is a separate stat, and therefore racy.
  */
-private class DirectoryRecoveryTaskCommitStore(root: Path, fault: StoreFault)
+private class DirectoryRecoveryTaskCommitStore(root: String, fault: StoreFault)
   extends RecoveryTaskCommitStore {
 
+  override def capabilities(): RecoveryTaskCommitStore.Capabilities =
+    DirectoryStoreCapabilities
+
   private def recordPath(recoveryId: String, partitionId: Int): Path =
-    root.resolve(s"${sanitize(recoveryId)}__$partitionId.record")
+    new File(root, s"${sanitize(recoveryId)}__$partitionId.record").toPath
 
   private def sanitize(id: String): String = id.replaceAll("[^A-Za-z0-9_.-]", "_")
 
@@ -292,8 +395,8 @@ private class DirectoryRecoveryTaskCommitStore(root: Path, fault: StoreFault)
     if (existing.isDefined) {
       existing.get
     } else {
-      Files.createDirectories(root)
-      val temp = root.resolve(s".tmp-${UUID.randomUUID()}")
+      Files.createDirectories(new File(root).toPath)
+      val temp = new File(root, s".tmp-${UUID.randomUUID()}").toPath
       Files.write(temp, value, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
       try {
         Files.createLink(target, temp)
@@ -309,19 +412,24 @@ private class DirectoryRecoveryTaskCommitStore(root: Path, fault: StoreFault)
   }
 
   override def resolveWriteManifest(recoveryId: String, proposedValue: Array[Byte]): Array[Byte] =
-    compareAndSet(root.resolve(s"${sanitize(recoveryId)}__manifest.record"), proposedValue)
+    compareAndSet(
+      new File(root, s"${sanitize(recoveryId)}__manifest.record").toPath, proposedValue)
 
-  override def load(recoveryId: String, partitionIds: Array[Int]): Array[Array[Byte]] = {
+  override def load(
+      recoveryId: String,
+      partitionIds: Array[Int]): util.List[util.Optional[Array[Byte]]] = {
+    fault.beforeLoad()
     val loaded = partitionIds.map { partitionId =>
       readIfPresent(recordPath(recoveryId, partitionId))
         .map(value => fault.onRead(partitionId, value))
-        .orNull
+        .map(util.Optional.of[Array[Byte]])
+        .getOrElse(util.Optional.empty[Array[Byte]]())
     }
-    if (partitionIds.length == 1 && loaded.head != null) {
+    if (partitionIds.length == 1 && loaded.head.isPresent) {
       // A single-key load only happens in the executor preflight.
       TestWriterCounters.preflightHits.incrementAndGet()
     }
-    loaded
+    loaded.toList.asJava
   }
 
   override def publish(
@@ -338,6 +446,13 @@ private class DirectoryRecoveryTaskCommitStore(root: Path, fault: StoreFault)
   }
 }
 
+private object DirectoryStoreCapabilities extends RecoveryTaskCommitStore.Capabilities {
+  override def semanticsVersion(): Int = RecoveryTaskCommitStore.SEMANTICS_VERSION
+  override def maxLoadBatchSize(): Int = 1024
+  override def maxManifestBytes(): Int = 2 * 1024 * 1024
+  override def maxTaskCommitBytes(): Int = 32 * 1024 * 1024
+}
+
 /**
  * A recovery provider that implements write recovery only. `tryRecover` returns `None`, which the
  * SPI defines as authoritative permission to recompute the stage, so these tests exercise the write
@@ -345,6 +460,8 @@ private class DirectoryRecoveryTaskCommitStore(root: Path, fault: StoreFault)
  */
 private class TestRecoveryProvider(root: Path, store: RecoveryTaskCommitStore)
   extends ShuffleStageRecovery {
+
+  override def protocolVersion: Int = ShuffleStageRecovery.PROTOCOL_VERSION
 
   override def tryRecover(info: ShuffleStageRecoveryInfo): Option[RecoveredShuffleStage] = None
 
@@ -373,6 +490,35 @@ private object TestRecoveryProvider {
 
 private object TestSinkPaths {
   val CommittedMarker = "_COMMITTED"
+}
+
+private object TestRecoveryMetrics {
+  val Rows = "recoveryRows"
+
+  val Schema = new RecoveryTaskMetricSchema(
+    "test-recoverable-sink-metrics",
+    1,
+    Array(new RecoveryTaskMetricDescriptor(
+      Rows,
+      "row-count",
+      RecoveryTaskMetricDescriptor.ADDITIVE_AGGREGATION,
+      1,
+      0L,
+      Long.MaxValue)))
+}
+
+class TestRecoveryRowsMetric extends CustomMetric {
+  override def name(): String = TestRecoveryMetrics.Rows
+
+  override def description(): String = "number of rows reported by the recovery test writer"
+
+  override def aggregateTaskMetrics(taskMetrics: Array[Long]): String = taskMetrics.sum.toString
+}
+
+private case class TestRecoveryRowsTaskMetric(metricValue: Long) extends CustomTaskMetric {
+  override def name(): String = TestRecoveryMetrics.Rows
+
+  override def value(): Long = metricValue
 }
 
 private case class TestCommit(fileName: String, numRows: Long) extends WriterCommitMessage
@@ -422,6 +568,9 @@ private class TestRecoveryDataWriter(root: String, partitionId: Int, taskId: Lon
 
   override def close(): Unit = {}
 
+  override def currentMetricsValues(): Array[CustomTaskMetric] =
+    Array(TestRecoveryRowsTaskMetric(numRows))
+
   override def discardCommittedOutput(committedMessage: WriterCommitMessage): Unit =
     Files.deleteIfExists(new File(root, committedMessage.asInstanceOf[TestCommit].fileName).toPath)
 }
@@ -433,10 +582,10 @@ private class TestRecoveryDataWriterFactory(root: String) extends RecoveryDataWr
   }
 }
 
-private class TestRecoverableBatchWrite(root: String, writeId: String, sinkId: String)
-  extends SupportsBatchWriteRecovery {
+private class TestRecoverableBatchWrite(root: String, sinkId: String)
+  extends SupportsRecoveryTaskMetrics {
 
-  override def recoveryId(): String = writeId
+  override def recoveryTaskMetricSchema(): RecoveryTaskMetricSchema = TestRecoveryMetrics.Schema
 
   override def commitMessageCodec(): RecoveryCommitMessageCodec = new TestCommitCodec
 
@@ -450,10 +599,25 @@ private class TestRecoverableBatchWrite(root: String, writeId: String, sinkId: S
     // authority for per-partition state: the strictest configuration of the contract.
     new BatchWriteRecoveryState {
       override def isCommitted(): Boolean = committed
-      override def commitMessages(): Array[WriterCommitMessage] =
-        new Array[WriterCommitMessage](info.numPartitions())
-      override def numRows(): Array[Long] = Array.fill(info.numPartitions())(-1L)
+
+      override def totalNumRows(): Long = if (committed) committedRowCount() else -1L
+
+      override def totalTaskMetrics(): util.Map[String, java.lang.Long] = {
+        if (committed && !TestWriterCounters.omitCommittedMetricTotals.get()) {
+          util.Collections.singletonMap(
+            TestRecoveryMetrics.Rows, java.lang.Long.valueOf(committedRowCount()))
+        } else {
+          util.Collections.emptyMap[String, java.lang.Long]()
+        }
+      }
     }
+  }
+
+  private def committedRowCount(): Long = {
+    Files.readAllLines(new File(root, TestSinkPaths.CommittedMarker).toPath).asScala
+      .flatMap(_.split(" ").find(_.startsWith("rows=")))
+      .map(_.stripPrefix("rows=").toLong)
+      .sum
   }
 
   override def abortAfterRecovery(messages: Array[WriterCommitMessage]): Unit = {
@@ -462,6 +626,9 @@ private class TestRecoverableBatchWrite(root: String, writeId: String, sinkId: S
 
   override def createBatchWriterFactory(info: PhysicalWriteInfo): DataWriterFactory =
     new TestRecoveryDataWriterFactory(root)
+
+  override def onDataWriterCommit(message: WriterCommitMessage): Unit =
+    TestWriterCounters.driverCommitCallbacks.incrementAndGet()
 
   override def commit(messages: Array[WriterCommitMessage]): Unit = {
     val payload = messages.zipWithIndex.map { case (message, partitionId) =>
@@ -491,7 +658,9 @@ private class TestRecoverableTable(root: String, sinkId: String)
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder = new WriteBuilder {
     override def build(): Write = new Write {
       override def description(): String = s"test-recoverable-sink ${info.queryId()}"
-      override def toBatch: BatchWrite = new TestRecoverableBatchWrite(root, info.queryId(), sinkId)
+      override def supportedCustomMetrics(): Array[CustomMetric] =
+        Array(new TestRecoveryRowsMetric)
+      override def toBatch: BatchWrite = new TestRecoverableBatchWrite(root, sinkId)
     }
   }
 }

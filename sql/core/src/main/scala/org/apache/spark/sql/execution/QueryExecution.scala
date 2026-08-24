@@ -18,6 +18,7 @@
 package org.apache.spark.sql.execution
 
 import java.io.{BufferedWriter, OutputStreamWriter}
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 import javax.annotation.concurrent.GuardedBy
@@ -40,8 +41,8 @@ import org.apache.spark.sql.catalyst.transactions.TransactionUtils
 import org.apache.spark.sql.catalyst.util.StringUtils.PlanStringConcat
 import org.apache.spark.sql.catalyst.util.truncatedString
 import org.apache.spark.sql.classic.SparkSession
-import org.apache.spark.sql.connector.catalog.LookupCatalog
-import org.apache.spark.sql.connector.catalog.transactions.Transaction
+import org.apache.spark.sql.connector.catalog.{LookupCatalog, SupportsTransactionRecovery, TransactionalCatalogPlugin}
+import org.apache.spark.sql.connector.catalog.transactions.{Transaction, TransactionRecoveryInfo, TransactionRecoveryResult, TransactionRecoveryState}
 import org.apache.spark.sql.execution.SQLExecution.EXECUTION_ROOT_ID_KEY
 import org.apache.spark.sql.execution.adaptive.{AdaptiveExecutionContext, InsertAdaptiveSparkPlan}
 import org.apache.spark.sql.execution.bucketing.{CoalesceBucketsInJoin, DisableUnnecessaryBucketedScan}
@@ -56,6 +57,11 @@ import org.apache.spark.sql.scripting.SqlScriptingExecution
 import org.apache.spark.sql.streaming.OutputMode
 import org.apache.spark.util.{LazyTry, Utils, UUIDv7Generator}
 import org.apache.spark.util.ArrayImplicits._
+
+private[execution] case class RecoverableTransaction(
+    catalog: SupportsTransactionRecovery,
+    info: TransactionRecoveryInfo,
+    result: TransactionRecoveryResult)
 
 /**
  * The primary workflow for executing relational queries using Spark.  Designed to allow easy
@@ -76,7 +82,9 @@ class QueryExecution(
     // the enclosing QueryExecution's analyzer here to propagate the transaction context.
     // Omitting it causes the nested QE to use sessionState.analyzer, which has no knowledge
     // of the transaction and will load tables outside the transaction's catalog scope.
-    val analyzerOpt: Option[Analyzer] = None) extends LookupCatalog {
+    val analyzerOpt: Option[Analyzer] = None,
+    private[execution] val recoverableTransactionOpt: Option[RecoverableTransaction] = None)
+  extends LookupCatalog {
 
   val id: Long = QueryExecution.nextExecutionId
 
@@ -111,17 +119,54 @@ class QueryExecution(
   //    should keep state about the reads (tables+predicates) that occurred during the transaction.
   // 3. The analyzer instance is passed to nested Query Execution instances. These need to respect
   //    the open transaction instead of creating their own.
+  private def transactionalCatalog: Option[TransactionalCatalogPlugin] = logical match {
+    case UnresolvedWith(TransactionalWrite(c), _, _) => Some(c)
+    case TransactionalWrite(c) => Some(c)
+    case _ => None
+  }
+
+  private val lazyRecoverableTransaction = LazyTry {
+    if (recoverableTransactionOpt.isDefined) {
+      recoverableTransactionOpt
+    } else if (analyzerOpt.isDefined || mode == CommandExecutionMode.SKIP) {
+      None
+    } else {
+      (transactionalCatalog, sparkSession.sessionState.shuffleStageRecovery) match {
+        case (Some(catalog: SupportsTransactionRecovery), Some(resolver)) =>
+          val operation = logical.canonicalized.asCode.getBytes(StandardCharsets.UTF_8)
+          val info = TransactionUtils.stableTransactionInfo(
+            resolver.recoveryExecutionId, catalog.name(), operation)
+          Some(RecoverableTransaction(
+            catalog, info, TransactionUtils.resolveTransaction(catalog, info)))
+        case (Some(catalog), Some(_)) =>
+          throw SparkException.internalError(
+            s"Recovery is enabled but transactional catalog ${catalog.name()} does not implement " +
+              classOf[SupportsTransactionRecovery].getName)
+        case _ => None
+      }
+    }
+  }
+  private def recoverableTransaction: Option[RecoverableTransaction] =
+    lazyRecoverableTransaction.get
+
   private val lazyTransactionOpt = LazyTry {
     // Always inherit an active transaction from the outer analyzer, regardless of mode.
     analyzerOpt.flatMap(_.catalogManager.transaction).orElse {
       // Only begin a new transaction for outer QEs that lead to execution.
       if (mode != CommandExecutionMode.SKIP) {
-        val catalog = logical match {
-          case UnresolvedWith(TransactionalWrite(c), _, _) => Some(c)
-          case TransactionalWrite(c) => Some(c)
-          case _ => None
+        recoverableTransaction match {
+          case Some(recovery) if recovery.result.state() == TransactionRecoveryState.OPEN =>
+            Some(recovery.result.transaction().orElseThrow())
+          case Some(recovery) if recovery.result.state() == TransactionRecoveryState.COMMITTED =>
+            None
+          case Some(recovery) if recovery.result.state() == TransactionRecoveryState.ABORTED =>
+            throw SparkException.internalError(
+              s"Transaction ${recovery.info.id()} was durably aborted; recovery cannot continue")
+          case Some(recovery) =>
+            throw SparkException.internalError(
+              s"Unexpected transaction recovery state ${recovery.result.state()}")
+          case None => transactionalCatalog.map(TransactionUtils.beginTransaction)
         }
-        catalog.map(TransactionUtils.beginTransaction)
       } else {
         None
       }
@@ -213,11 +258,24 @@ class QueryExecution(
   }
 
   private val lazyCommandExecuted = LazyTry {
-    mode match {
-      case CommandExecutionMode.NON_ROOT => analyzed.mapChildren(eagerlyExecuteCommands)
-      case CommandExecutionMode.ALL => eagerlyExecuteCommands(analyzed)
-      case CommandExecutionMode.SKIP => analyzed
+    recoverableTransaction match {
+      case Some(recovery) if recovery.result.state() == TransactionRecoveryState.COMMITTED =>
+        recoveredCommittedCommands(analyzed)
+      case _ => mode match {
+        case CommandExecutionMode.NON_ROOT => analyzed.mapChildren(eagerlyExecuteCommands)
+        case CommandExecutionMode.ALL => eagerlyExecuteCommands(analyzed)
+        case CommandExecutionMode.SKIP => analyzed
+      }
     }
+  }
+
+  private def recoveredCommittedCommands(plan: LogicalPlan): LogicalPlan = plan.transformDown {
+    case command: Command =>
+      CommandResult(
+        command.output,
+        command,
+        LocalTableScanExec(command.output, Seq.empty, None, useSingleTask = false),
+        Seq.empty)
   }
 
   def commandExecuted: LogicalPlan = withAbortTransactionOnFailure {
@@ -244,7 +302,14 @@ class QueryExecution(
       // for eagerly executed commands we mark this place as beginning of execution.
       tracker.setReadyForExecution()
       val (qe, result) = QueryExecution.runCommand(
-        sparkSession, p, name, refreshPhaseEnabled, mode, Some(shuffleCleanupMode), Some(analyzer))
+        sparkSession,
+        p,
+        name,
+        refreshPhaseEnabled,
+        mode,
+        Some(shuffleCleanupMode),
+        Some(analyzer),
+        recoverableTransaction)
       CommandResult(
         qe.analyzed.output,
         qe.commandExecuted,
@@ -640,7 +705,28 @@ class QueryExecution(
   private def withAbortTransactionOnFailure[T](block: => T): T = transactionOpt match {
     case Some(transaction) =>
       try block
-      catch { case e: Throwable => TransactionUtils.abort(transaction); throw e }
+      catch {
+        case e: Throwable =>
+          recoverableTransaction match {
+            case Some(recovery) =>
+              val durable = try {
+                TransactionUtils.resolveTransaction(recovery.catalog, recovery.info)
+              } catch {
+                case resolutionFailure: Throwable =>
+                  resolutionFailure.addSuppressed(e)
+                  throw resolutionFailure
+              }
+              durable.state() match {
+                case TransactionRecoveryState.OPEN => TransactionUtils.abort(transaction)
+                case TransactionRecoveryState.COMMITTED | TransactionRecoveryState.ABORTED =>
+                case TransactionRecoveryState.UNKNOWN =>
+                  throw SparkException.internalError(
+                    s"Transaction ${recovery.info.id()} has an unknown durable outcome", e)
+              }
+            case None => TransactionUtils.abort(transaction)
+          }
+          throw e
+      }
     case None => block
   }
 
@@ -957,7 +1043,8 @@ object QueryExecution {
       refreshPhaseEnabled: Boolean = true,
       mode: CommandExecutionMode.Value = CommandExecutionMode.SKIP,
       shuffleCleanupModeOpt: Option[ShuffleCleanupMode] = None,
-      analyzerOpt: Option[Analyzer] = None)
+      analyzerOpt: Option[Analyzer] = None,
+      recoverableTransactionOpt: Option[RecoverableTransaction] = None)
     : (QueryExecution, Array[InternalRow]) = {
     val qe = new QueryExecution(
       sparkSession,
@@ -965,7 +1052,8 @@ object QueryExecution {
       mode = mode,
       shuffleCleanupModeOpt = shuffleCleanupModeOpt,
       refreshPhaseEnabled = refreshPhaseEnabled,
-      analyzerOpt = analyzerOpt)
+      analyzerOpt = analyzerOpt,
+      recoverableTransactionOpt = recoverableTransactionOpt)
     val result = QueryExecution.withInternalError(s"Executed $name failed.") {
       SQLExecution.withNewExecutionId(qe, Some(name)) {
         qe.executedPlan.executeCollect()

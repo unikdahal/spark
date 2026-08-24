@@ -33,7 +33,7 @@ import org.apache.spark.sql.connector.catalog.{CatalogV2Util, Column, Identifier
 import org.apache.spark.sql.connector.catalog.transactions.Transaction
 import org.apache.spark.sql.connector.expressions.Transform
 import org.apache.spark.sql.connector.metric.CustomMetric
-import org.apache.spark.sql.connector.write.{BatchWrite, DataWriter, DataWriterFactory, DeleteSummaryImpl, DeltaWrite, DeltaWriter, InsertSummaryImpl, MergeSummaryImpl, PhysicalWriteInfoImpl, RecoveryDataWriterFactory, RowLevelOperation, RowLevelOperationTable, SupportsBatchWriteRecovery, SupportsRecoveryCommitDiscard, UpdateSummaryImpl, Write, WriterCommitMessage, WriteSummary}
+import org.apache.spark.sql.connector.write.{BatchWrite, DataWriter, DataWriterFactory, DeleteSummaryImpl, DeltaWrite, DeltaWriter, InsertSummaryImpl, MergeSummaryImpl, PhysicalWriteInfoImpl, RecoveryDataWriterFactory, RowLevelOperation, RowLevelOperationTable, RowLevelTaskSummary, SupportsBatchWriteRecovery, SupportsRecoveryCommitDiscard, SupportsRecoveryTaskMetrics, UpdateSummaryImpl, Write, WriterCommitMessage, WriteSummary}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command._
 import org.apache.spark.sql.errors.{QueryCompilationErrors, QueryExecutionErrors}
 import org.apache.spark.sql.execution.{EmptyRDDWithPartitions, QueryExecution, SparkPlan, SQLExecution, UnaryExecNode}
@@ -512,8 +512,7 @@ trait V2ExistingTableWriteExec extends V2TableWriteExec with TransactionalExec {
 trait RowLevelWriteExec extends V2ExistingTableWriteExec {
   def rowLevelCommand: RowLevelOperation.Command
 
-  override protected def recoveryUnsupportedReason: Option[String] = Some(
-    s"Recovery of row-level $rowLevelCommand writes requires durable custom task metrics")
+  override protected def requiresRowLevelTaskSummary: Boolean = true
 
   override protected lazy val sparkMetrics: Map[String, SQLMetric] = super.sparkMetrics ++ (
     rowLevelCommand match {
@@ -580,6 +579,61 @@ trait RowLevelWriteExec extends V2ExistingTableWriteExec {
       getMetricValue(sparkMetrics, "numDeletedRows"),
       getMetricValue(sparkMetrics, "numCopiedRows")))
   }
+
+  override protected def restoreRowLevelTaskSummary(summary: RowLevelTaskSummary): Unit = {
+    require(summary != null, "Recovered row-level task summary must not be null")
+    rowLevelCommand match {
+      case MERGE =>
+        val merge = collectFirst(query) { case node: MergeRowsExec => node }.getOrElse {
+          throw new IllegalStateException(
+            "A recoverable MERGE plan has no MergeRowsExec metrics owner")
+        }
+        val values = Map(
+          "numTargetRowsCopied" -> summary.numTargetRowsCopied(),
+          "numTargetRowsDeleted" -> summary.numTargetRowsDeleted(),
+          "numTargetRowsUpdated" -> summary.numTargetRowsUpdated(),
+          "numTargetRowsInserted" -> summary.numTargetRowsInserted(),
+          "numTargetRowsMatchedUpdated" -> summary.numTargetRowsMatchedUpdated(),
+          "numTargetRowsMatchedDeleted" -> summary.numTargetRowsMatchedDeleted(),
+          "numTargetRowsNotMatchedBySourceUpdated" ->
+            summary.numTargetRowsNotMatchedBySourceUpdated(),
+          "numTargetRowsNotMatchedBySourceDeleted" ->
+            summary.numTargetRowsNotMatchedBySourceDeleted())
+        values.foreach { case (name, value) =>
+          merge.metrics.getOrElse(name,
+            throw new IllegalStateException(s"A recoverable MERGE plan has no $name metric"))
+            .set(value)
+        }
+
+      case UPDATE =>
+        sparkMetrics("numUpdatedRows").set(summary.numTargetRowsUpdated())
+        sparkMetrics("numCopiedRows").set(summary.numTargetRowsCopied())
+
+      case DELETE =>
+        sparkMetrics("numDeletedRows").set(summary.numTargetRowsDeleted())
+        sparkMetrics("numCopiedRows").set(summary.numTargetRowsCopied())
+        this match {
+          case _: ReplaceDataExec =>
+            require(summary.numTargetRowsScanned() >= summary.numTargetRowsCopied(),
+              "Recovered DELETE scanned-row count is smaller than its copied-row count")
+            require(
+              summary.numTargetRowsScanned() - summary.numTargetRowsCopied() ==
+                summary.numTargetRowsDeleted(),
+              "Recovered DELETE summary has inconsistent scanned, copied, and deleted counts")
+            val scan = collectFirst(query) {
+              case node: BatchScanExec if node.table.isInstanceOf[RowLevelOperationTable] => node
+            }.getOrElse {
+              throw new IllegalStateException(
+                "A recoverable ReplaceData DELETE plan has no row-level BatchScanExec")
+            }
+            scan.metrics.getOrElse("numOutputRows",
+              throw new IllegalStateException(
+                "A recoverable ReplaceData DELETE scan has no output-row metric"))
+              .set(summary.numTargetRowsScanned())
+          case _ =>
+        }
+    }
+  }
 }
 
 /**
@@ -603,6 +657,7 @@ trait V2TableWriteExec
 
   protected def recoveryTransaction: Option[Transaction] = None
   protected def recoveryUnsupportedReason: Option[String] = None
+  protected def requiresRowLevelTaskSummary: Boolean = false
 
   protected lazy val numOutputRowsMetric: SQLMetric =
     SQLMetrics.createMetric(sparkContext, "number of output rows")
@@ -634,16 +689,60 @@ trait V2TableWriteExec
           case _ => throw new IllegalStateException(
             "A recoverable batch write has no durable task commit store")
         }
+        val metricSchema = batchWrite match {
+          case withMetrics: SupportsRecoveryTaskMetrics =>
+            Some(Option(withMetrics.recoveryTaskMetricSchema()).getOrElse {
+              throw new IllegalStateException(
+                "A recoverable batch write returned a null task metric schema")
+            })
+          case _ =>
+            require(customMetrics.isEmpty,
+              "A recoverable batch write with custom metrics must implement " +
+                classOf[SupportsRecoveryTaskMetrics].getName)
+            None
+        }
+        metricSchema.foreach { schema =>
+          val descriptors = schema.descriptors()
+          val descriptorNames = descriptors.iterator.map(_.name()).toSeq
+          require(descriptorNames.distinct.size == descriptorNames.size,
+            "Recovery task metric schema contains duplicate names")
+          require(descriptorNames.toSet == customMetrics.keySet,
+            s"Recovery task metric schema names ${descriptorNames.sorted.mkString(", ")} " +
+              "do not match supported custom metrics " +
+              customMetrics.keys.toSeq.sorted.mkString(", "))
+        }
         val context = RecoveryTaskCommitContext(
-          store, recoverable.recoveryId(), recoverable.commitMessageCodec())
+          store, batchWrite.asInstanceOf[HasRecoveryTaskCommitStore].recoveryId,
+          recoverable.commitMessageCodec(), metricSchema, requiresRowLevelTaskSummary)
+        if (requiresRowLevelTaskSummary && this.isInstanceOf[RowLevelWriteExec]) {
+          val command = this.asInstanceOf[RowLevelWriteExec].rowLevelCommand.toString
+          val manifestInput =
+            batchWrite.asInstanceOf[HasRecoveryTaskCommitStore].rowLevelManifestInput
+          require(manifestInput.isDefined,
+            s"Recovery of row-level ${this.asInstanceOf[RowLevelWriteExec].rowLevelCommand} " +
+              "requires a Spark-owned generation manifest")
+          require(manifestInput.get.command == command,
+            s"Row-level recovery manifest command ${manifestInput.get.command} does not match " +
+              s"physical command $command")
+        }
         RecoveryTaskCommitEnvelope.validateContext(context)
         val compatibilityMetadata = Option(
           recoverable.recoveryCompatibilityMetadata(physicalWriteInfo)).getOrElse {
           throw new IllegalStateException(
             "A recoverable batch write returned null compatibility metadata")
         }
+        val durableCompatibilityMetadata =
+          batchWrite.asInstanceOf[HasRecoveryTaskCommitStore].rowLevelManifestInput match {
+            case Some(input) =>
+              require(input.recoveryId == context.recoveryId,
+                "Row-level write manifest and task commit context have different recovery IDs")
+              RowLevelWriteManifest.encode(input.copy(
+                connectorCompatibilityMetadata = compatibilityMetadata))
+            case None => compatibilityMetadata
+          }
         val proposedManifest = RecoveryTaskCommitEnvelope.writeManifest(
-          context, rdd.getNumPartitions, compatibilityMetadata)
+          context, rdd.getNumPartitions, durableCompatibilityMetadata)
+        RecoveryTaskCommitEnvelope.validateManifestSize(context, proposedManifest)
         val resolvedManifest = Option(
           store.resolveWriteManifest(context.recoveryId, proposedManifest)).getOrElse {
           throw new IllegalStateException("Recovery task commit store returned a null manifest")
@@ -660,58 +759,40 @@ trait V2TableWriteExec
         })
       case _ => None
     }
-    val messages = recoveryState.map(_.commitMessages()).getOrElse {
-      new Array[WriterCommitMessage](rdd.partitions.length)
-    }
-    require(messages.length == rdd.partitions.length,
-      s"Recovered ${messages.length} write commit messages for ${rdd.partitions.length} partitions")
-    val recoveredRows = recoveryState.map(_.numRows()).getOrElse(Array.fill(messages.length)(-1L))
-    require(recoveredRows.length == messages.length,
-      s"Recovered ${recoveredRows.length} row counts for ${messages.length} partitions")
+    val messages = new Array[WriterCommitMessage](rdd.partitions.length)
+    val canonicalRows = Array.fill(messages.length)(-1L)
+    val canonicalMetrics = Array.fill(messages.length)(Map.empty[String, Long])
+    val canonicalRowLevelSummaries =
+      Array.fill[Option[RowLevelTaskSummary]](messages.length)(None)
     val alreadyCommitted = recoveryState.exists(_.isCommitted())
-    val taskStoreHasCommit = Array.fill(messages.length)(false)
-    taskCommitContext.foreach { context =>
-      val MaxLoadBatch = 1024
+    taskCommitContext.filter(_ => !alreadyCommitted).foreach { context =>
+      val MaxLoadBatch = math.min(
+        1024, RecoveryTaskCommitEnvelope.validatedCapabilities(context).maxLoadBatchSize())
       messages.indices.grouped(MaxLoadBatch).foreach { partitionIds =>
         val ids = partitionIds.toArray
         val stored = Option(context.store.load(context.recoveryId, ids)).getOrElse {
           throw new IllegalStateException("Recovery task commit store returned a null result")
         }
-        require(stored.length == ids.length,
-          s"Recovery task commit store returned ${stored.length} values for ${ids.length} keys")
+        require(stored.size() == ids.length,
+          s"Recovery task commit store returned ${stored.size()} values for ${ids.length} keys")
         ids.indices.foreach { resultIndex =>
           val partitionId = ids(resultIndex)
-          Option(stored(resultIndex)).foreach { envelope =>
+          val storedValue = Option(stored.get(resultIndex)).getOrElse {
+            throw new IllegalStateException(
+              s"Recovery task commit store returned null lookup entry $resultIndex")
+          }
+          if (storedValue.isPresent) {
+            val envelope = storedValue.get()
+            RecoveryTaskCommitEnvelope.validateTaskCommitSize(context, envelope)
             val decoded = RecoveryTaskCommitEnvelope.decode(context, partitionId, envelope)
-            taskStoreHasCommit(partitionId) = true
-            if (messages(partitionId) != null) {
-              val connectorPayload = Option(context.codec.encode(messages(partitionId))).getOrElse {
-                throw new IllegalStateException(
-                  s"Recovery codec returned null for connector commit $partitionId")
-              }
-              require(java.util.Arrays.equals(connectorPayload, decoded.payload),
-                s"Connector and task store disagree for recovered partition $partitionId")
-              require(recoveredRows(partitionId) < 0 ||
-                recoveredRows(partitionId) == decoded.numRows,
-                s"Connector and task store row counts disagree for partition $partitionId")
-            }
             messages(partitionId) = decoded.message
-            recoveredRows(partitionId) = decoded.numRows
+            canonicalRows(partitionId) = decoded.numRows
+            canonicalMetrics(partitionId) = decoded.metrics
+            canonicalRowLevelSummaries(partitionId) = decoded.rowLevelSummary
           }
         }
       }
     }
-    messages.indices.foreach { index =>
-      require(alreadyCommitted || messages(index) == null || taskStoreHasCommit(index),
-        s"Connector recovered partition $index without an authoritative task store commit")
-      require(messages(index) != null || recoveredRows(index) == -1L || alreadyCommitted,
-        s"Recovered a row count without a commit message for uncommitted partition $index")
-      if (!alreadyCommitted && messages(index) != null && recoveredRows(index) >= 0) {
-        numOutputRowsMetric.add(recoveredRows(index))
-      }
-    }
-    recoveryState.filter(_.isCommitted()).map(_.totalNumRows()).filter(_ >= 0)
-      .foreach(numOutputRowsMetric.add)
     val partitionsToWrite = messages.indices.filter(messages(_) == null)
 
     logInfo(log"Start processing data source write support: " +
@@ -752,14 +833,98 @@ trait V2TableWriteExec
             val partitionIndex = partitionsToWrite(resultIndex)
             val commitMessage = result.writerCommitMessage
             messages(partitionIndex) = commitMessage
-            numOutputRowsMetric.add(result.numRows)
-            batchWrite.onDataWriterCommit(commitMessage)
+            canonicalRows(partitionIndex) = result.numRows
+            canonicalMetrics(partitionIndex) = result.recoveryMetrics
+            canonicalRowLevelSummaries(partitionIndex) = result.rowLevelSummary
+            // A store-authoritative commit can be returned by executor preflight, by a retry
+            // after a publish response was lost, or by a losing speculative attempt. None of
+            // those cases can support an exactly-once driver callback. Recovery-capable writes
+            // must reconstruct all global state from the canonical messages passed to commit.
+            if (taskCommitContext.isEmpty) {
+              batchWrite.onDataWriterCommit(commitMessage)
+            }
           }
         )
       }
 
+      if (alreadyCommitted) {
+        recoveryState.map(_.totalNumRows()).filter(_ >= 0).foreach(numOutputRowsMetric.add)
+        taskCommitContext.flatMap(_.metricSchema).foreach { schema =>
+          val durableTotals = Option(recoveryState.get.totalTaskMetrics()).getOrElse {
+            throw new IllegalStateException(
+              "A committed recovery state returned null task metric totals")
+          }.asScala.toMap
+          val descriptors = schema.descriptors()
+          val expectedNames = descriptors.iterator.map(_.name()).toSet
+          require(durableTotals.keySet == expectedNames,
+            "Committed recovery task metric names " +
+              durableTotals.keys.toSeq.sorted.mkString(", ") + " " +
+              s"do not match the durable schema ${expectedNames.toSeq.sorted.mkString(", ")}")
+          descriptors.foreach { descriptor =>
+            val value = Option(durableTotals(descriptor.name())).map(_.longValue()).getOrElse {
+              throw new IllegalStateException(
+                s"Committed recovery task metric ${descriptor.name()} is null")
+            }
+            require(descriptor.accepts(value),
+              s"Committed recovery task metric ${descriptor.name()} has out-of-range value $value")
+            customMetrics(descriptor.name()).add(value)
+          }
+        }
+        if (requiresRowLevelTaskSummary) {
+          val durableSummary = Option(recoveryState.get.totalRowLevelSummary())
+            .filter(_.isPresent)
+            .map(_.get())
+            .getOrElse {
+              throw new IllegalStateException(
+                "A committed row-level recovery state returned no authoritative summary")
+            }
+          restoreRowLevelTaskSummary(durableSummary)
+        }
+      } else {
+        var totalRows = 0L
+        val metricTotals = scala.collection.mutable.HashMap.empty[String, Long]
+        canonicalRows.indices.foreach { partitionId =>
+          require(canonicalRows(partitionId) >= 0,
+            s"Missing canonical output row count for partition $partitionId")
+          try {
+            totalRows = Math.addExact(totalRows, canonicalRows(partitionId))
+          } catch {
+            case _: ArithmeticException =>
+              throw new IllegalStateException("Recovered output row count overflow")
+          }
+          canonicalMetrics(partitionId).foreach { case (name, value) =>
+            require(customMetrics.contains(name),
+              s"Unknown canonical recovery task metric: $name")
+            val current = metricTotals.getOrElse(name, 0L)
+            try {
+              metricTotals.put(name, Math.addExact(current, value))
+            } catch {
+              case _: ArithmeticException =>
+                throw new IllegalStateException(
+                  s"Recovered task metric $name overflow")
+            }
+          }
+        }
+        numOutputRowsMetric.add(totalRows)
+        metricTotals.foreach { case (name, value) => customMetrics(name).add(value) }
+        if (requiresRowLevelTaskSummary) {
+          val summaries = canonicalRowLevelSummaries.indices.map { partitionId =>
+            canonicalRowLevelSummaries(partitionId).getOrElse {
+              throw new IllegalStateException(
+                s"Missing canonical row-level summary for partition $partitionId")
+            }
+          }
+          restoreRowLevelTaskSummary(RowLevelTaskSummary.sum(summaries.asJava))
+        }
+      }
+
       val executionId = sparkContext.getLocalProperty(SQLExecution.EXECUTION_ID_KEY)
-      SQLMetrics.postDriverMetricUpdates(sparkContext, executionId, Seq(numOutputRowsMetric))
+      val recoveredCustomMetrics = taskCommitContext
+        .filter(_.metricSchema.isDefined)
+        .toSeq
+        .flatMap(_ => customMetrics.values)
+      SQLMetrics.postDriverMetricUpdates(
+        sparkContext, executionId, Seq(numOutputRowsMetric) ++ recoveredCustomMetrics)
 
       if (!alreadyCommitted) {
         val writeSummary = getWriteSummary()
@@ -801,11 +966,23 @@ trait V2TableWriteExec
   }
 
   protected def getWriteSummary(): Option[WriteSummary] = None
+
+  /** Restores Spark-owned row-level metrics before the connector commit summary is constructed. */
+  protected def restoreRowLevelTaskSummary(summary: RowLevelTaskSummary): Unit = {
+    require(!requiresRowLevelTaskSummary,
+      s"${getClass.getName} requires a row-level summary but does not restore it")
+  }
 }
 
 trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serializable {
 
   protected def write(writer: W, iter: java.util.Iterator[InternalRow]): Unit
+
+  /** Returns exact Spark-owned row-level counters produced by this invocation, when applicable. */
+  protected def rowLevelTaskSummary(): Option[RowLevelTaskSummary] = None
+
+  /** Returns connector records written, excluding Spark-owned summary-only control rows. */
+  protected def numRowsWritten(numInputRows: Long): Long = numInputRows
 
   def run(
       writerFactory: DataWriterFactory,
@@ -829,26 +1006,44 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
         throw new IllegalStateException(
           s"Recovery task commit store returned a null preflight result for partition $partId")
       }
-      require(stored.length == 1,
-        s"Recovery task commit store returned ${stored.length} preflight values for one key")
-      Option(stored(0)).foreach { envelope =>
+      require(stored.size() == 1,
+        s"Recovery task commit store returned ${stored.size()} preflight values for one key")
+      val storedValue = Option(stored.get(0)).getOrElse {
+        throw new IllegalStateException(
+          s"Recovery task commit store returned a null preflight entry for partition $partId")
+      }
+      if (storedValue.isPresent) {
+        val envelope = storedValue.get()
+        RecoveryTaskCommitEnvelope.validateTaskCommitSize(recoveryContext, envelope)
         val decoded = RecoveryTaskCommitEnvelope.decode(recoveryContext, partId, envelope)
         logInfo(log"Using canonical recovery commit for partition " +
           log"${MDC(LogKeys.PARTITION_ID, partId)} before creating a data writer.")
-        return DataWritingSparkTaskResult(decoded.numRows, decoded.message)
+        return DataWritingSparkTaskResult(
+          decoded.numRows, decoded.message, decoded.metrics, decoded.rowLevelSummary)
       }
     }
     val dataWriter = writerFactory.createWriter(partId, taskId).asInstanceOf[W]
     var writerCommitted = false
 
-    val iterWithMetrics = IteratorWithMetrics(iter, dataWriter, customMetrics)
+    val updateMetricsOnExecutor = recovery.forall(_.metricSchema.isEmpty)
+    val iterWithMetrics = IteratorWithMetrics(
+      iter, dataWriter, customMetrics, updateMetricsOnExecutor)
 
     // write the data and commit this writer.
     Utils.tryWithSafeFinallyAndFailureCallbacks(block = {
       write(dataWriter, iterWithMetrics)
+      val currentRowLevelSummary = rowLevelTaskSummary()
+      val currentNumRows = numRowsWritten(iterWithMetrics.count)
+      require(currentNumRows >= 0L && currentNumRows <= iterWithMetrics.count,
+        s"Invalid connector output row count $currentNumRows for ${iterWithMetrics.count} inputs")
 
-      CustomMetrics.updateMetrics(
-        dataWriter.currentMetricsValues.toImmutableArraySeq, customMetrics)
+      val currentMetrics = Option(dataWriter.currentMetricsValues).getOrElse {
+        throw new IllegalStateException("Data writer returned null current metrics")
+      }.toImmutableArraySeq
+      recovery.foreach(RecoveryTaskCommitEnvelope.validateCurrentMetrics(_, currentMetrics))
+      if (updateMetricsOnExecutor) {
+        CustomMetrics.updateMetrics(currentMetrics, customMetrics)
+      }
 
       val msg = if (useCommitCoordinator) {
         val coordinator = SparkEnv.get.outputCommitCoordinator
@@ -884,7 +1079,13 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
 
       val result = recovery.map { recoveryContext =>
         val proposed = RecoveryTaskCommitEnvelope.encode(
-          recoveryContext, partId, msg, iterWithMetrics.count)
+          recoveryContext,
+          partId,
+          msg,
+          currentNumRows,
+          currentMetrics,
+          currentRowLevelSummary)
+        RecoveryTaskCommitEnvelope.validateTaskCommitSize(recoveryContext, proposed)
         val canonical = Option(recoveryContext.store.publish(
           recoveryContext.recoveryId,
           partId,
@@ -894,6 +1095,7 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
           throw new IllegalStateException(
             s"Recovery task commit store returned null for partition $partId")
         }
+        RecoveryTaskCommitEnvelope.validateTaskCommitSize(recoveryContext, canonical)
         val decoded = RecoveryTaskCommitEnvelope.decode(recoveryContext, partId, canonical)
         if (!java.util.Arrays.equals(proposed, canonical)) {
           dataWriter match {
@@ -903,8 +1105,10 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
               s"Recovery writer ${dataWriter.getClass.getName} cannot discard losing output")
           }
         }
-        DataWritingSparkTaskResult(decoded.numRows, decoded.message)
-      }.getOrElse(DataWritingSparkTaskResult(iterWithMetrics.count, msg))
+        DataWritingSparkTaskResult(
+          decoded.numRows, decoded.message, decoded.metrics, decoded.rowLevelSummary)
+      }.getOrElse(DataWritingSparkTaskResult(
+        currentNumRows, msg, Map.empty, currentRowLevelSummary))
 
       result
 
@@ -931,13 +1135,14 @@ trait WritingSparkTask[W <: DataWriter[InternalRow]] extends Logging with Serial
   private case class IteratorWithMetrics(
       iter: Iterator[InternalRow],
       dataWriter: W,
-      customMetrics: Map[String, SQLMetric]) extends java.util.Iterator[InternalRow] {
+      customMetrics: Map[String, SQLMetric],
+      updateMetrics: Boolean) extends java.util.Iterator[InternalRow] {
     var count = 0L
 
     override def hasNext: Boolean = iter.hasNext
 
     override def next(): InternalRow = {
-      if (count % CustomMetrics.NUM_ROWS_PER_UPDATE == 0) {
+      if (updateMetrics && count % CustomMetrics.NUM_ROWS_PER_UPDATE == 0) {
         CustomMetrics.updateMetrics(
           dataWriter.currentMetricsValues.toImmutableArraySeq, customMetrics)
       }
@@ -953,40 +1158,50 @@ case class DataAndMetadataWritingSparkTask(
     sparkMetrics: Map[String, SQLMetric])
   extends WritingSparkTask[DataWriter[InternalRow]] {
 
+  private var completedSummary: Option[RowLevelTaskSummary] = None
+  private var completedRows = 0L
+
   override protected def write(
-      writer: DataWriter[InternalRow], iter: java.util.Iterator[InternalRow]): Unit = {
-    var numUpdatedRows = 0L
-    var numCopiedRows = 0L
+      writer: DataWriter[InternalRow],
+      iter: java.util.Iterator[InternalRow]): Unit = {
+    val summary = new RowLevelTaskSummaryAccumulator
+    completedSummary = None
+    completedRows = 0L
 
     while (iter.hasNext) {
       val row = iter.next()
-      val operation = row.getInt(0)
+      val operation = summary.record(row.getInt(0))
 
       operation match {
-        case UPDATE_OPERATION =>
-          numUpdatedRows += 1L
+        case Some(UPDATE_OPERATION) =>
           dataProj.project(row)
           metadataProj.project(row)
           writer.write(metadataProj, dataProj)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case COPY_OPERATION =>
-          numCopiedRows += 1L
+        case Some(COPY_OPERATION) =>
           dataProj.project(row)
           metadataProj.project(row)
           writer.write(metadataProj, dataProj)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case INSERT_OPERATION =>
+        case Some(INSERT_OPERATION) =>
           dataProj.project(row)
           writer.write(dataProj)
+          completedRows = Math.addExact(completedRows, 1L)
+
+        case None =>
 
         case other =>
-          throw new SparkException(s"Unexpected operation ID: $other")
+          throw new SparkException(s"Unexpected group-replacement operation: $other")
       }
     }
 
-    sparkMetrics.get("numUpdatedRows").foreach(_.add(numUpdatedRows))
-    sparkMetrics.get("numCopiedRows").foreach(_.add(numCopiedRows))
+    completedSummary = Some(summary.summary)
   }
+
+  override protected def rowLevelTaskSummary(): Option[RowLevelTaskSummary] = completedSummary
+  override protected def numRowsWritten(numInputRows: Long): Long = completedRows
 }
 
 case class DataWithProjectionWritingSparkTask(
@@ -994,43 +1209,54 @@ case class DataWithProjectionWritingSparkTask(
     sparkMetrics: Map[String, SQLMetric])
   extends WritingSparkTask[DataWriter[InternalRow]] {
 
+  private var completedSummary: Option[RowLevelTaskSummary] = None
+  private var completedRows = 0L
+
   override protected def write(
-      writer: DataWriter[InternalRow], iter: java.util.Iterator[InternalRow]): Unit = {
-    var numUpdatedRows = 0L
-    var numCopiedRows = 0L
+      writer: DataWriter[InternalRow],
+      iter: java.util.Iterator[InternalRow]): Unit = {
+    val summary = new RowLevelTaskSummaryAccumulator
+    completedSummary = None
+    completedRows = 0L
 
     while (iter.hasNext) {
       val row = iter.next()
-      val operation = row.getInt(0)
+      val operation = summary.record(row.getInt(0))
 
       operation match {
-        case UPDATE_OPERATION =>
-          numUpdatedRows += 1L
+        case Some(UPDATE_OPERATION) =>
           dataProj.project(row)
           writer.write(dataProj)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case COPY_OPERATION =>
-          numCopiedRows += 1L
+        case Some(COPY_OPERATION) =>
           dataProj.project(row)
           writer.write(dataProj)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case INSERT_OPERATION =>
+        case Some(INSERT_OPERATION) =>
           dataProj.project(row)
           writer.write(dataProj)
+          completedRows = Math.addExact(completedRows, 1L)
+
+        case None =>
 
         case other =>
-          throw new SparkException(s"Unexpected operation ID: $other")
+          throw new SparkException(s"Unexpected group-replacement operation: $other")
       }
     }
 
-    sparkMetrics.get("numUpdatedRows").foreach(_.add(numUpdatedRows))
-    sparkMetrics.get("numCopiedRows").foreach(_.add(numCopiedRows))
+    completedSummary = Some(summary.summary)
   }
+
+  override protected def rowLevelTaskSummary(): Option[RowLevelTaskSummary] = completedSummary
+  override protected def numRowsWritten(numInputRows: Long): Long = completedRows
 }
 
 object DataWritingSparkTask extends WritingSparkTask[DataWriter[InternalRow]] {
   override protected def write(
-      writer: DataWriter[InternalRow], iter: java.util.Iterator[InternalRow]): Unit = {
+      writer: DataWriter[InternalRow],
+      iter: java.util.Iterator[InternalRow]): Unit = {
     writer.writeAll(iter)
   }
 }
@@ -1040,49 +1266,57 @@ case class DeltaWritingSparkTask(
     sparkMetrics: Map[String, SQLMetric])
   extends WritingSparkTask[DeltaWriter[InternalRow]] {
 
+  private var completedSummary: Option[RowLevelTaskSummary] = None
+  private var completedRows = 0L
+
   private lazy val rowProjection = projections.rowProjection.orNull
   private lazy val rowIdProjection = projections.rowIdProjection
 
   override protected def write(
-      writer: DeltaWriter[InternalRow], iter: java.util.Iterator[InternalRow]): Unit = {
-    var numUpdatedRows = 0L
-    var numDeletedRows = 0L
+      writer: DeltaWriter[InternalRow],
+      iter: java.util.Iterator[InternalRow]): Unit = {
+    val summary = new RowLevelTaskSummaryAccumulator
+    completedSummary = None
+    completedRows = 0L
 
     while (iter.hasNext) {
       val row = iter.next()
-      val operation = row.getInt(0)
+      val operation = summary.record(row.getInt(0))
 
       operation match {
-        case DELETE_OPERATION =>
-          numDeletedRows += 1L
+        case Some(DELETE_OPERATION) =>
           rowIdProjection.project(row)
           writer.delete(null, rowIdProjection)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case UPDATE_OPERATION =>
-          numUpdatedRows += 1L
+        case Some(UPDATE_OPERATION) =>
           rowProjection.project(row)
           rowIdProjection.project(row)
           writer.update(null, rowIdProjection, rowProjection)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case REINSERT_OPERATION =>
-          // When representUpdateAsDeleteAndInsert is true, each logical update is split
-          // into a DELETE and a REINSERT. Count the REINSERT as one updated row.
-          numUpdatedRows += 1L
+        case Some(REINSERT_OPERATION) =>
           rowProjection.project(row)
           writer.reinsert(null, rowProjection)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case INSERT_OPERATION =>
+        case Some(INSERT_OPERATION) =>
           rowProjection.project(row)
           writer.insert(rowProjection)
+          completedRows = Math.addExact(completedRows, 1L)
+
+        case None =>
 
         case other =>
-          throw new SparkException(s"Unexpected operation ID: $other")
+          throw new SparkException(s"Unexpected delta operation: $other")
       }
     }
 
-    sparkMetrics.get("numUpdatedRows").foreach(_.add(numUpdatedRows))
-    sparkMetrics.get("numDeletedRows").foreach(_.add(numDeletedRows))
+    completedSummary = Some(summary.summary)
   }
+
+  override protected def rowLevelTaskSummary(): Option[RowLevelTaskSummary] = completedSummary
+  override protected def numRowsWritten(numInputRows: Long): Long = completedRows
 }
 
 case class DeltaWithMetadataWritingSparkTask(
@@ -1090,53 +1324,61 @@ case class DeltaWithMetadataWritingSparkTask(
     sparkMetrics: Map[String, SQLMetric])
   extends WritingSparkTask[DeltaWriter[InternalRow]] {
 
+  private var completedSummary: Option[RowLevelTaskSummary] = None
+  private var completedRows = 0L
+
   private lazy val rowProjection = projections.rowProjection.orNull
   private lazy val rowIdProjection = projections.rowIdProjection
   private lazy val metadataProjection = projections.metadataProjection.orNull
 
   override protected def write(
-      writer: DeltaWriter[InternalRow], iter: java.util.Iterator[InternalRow]): Unit = {
-    var numUpdatedRows = 0L
-    var numDeletedRows = 0L
+      writer: DeltaWriter[InternalRow],
+      iter: java.util.Iterator[InternalRow]): Unit = {
+    val summary = new RowLevelTaskSummaryAccumulator
+    completedSummary = None
+    completedRows = 0L
 
     while (iter.hasNext) {
       val row = iter.next()
-      val operation = row.getInt(0)
+      val operation = summary.record(row.getInt(0))
 
       operation match {
-        case DELETE_OPERATION =>
-          numDeletedRows += 1L
+        case Some(DELETE_OPERATION) =>
           rowIdProjection.project(row)
           metadataProjection.project(row)
           writer.delete(metadataProjection, rowIdProjection)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case UPDATE_OPERATION =>
-          numUpdatedRows += 1L
+        case Some(UPDATE_OPERATION) =>
           rowProjection.project(row)
           rowIdProjection.project(row)
           metadataProjection.project(row)
           writer.update(metadataProjection, rowIdProjection, rowProjection)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case REINSERT_OPERATION =>
-          // When representUpdateAsDeleteAndInsert is true, each logical update is split
-          // into a DELETE and a REINSERT. Count the REINSERT as one updated row.
-          numUpdatedRows += 1L
+        case Some(REINSERT_OPERATION) =>
           rowProjection.project(row)
           metadataProjection.project(row)
           writer.reinsert(metadataProjection, rowProjection)
+          completedRows = Math.addExact(completedRows, 1L)
 
-        case INSERT_OPERATION =>
+        case Some(INSERT_OPERATION) =>
           rowProjection.project(row)
           writer.insert(rowProjection)
+          completedRows = Math.addExact(completedRows, 1L)
+
+        case None =>
 
         case other =>
-          throw new SparkException(s"Unexpected operation ID: $other")
+          throw new SparkException(s"Unexpected delta operation: $other")
       }
     }
 
-    sparkMetrics.get("numUpdatedRows").foreach(_.add(numUpdatedRows))
-    sparkMetrics.get("numDeletedRows").foreach(_.add(numDeletedRows))
+    completedSummary = Some(summary.summary)
   }
+
+  override protected def rowLevelTaskSummary(): Option[RowLevelTaskSummary] = completedSummary
+  override protected def numRowsWritten(numInputRows: Long): Long = completedRows
 }
 
 private[v2] trait V2CreateTableAsSelectBaseExec extends LeafV2CommandExec {
@@ -1193,7 +1435,9 @@ private[v2] trait V2CreateTableAsSelectBaseExec extends LeafV2CommandExec {
 
 private[v2] case class DataWritingSparkTaskResult(
     numRows: Long,
-    writerCommitMessage: WriterCommitMessage)
+    writerCommitMessage: WriterCommitMessage,
+    recoveryMetrics: Map[String, Long],
+    rowLevelSummary: Option[RowLevelTaskSummary] = None)
 
 /**
  * Sink progress information collected after commit.

@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.catalyst.analysis
 
-import org.apache.spark.sql.catalyst.expressions.{Alias, EqualNullSafe, Expression, Literal, Not}
+import org.apache.spark.sql.catalyst.expressions.{Alias, EqualNullSafe, Expression, If, Literal}
 import org.apache.spark.sql.catalyst.expressions.Literal.TrueLiteral
 import org.apache.spark.sql.catalyst.plans.logical.{DeleteFromTable, Filter, LogicalPlan, Project, ReplaceData, WriteDelta}
 import org.apache.spark.sql.catalyst.trees.TreePattern.DELETE_FROM_TABLE
@@ -76,18 +76,16 @@ object RewriteDeleteFromTable extends RewriteRowLevelCommand {
     // construct a read relation and include all required metadata columns
     val readRelation = buildRelationWithAttrs(relation, operationTable, metadataAttrs)
 
-    // construct a plan that contains unmatched rows in matched groups that must be carried over
-    // such rows do not match the condition but have to be copied over as the source can replace
-    // only groups of rows (e.g. if a source supports replacing files, unmatched rows in matched
-    // files must be carried over)
-    // it is safe to negate the condition here as the predicate pushdown for group-based row-level
-    // operations is handled in a special way
-    val remainingRowsFilter = Not(EqualNullSafe(cond, TrueLiteral))
-    val remainingRowsPlan = Filter(remainingRowsFilter, readRelation)
-
     // build a plan to replace read groups in the table
     val writeRelation = relation.copy(table = operationTable)
-    val query = addOperationColumn(COPY_OPERATION, remainingRowsPlan)
+    // Preserve a control row for each deleted target row. Besides making the semantic distinction
+    // durable, this also retains the exact scanned/deleted cardinalities across driver recovery.
+    val operation = If(
+      EqualNullSafe(cond, TrueLiteral),
+      Literal(DELETE_CONTROL_OPERATION),
+      Literal(COPY_OPERATION))
+    val operationType = Alias(operation, OPERATION_COLUMN)()
+    val query = Project(operationType +: readRelation.output, readRelation)
     val projections = buildReplaceDataProjections(query, relation.output, metadataAttrs)
     val groupFilterCond = if (groupFilterEnabled) Some(cond) else None
     ReplaceData(writeRelation, cond, query, relation, projections, groupFilterCond)

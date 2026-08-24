@@ -118,6 +118,82 @@ private[spark] object MapStatus {
   }
 }
 
+/**
+ * Reducer totals shared by every synthetic map status of one externally recovered shuffle.
+ *
+ * Keeping one immutable array for the generation avoids materializing a mapper-by-reducer size
+ * matrix. Java serialization, which MapOutputTracker uses for status distribution, preserves the
+ * shared object reference and therefore also keeps the wire representation linear in mappers plus
+ * reducers.
+ */
+private[spark] final class RecoveredMapStatusMetadata(
+    bytesByPartitionId: Array[Long],
+    val numMaps: Int) extends Serializable {
+
+  // Each reducer has at most two block sizes under the deterministic quotient/remainder split.
+  // Store their one-byte encodings and the mapper boundary once per reducer. This keeps metadata
+  // O(reducers) while avoiding logarithm/power work on every block lookup.
+  private[this] val baseSizes = new Array[Byte](bytesByPartitionId.length)
+  private[this] val largerSizes = new Array[Byte](bytesByPartitionId.length)
+  private[this] val remainders = new Array[Int](bytesByPartitionId.length)
+
+  private var reduceId = 0
+  while (reduceId < bytesByPartitionId.length) {
+    val total = bytesByPartitionId(reduceId)
+    val base = total / numMaps
+    baseSizes(reduceId) = MapStatus.compressSize(base)
+    largerSizes(reduceId) = MapStatus.compressSize(base + (if (total % numMaps > 0) 1L else 0L))
+    remainders(reduceId) = (total % numMaps).toInt
+    reduceId += 1
+  }
+
+  def sizeForBlock(mapIndex: Int, reduceId: Int): Long = {
+    val encoded = if (mapIndex < remainders(reduceId)) {
+      largerSizes(reduceId)
+    } else {
+      baseSizes(reduceId)
+    }
+    RecoveredMapStatusMetadata.decompress(encoded)
+  }
+}
+
+private[spark] object RecoveredMapStatusMetadata {
+  private val DecompressedSizes = Array.tabulate[Long](256) { encoded =>
+    MapStatus.decompressSize(encoded.toByte)
+  }
+
+  def decompress(encoded: Byte): Long = DecompressedSizes(encoded & 0xff)
+}
+
+/**
+ * A compact synthetic status for one mapper of an externally recovered shuffle.
+ *
+ * The physical shuffle manager has already adopted the external generation. These statuses only
+ * preserve Spark's availability and block-enumeration contracts. Their per-map block sizes retain
+ * the previous even distribution and MapStatus compression bounds without eagerly storing it.
+ */
+private[spark] final class RecoveredMapStatus(
+    private[this] var loc: BlockManagerId,
+    private[spark] val recoveryMetadata: RecoveredMapStatusMetadata,
+    private[spark] val mapIndex: Int) extends MapStatus with Serializable {
+
+  override def location: BlockManagerId = loc
+
+  override def updateLocation(newLoc: BlockManagerId): Unit = {
+    loc = newLoc
+  }
+
+  override def getSizeForBlock(reduceId: Int): Long = {
+    recoveryMetadata.sizeForBlock(mapIndex, reduceId)
+  }
+
+  override def mapId: Long = mapIndex.toLong
+
+  private[spark] def sharesRecoveryMetadata(other: RecoveredMapStatus): Boolean = {
+    recoveryMetadata eq other.recoveryMetadata
+  }
+}
+
 
 /**
  * A [[MapStatus]] implementation that tracks the size of each block. Size for each block is

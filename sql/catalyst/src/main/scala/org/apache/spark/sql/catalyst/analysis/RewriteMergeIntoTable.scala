@@ -23,9 +23,9 @@ import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLite
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
 import org.apache.spark.sql.catalyst.plans.{FullOuter, Inner, JoinType, LeftAnti, LeftOuter, RightOuter}
 import org.apache.spark.sql.catalyst.plans.logical.{DeleteAction, Filter, HintInfo, InsertAction, InsertOnlyMerge, Join, JoinHint, LogicalPlan, MergeAction, MergeIntoTable, MergeRows, NO_BROADCAST_AND_REPLICATION, Project, ReplaceData, UpdateAction, WriteDelta}
-import org.apache.spark.sql.catalyst.plans.logical.MergeRows.{Copy, Delete, Discard, Insert, Instruction, Keep, ROW_ID, Split, Update}
+import org.apache.spark.sql.catalyst.plans.logical.MergeRows.{Copy, Delete, Insert, Instruction, Keep, ROW_ID, Split, Update}
 import org.apache.spark.sql.catalyst.trees.TreePattern.MERGE_INTO_TABLE
-import org.apache.spark.sql.catalyst.util.RowDeltaUtils.{COPY_OPERATION, INSERT_OPERATION, OPERATION_COLUMN, UPDATE_OPERATION}
+import org.apache.spark.sql.catalyst.util.RowDeltaUtils._
 import org.apache.spark.sql.connector.catalog.SupportsRowLevelOperations
 import org.apache.spark.sql.connector.write.{RowLevelOperationTable, SupportsDelta}
 import org.apache.spark.sql.connector.write.RowLevelOperation.Command.MERGE
@@ -39,6 +39,11 @@ import org.apache.spark.sql.types.IntegerType
  * This rule assumes the commands have been fully resolved and all assignments have been aligned.
  */
 object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper {
+
+  private sealed trait ActionOrigin
+  private case object Matched extends ActionOrigin
+  private case object NotMatched extends ActionOrigin
+  private case object NotMatchedBySource extends ActionOrigin
 
   private final val ROW_FROM_SOURCE = "__row_from_source"
   private final val ROW_FROM_TARGET = "__row_from_target"
@@ -210,15 +215,15 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
     val keepCarryoverRowsInstruction = Keep(Copy, TrueLiteral, carryoverRowsOutput)
 
     val matchedInstructions = matchedActions.map { action =>
-      toInstruction(action, metadataAttrs)
+      toInstruction(action, Matched, targetTable.output, metadataAttrs)
     } :+ keepCarryoverRowsInstruction
 
     val notMatchedInstructions = notMatchedActions.map { action =>
-      toInstruction(action, metadataAttrs)
+      toInstruction(action, NotMatched, targetTable.output, metadataAttrs)
     }
 
     val notMatchedBySourceInstructions = notMatchedBySourceActions.map { action =>
-      toInstruction(action, metadataAttrs)
+      toInstruction(action, NotMatchedBySource, targetTable.output, metadataAttrs)
     } :+ keepCarryoverRowsInstruction
 
     val rowFromSourceAttr = resolveAttrRef(ROW_FROM_SOURCE, joinPlan)
@@ -352,15 +357,18 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
     }
 
     val matchedInstructions = matchedActions.map { action =>
-      toInstruction(action, rowAttrs, rowIdAttrs, metadataAttrs, originalRowIdValues, splitUpdates)
+      toInstruction(action, Matched, rowAttrs, rowIdAttrs, metadataAttrs,
+        originalRowIdValues, splitUpdates)
     }
 
     val notMatchedInstructions = notMatchedActions.map { action =>
-      toInstruction(action, rowAttrs, rowIdAttrs, metadataAttrs, originalRowIdValues, splitUpdates)
+      toInstruction(action, NotMatched, rowAttrs, rowIdAttrs, metadataAttrs,
+        originalRowIdValues, splitUpdates)
     }
 
     val notMatchedBySourceInstructions = notMatchedBySourceActions.map { action =>
-      toInstruction(action, rowAttrs, rowIdAttrs, metadataAttrs, originalRowIdValues, splitUpdates)
+      toInstruction(action, NotMatchedBySource, rowAttrs, rowIdAttrs, metadataAttrs,
+        originalRowIdValues, splitUpdates)
     }
 
     val rowFromSourceAttr = resolveAttrRef(ROW_FROM_SOURCE, joinPlan)
@@ -443,16 +451,30 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
   }
 
   // converts a MERGE action into an instruction on top of the joined plan for group-based plans
-  private def toInstruction(action: MergeAction, metadataAttrs: Seq[Attribute]): Instruction = {
+  private def toInstruction(
+      action: MergeAction,
+      origin: ActionOrigin,
+      targetAttrs: Seq[Attribute],
+      metadataAttrs: Seq[Attribute]): Instruction = {
     action match {
       case UpdateAction(cond, assignments, _) =>
         val rowValues = assignments.map(_.value)
         val metadataValues = nullifyMetadataOnUpdate(metadataAttrs)
-        val output = Seq(Literal(UPDATE_OPERATION)) ++ rowValues ++ metadataValues
+        val operation = origin match {
+          case Matched => MATCHED_UPDATE_OPERATION
+          case NotMatchedBySource => NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION
+          case NotMatched => UPDATE_OPERATION
+        }
+        val output = Seq(Literal(operation)) ++ rowValues ++ metadataValues
         Keep(Update, cond.getOrElse(TrueLiteral), output)
 
       case DeleteAction(cond) =>
-        Discard(cond.getOrElse(TrueLiteral))
+        val operation = origin match {
+          case Matched => MATCHED_DELETE_CONTROL_OPERATION
+          case NotMatchedBySource => NOT_MATCHED_BY_SOURCE_DELETE_CONTROL_OPERATION
+          case NotMatched => DELETE_CONTROL_OPERATION
+        }
+        Keep(Delete, cond.getOrElse(TrueLiteral), Literal(operation) +: targetAttrs)
 
       case InsertAction(cond, assignments) =>
         val rowValues = assignments.map(_.value)
@@ -470,6 +492,7 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
   // converts a MERGE action into an instruction on top of the joined plan for delta-based plans
   private def toInstruction(
       action: MergeAction,
+      origin: ActionOrigin,
       rowAttrs: Seq[Attribute],
       rowIdAttrs: Seq[Attribute],
       metadataAttrs: Seq[Attribute],
@@ -478,16 +501,38 @@ object RewriteMergeIntoTable extends RewriteRowLevelCommand with PredicateHelper
 
     action match {
       case UpdateAction(cond, assignments, _) if splitUpdates =>
-        val output = deltaDeleteOutput(rowAttrs, rowIdAttrs, metadataAttrs, originalRowIdValues)
-        val otherOutput = deltaReinsertOutput(assignments, metadataAttrs, originalRowIdValues)
+        val (deleteOperation, reinsertOperation) = origin match {
+          case Matched =>
+            (MATCHED_SPLIT_UPDATE_DELETE_OPERATION, MATCHED_SPLIT_UPDATE_REINSERT_OPERATION)
+          case NotMatchedBySource =>
+            (NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_DELETE_OPERATION,
+              NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_REINSERT_OPERATION)
+          case NotMatched => (SPLIT_UPDATE_DELETE_OPERATION, SPLIT_UPDATE_REINSERT_OPERATION)
+        }
+        val output = deltaDeleteOutput(
+          rowAttrs, rowIdAttrs, metadataAttrs, originalRowIdValues, deleteOperation)
+        val otherOutput = deltaReinsertOutput(
+          assignments, metadataAttrs, originalRowIdValues, reinsertOperation)
         Split(cond.getOrElse(TrueLiteral), output, otherOutput)
 
       case UpdateAction(cond, assignments, _) =>
-        val output = deltaUpdateOutput(assignments, metadataAttrs, originalRowIdValues)
+        val operation = origin match {
+          case Matched => MATCHED_UPDATE_OPERATION
+          case NotMatchedBySource => NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION
+          case NotMatched => UPDATE_OPERATION
+        }
+        val output = deltaUpdateOutput(
+          assignments, metadataAttrs, originalRowIdValues, operation)
         Keep(Update, cond.getOrElse(TrueLiteral), output)
 
       case DeleteAction(cond) =>
-        val output = deltaDeleteOutput(rowAttrs, rowIdAttrs, metadataAttrs, originalRowIdValues)
+        val operation = origin match {
+          case Matched => MATCHED_DELETE_OPERATION
+          case NotMatchedBySource => NOT_MATCHED_BY_SOURCE_DELETE_OPERATION
+          case NotMatched => DELETE_OPERATION
+        }
+        val output = deltaDeleteOutput(
+          rowAttrs, rowIdAttrs, metadataAttrs, originalRowIdValues, operation)
         Keep(Delete, cond.getOrElse(TrueLiteral), output)
 
       case InsertAction(cond, assignments) =>

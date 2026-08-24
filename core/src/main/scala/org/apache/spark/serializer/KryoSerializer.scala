@@ -45,7 +45,8 @@ import org.apache.spark.internal.LogKeys.CLASS_NAME
 import org.apache.spark.internal.config.Kryo._
 import org.apache.spark.internal.io.FileCommitProtocol._
 import org.apache.spark.network.util.ByteUnit
-import org.apache.spark.scheduler.{CompressedMapStatus, HighlyCompressedMapStatus}
+import org.apache.spark.scheduler.{CompressedMapStatus, HighlyCompressedMapStatus,
+  RecoveredMapStatus, RecoveredMapStatusMetadata}
 import org.apache.spark.storage._
 import org.apache.spark.unsafe.types.{TimestampNanosVal, UTF8String}
 import org.apache.spark.util.{BoundedPriorityQueue, ByteBufferInputStream, NextIterator, SerializableConfiguration, SerializableJobConf, Utils}
@@ -555,7 +556,10 @@ private[serializer] object KryoSerializer {
     classOf[SparkConf],
     classOf[TaskCommitMessage],
     classOf[SerializedLambda],
-    classOf[BitSet]
+    classOf[BitSet],
+    // Append recovery classes to preserve every pre-existing registration ID.
+    classOf[RecoveredMapStatus],
+    classOf[RecoveredMapStatusMetadata]
   )
 
   private val toRegisterSerializer = Map[Class[_], KryoClassSerializer[_]](

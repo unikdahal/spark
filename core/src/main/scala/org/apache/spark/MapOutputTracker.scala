@@ -39,7 +39,8 @@ import org.apache.spark.internal.LogKeys._
 import org.apache.spark.internal.config._
 import org.apache.spark.io.CompressionCodec
 import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
-import org.apache.spark.scheduler.{MapStatus, MergeStatus, ShuffleOutputStatus}
+import org.apache.spark.scheduler.{MapStatus, MergeStatus, RecoveredMapStatus,
+  RecoveredMapStatusMetadata, ShuffleOutputStatus}
 import org.apache.spark.shuffle.MetadataFetchFailedException
 import org.apache.spark.storage.{BlockId, BlockManagerId, ShuffleBlockId, ShuffleMergedBlockId}
 import org.apache.spark.util._
@@ -119,6 +120,18 @@ private class ShuffleStatus(
    * fallback if stale data is present in a merged block.
    */
   private[this] val staleMapIndexes = new java.util.HashSet[Int]()
+
+  // This is generation metadata: it must live and disappear with this ShuffleStatus rather than
+  // with any one DAGScheduler stage wrapper.
+  private[this] var recovered = false
+
+  def markRecovered(): Unit = withWriteLock {
+    recovered = true
+  }
+
+  def isRecovered: Boolean = withReadLock {
+    recovered
+  }
 
   /**
    * Mark a partition as having stale (redundant) push attempts. Called from TaskSetManager when it
@@ -965,19 +978,18 @@ private[spark] class MapOutputTrackerMaster(
     val recoveredLocation = BlockManagerId("recovered-shuffle", "external", 1)
     registerShuffle(shuffleId, numMaps, bytesByPartitionId.length)
     try {
-      val baseSizes = bytesByPartitionId.map(_ / numMaps)
-      val remainders = bytesByPartitionId.map(_ % numMaps)
+      val recoveryMetadata = new RecoveredMapStatusMetadata(bytesByPartitionId, numMaps)
       var mapIndex = 0
       while (mapIndex < numMaps) {
-        val sizes = Array.tabulate(bytesByPartitionId.length) { partitionId =>
-          baseSizes(partitionId) + (if (mapIndex < remainders(partitionId)) 1L else 0L)
-        }
         registerMapOutput(
           shuffleId,
           mapIndex,
-          MapStatus(recoveredLocation, sizes, mapIndex.toLong))
+          new RecoveredMapStatus(recoveredLocation, recoveryMetadata, mapIndex))
         mapIndex += 1
       }
+      // Publish provenance only after every synthetic map status is installed, so observing
+      // isRecovered also implies that the recovered tracker generation is complete.
+      shuffleStatuses(shuffleId).markRecovered()
       new MapOutputStatistics(shuffleId, bytesByPartitionId.clone())
     } catch {
       case NonFatal(e) =>
@@ -1125,6 +1137,11 @@ private[spark] class MapOutputTrackerMaster(
 
   /** Check if the given shuffle is being tracked */
   override def containsShuffle(shuffleId: Int): Boolean = shuffleStatuses.contains(shuffleId)
+
+  /** Whether the currently tracked shuffle generation was adopted from durable external state. */
+  private[spark] def isRecoveredShuffle(shuffleId: Int): Boolean = {
+    shuffleStatuses.get(shuffleId).exists(_.isRecovered)
+  }
 
   def getNumAvailableOutputs(shuffleId: Int): Int = {
     shuffleStatuses.get(shuffleId).map(_.numAvailableMapOutputs).getOrElse(0)

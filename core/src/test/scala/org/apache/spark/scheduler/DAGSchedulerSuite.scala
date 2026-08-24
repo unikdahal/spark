@@ -860,6 +860,76 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(mapOutputTracker.getStatistics(shuffleDep).bytesByPartitionId === Array(10L, 20L))
   }
 
+  test("recreated shuffle stage retains externally recovered provenance") {
+    val attempts = new AtomicInteger()
+    val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(1))
+    shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+      override def tryRecover(
+          shuffleId: Int,
+          numMappers: Int,
+          numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        attempts.incrementAndGet()
+        Some(RecoveredShuffleOutput(Array(10L), 10L, Some(2L)))
+      }
+
+      override def onStageCompleted(
+          shuffleId: Int,
+          statistics: MapOutputStatistics): Unit = {}
+    })
+
+    val original = scheduler.createShuffleMapStage(shuffleDep, 0)
+    val recreated = scheduler.createShuffleMapStage(shuffleDep, 1)
+
+    assert(original.isRecovered)
+    assert(recreated.isRecovered)
+    assert(recreated.isAvailable)
+    assert(attempts.get() === 1)
+
+    val reduceRdd = new MyRDD(sc, 1, List(shuffleDep), tracker = mapOutputTracker)
+    submit(reduceRdd, Array(0))
+    assert(taskSets.size === 1)
+    complete(taskSets.head, Seq(
+      (FetchFailed(
+        makeBlockManagerId("old-executor"),
+        shuffleDep.shuffleId,
+        0L,
+        0,
+        0,
+        "late failure"), null)))
+    assert(failure.getMessage.contains("Recovered shuffle"))
+    assert(taskSets.size === 1)
+  }
+
+  test("recovered shuffle rejects inconsistent or overflowing reducer totals") {
+    Seq(
+      RecoveredShuffleOutput(Array(4L, 5L), 10L, None),
+      RecoveredShuffleOutput(Array(Long.MaxValue, 1L), Long.MaxValue, None)).foreach { output =>
+      val aborts = new AtomicInteger()
+      val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(2))
+      shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+        override def tryRecover(
+            shuffleId: Int,
+            numMappers: Int,
+            numPartitions: Int): Option[RecoveredShuffleOutput] = Some(output)
+
+        override def onStageCompleted(
+            shuffleId: Int,
+            statistics: MapOutputStatistics): Unit = {}
+
+        override def abortRecovery(shuffleId: Int, cause: Throwable): Unit = {
+          aborts.incrementAndGet()
+        }
+      })
+
+      val error = intercept[SparkException] {
+        scheduler.createShuffleMapStage(shuffleDep, 0)
+      }
+      assert(error.getMessage.contains("refusing to recompute"))
+      assert(aborts.get() === 1)
+      assert(!mapOutputTracker.containsShuffle(shuffleDep.shuffleId))
+    }
+  }
+
   test("invalid recovered shuffle is aborted and not registered") {
     val aborts = new AtomicInteger()
     val shuffleDep = new ShuffleDependency(new MyRDD(sc, 3, Nil), new HashPartitioner(2))
@@ -915,6 +985,179 @@ class DAGSchedulerSuite extends SparkFunSuite with TempLocalSparkContext with Ti
     assert(failure.getMessage.contains("refusing to recompute"))
     assert(taskSets.size === 1)
     assert(mapOutputTracker.containsShuffle(shuffleDep.shuffleId))
+  }
+
+  test("executor loss does not invalidate or resubmit an externally recovered shuffle") {
+    val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(1))
+    shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+      override def tryRecover(
+          shuffleId: Int,
+          numMappers: Int,
+          numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        Some(RecoveredShuffleOutput(Array(10L), 10L, Some(2L)))
+      }
+
+      override def onStageCompleted(
+          shuffleId: Int,
+          statistics: MapOutputStatistics): Unit = {}
+    })
+    val reduceRdd = new MyRDD(sc, 1, List(shuffleDep), tracker = mapOutputTracker)
+
+    submit(reduceRdd, Array(0))
+    assert(taskSets.size === 1)
+    val recoveredStage = scheduler.shuffleIdToMapStage(shuffleDep.shuffleId)
+    assert(recoveredStage.isRecovered)
+    assert(recoveredStage.isAvailable)
+
+    runEvent(ExecutorLost(
+      "old-producer-executor",
+      ExecutorExited(-100, false, "late loss from the original driver generation")))
+
+    assert(recoveredStage.isAvailable)
+    assert(recoveredStage.findMissingPartitions().isEmpty)
+    assert(mapOutputTracker.isRecoveredShuffle(shuffleDep.shuffleId))
+    assert(taskSets.size === 1)
+  }
+
+  test("metadata fetch failure from recovered shuffle fails without producer resubmission") {
+    val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(1))
+    shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+      override def tryRecover(
+          shuffleId: Int,
+          numMappers: Int,
+          numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        Some(RecoveredShuffleOutput(Array(10L), 10L, Some(2L)))
+      }
+
+      override def onStageCompleted(
+          shuffleId: Int,
+          statistics: MapOutputStatistics): Unit = {}
+    })
+    val reduceRdd = new MyRDD(sc, 1, List(shuffleDep), tracker = mapOutputTracker)
+
+    submit(reduceRdd, Array(0))
+    assert(taskSets.size === 1)
+    val metadataFailure = new MetadataFetchFailedException(
+      shuffleDep.shuffleId, 0, "recovered metadata unavailable")
+    complete(taskSets.head, Seq((metadataFailure.toTaskFailedReason, null)))
+
+    assert(failure.getMessage.contains("Recovered shuffle"))
+    assert(failure.getMessage.contains("refusing to recompute"))
+    assert(mapOutputTracker.isRecoveredShuffle(shuffleDep.shuffleId))
+    assert(taskSets.size === 1)
+  }
+
+  test("repeated late fetch failures cannot resubmit a recovered shuffle producer") {
+    val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(1))
+    shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+      override def tryRecover(
+          shuffleId: Int,
+          numMappers: Int,
+          numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        Some(RecoveredShuffleOutput(Array(10L), 10L, Some(2L)))
+      }
+
+      override def onStageCompleted(
+          shuffleId: Int,
+          statistics: MapOutputStatistics): Unit = {}
+    })
+    val reduceRdd = new MyRDD(sc, 2, List(shuffleDep), tracker = mapOutputTracker)
+
+    submit(reduceRdd, Array(0, 1))
+    assert(taskSets.size === 1)
+    val consumerTasks = taskSets.head.tasks
+    val firstFailure = FetchFailed(
+      makeBlockManagerId("worker-a"), shuffleDep.shuffleId, 0L, 0, 0, "first failure")
+    val lateFailure = FetchFailed(
+      makeBlockManagerId("worker-b"), shuffleDep.shuffleId, 1L, 1, 0, "late failure")
+
+    runEvent(makeCompletionEvent(consumerTasks(0), firstFailure, null))
+    runEvent(makeCompletionEvent(consumerTasks(1), lateFailure, null))
+
+    assert(failure.getMessage.contains("Recovered shuffle"))
+    assert(mapOutputTracker.isRecoveredShuffle(shuffleDep.shuffleId))
+    assert(taskSets.size === 1)
+  }
+
+  test("barrier shuffle recovery is rejected before provider lookup") {
+    val attempts = new AtomicInteger()
+    val barrierRdd = new MyRDD(sc, 2, Nil).barrier().mapPartitions(iter => iter)
+    val shuffleDep = new ShuffleDependency(barrierRdd, new HashPartitioner(2))
+    shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+      override def tryRecover(
+          shuffleId: Int,
+          numMappers: Int,
+          numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        attempts.incrementAndGet()
+        None
+      }
+
+      override def onStageCompleted(
+          shuffleId: Int,
+          statistics: MapOutputStatistics): Unit = {}
+    })
+
+    val error = intercept[SparkException] {
+      scheduler.createShuffleMapStage(shuffleDep, 0)
+    }
+
+    assert(error.getMessage.contains("barrier execution"))
+    assert(attempts.get() === 0)
+    assert(!mapOutputTracker.containsShuffle(shuffleDep.shuffleId))
+  }
+
+  test("indeterminate shuffle recovery is rejected before provider lookup") {
+    val attempts = new AtomicInteger()
+    val shuffleDep = new ShuffleDependency(
+      new MyRDD(sc, 2, Nil, indeterminate = true), new HashPartitioner(2))
+    shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+      override def tryRecover(
+          shuffleId: Int,
+          numMappers: Int,
+          numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        attempts.incrementAndGet()
+        None
+      }
+
+      override def onStageCompleted(
+          shuffleId: Int,
+          statistics: MapOutputStatistics): Unit = {}
+    })
+
+    val error = intercept[SparkException] {
+      scheduler.createShuffleMapStage(shuffleDep, 0)
+    }
+
+    assert(error.getMessage.contains("producer is indeterminate"))
+    assert(attempts.get() === 0)
+    assert(!mapOutputTracker.containsShuffle(shuffleDep.shuffleId))
+  }
+
+  test("push-merged shuffle recovery is rejected before provider lookup") {
+    val attempts = new AtomicInteger()
+    val shuffleDep = new ShuffleDependency(new MyRDD(sc, 2, Nil), new HashPartitioner(2))
+    shuffleDep.setShuffleMergeAllowed(true)
+    shuffleDep.setStageRecoveryHandler(new ShuffleStageRecoveryHandler {
+      override def tryRecover(
+          shuffleId: Int,
+          numMappers: Int,
+          numPartitions: Int): Option[RecoveredShuffleOutput] = {
+        attempts.incrementAndGet()
+        None
+      }
+
+      override def onStageCompleted(
+          shuffleId: Int,
+          statistics: MapOutputStatistics): Unit = {}
+    })
+
+    val error = intercept[SparkException] {
+      scheduler.createShuffleMapStage(shuffleDep, 0)
+    }
+
+    assert(error.getMessage.contains("recovered merge metadata is unsupported"))
+    assert(attempts.get() === 0)
+    assert(!mapOutputTracker.containsShuffle(shuffleDep.shuffleId))
   }
 
   test("run trivial job") {

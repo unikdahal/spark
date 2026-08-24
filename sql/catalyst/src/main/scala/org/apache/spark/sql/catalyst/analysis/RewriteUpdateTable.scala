@@ -220,8 +220,15 @@ object RewriteUpdateTable extends RewriteRowLevelCommand {
     val (metadataAttrs, rowAttrs) = matchedRowsPlan.output.partition { attr =>
       MetadataAttribute.isValid(attr.metadata)
     }
-    val deleteOutput = deltaDeleteOutput(rowAttrs, rowIdAttrs, metadataAttrs)
-    val insertOutput = deltaReinsertOutput(assignments, metadataAttrs)
+    val deleteOutput = deltaDeleteOutput(
+      rowAttrs,
+      rowIdAttrs,
+      metadataAttrs,
+      operation = SPLIT_UPDATE_DELETE_OPERATION)
+    val insertOutput = deltaReinsertOutput(
+      assignments,
+      metadataAttrs,
+      operation = SPLIT_UPDATE_REINSERT_OPERATION)
     val outputs = Seq(deleteOutput, insertOutput)
     val operationTypeAttr = AttributeReference(OPERATION_COLUMN, IntegerType, nullable = false)()
     val attrs = operationTypeAttr +: matchedRowsPlan.output

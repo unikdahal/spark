@@ -66,7 +66,7 @@ class RelationResolution(
     recoveryAnchorResolver() match {
       case None => relation
       case Some(resolver) => relation match {
-        case table: Table => RecoveryAnchorResolver.resolveTable(table, resolver)
+        case table: Table => RecoveryAnchorUtils.resolveTable(table, resolver)
         case other => other
       }
     }

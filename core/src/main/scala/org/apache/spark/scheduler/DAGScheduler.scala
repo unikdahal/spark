@@ -734,7 +734,6 @@ private[spark] class DAGScheduler(
     // partial scheduler state and a re-submit re-throws the same error.
     val outputTracker = outputTrackerMaster(shuffleDep)
     val numTasks = rdd.partitions.length
-    val parents = getOrCreateParentStages(shuffleDeps, jobId)
 
     if (shuffleDep.isInstanceOf[PipelinedShuffleDependency[_, _, _]] &&
         shuffleDep.stageRecoveryHandler.nonEmpty) {
@@ -742,6 +741,26 @@ private[spark] class DAGScheduler(
         s"Pipelined shuffle ${shuffleDep.shuffleId} cannot be recovered because it has no " +
           "durable addressable output")
     }
+
+    shuffleDep.stageRecoveryHandler.foreach { _ =>
+      if (rdd.isBarrier()) {
+        throw new SparkException(
+          s"Shuffle ${shuffleDep.shuffleId} cannot be recovered because its producer uses " +
+            "barrier execution")
+      }
+      if (rdd.outputDeterministicLevel == DeterministicLevel.INDETERMINATE) {
+        throw new SparkException(
+          s"Shuffle ${shuffleDep.shuffleId} cannot be recovered because its producer is " +
+            "indeterminate")
+      }
+      if (shuffleDep.shuffleMergeAllowed) {
+        throw new SparkException(
+          s"Shuffle ${shuffleDep.shuffleId} cannot be recovered while push-based shuffle " +
+            "merge is allowed because recovered merge metadata is unsupported")
+      }
+    }
+
+    val parents = getOrCreateParentStages(shuffleDeps, jobId)
 
     val trackerAlreadyRegistered = outputTracker.containsShuffle(shuffleDep.shuffleId)
     val recovered = if (trackerAlreadyRegistered) {
@@ -762,6 +781,12 @@ private[spark] class DAGScheduler(
             s"Recovered shuffle ${shuffleDep.shuffleId} has a negative data size")
           require(output.rowCount.forall(_ >= 0),
             s"Recovered shuffle ${shuffleDep.shuffleId} has a negative row count")
+          val reducerDataSize = output.bytesByPartitionId.foldLeft(0L) { (sum, partitionSize) =>
+            Math.addExact(sum, partitionSize)
+          }
+          require(output.dataSize == reducerDataSize,
+            s"Recovered shuffle ${shuffleDep.shuffleId} data size ${output.dataSize} does not " +
+              s"match reducer total $reducerDataSize")
           output
         }
       } catch {
@@ -823,7 +848,7 @@ private[spark] class DAGScheduler(
     val stage = new ShuffleMapStage(
       id, rdd, numTasks, parents, jobId, rdd.creationSite, shuffleDep, mapOutputTracker,
       resourceProfile.id)
-    if (recovered.nonEmpty) {
+    if (recovered.nonEmpty || mapOutputTracker.isRecoveredShuffle(shuffleDep.shuffleId)) {
       stage.markRecovered()
     }
     stageIdToStage(id) = stage

@@ -21,11 +21,28 @@ package org.apache.spark.sql.catalyst.util
  * A utility that holds constants for handling deltas of rows.
  */
 object RowDeltaUtils {
+  // Bump this version whenever the meaning or encoding of an operation changes. Durable recovery
+  // metadata must bind itself to this version before interpreting operation values.
+  final val ROW_OPERATION_PROTOCOL_VERSION: Int = 1
   final val OPERATION_COLUMN: String = "__row_operation"
   final val DELETE_OPERATION: Int = 1
   final val UPDATE_OPERATION: Int = 2
   final val INSERT_OPERATION: Int = 3
   final val REINSERT_OPERATION: Int = 4
   final val COPY_OPERATION: Int = 5
+  final val NO_WRITE_OPERATION: Int = 6
+  final val DELETE_CONTROL_OPERATION: Int = 7
+  final val MATCHED_UPDATE_OPERATION: Int = 8
+  final val MATCHED_DELETE_OPERATION: Int = 9
+  final val NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION: Int = 10
+  final val NOT_MATCHED_BY_SOURCE_DELETE_OPERATION: Int = 11
+  final val MATCHED_DELETE_CONTROL_OPERATION: Int = 12
+  final val NOT_MATCHED_BY_SOURCE_DELETE_CONTROL_OPERATION: Int = 13
+  final val SPLIT_UPDATE_DELETE_OPERATION: Int = 14
+  final val SPLIT_UPDATE_REINSERT_OPERATION: Int = 15
+  final val MATCHED_SPLIT_UPDATE_DELETE_OPERATION: Int = 16
+  final val MATCHED_SPLIT_UPDATE_REINSERT_OPERATION: Int = 17
+  final val NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_DELETE_OPERATION: Int = 18
+  final val NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_REINSERT_OPERATION: Int = 19
   final val ORIGINAL_ROW_ID_VALUE_PREFIX: String = "__original_row_id_"
 }
