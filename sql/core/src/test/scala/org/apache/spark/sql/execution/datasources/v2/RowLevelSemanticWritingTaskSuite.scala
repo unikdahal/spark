@@ -61,6 +61,31 @@ class RowLevelSemanticWritingTaskSuite extends SparkFunSuite {
       notMatchedBySourceDeleted = 1L)))
   }
 
+  test("group replacement without metadata maps plain and clause-specific updates") {
+    val state = new GroupWriterState
+    val task = DataWithProjectionWritingSparkTask(projection(1), Map.empty)
+    val rows = Iterator(
+      row(COPY_OPERATION, 40),
+      row(UPDATE_OPERATION, 41),
+      row(NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION, 42),
+      row(DELETE_CONTROL_OPERATION, 43),
+      row(INSERT_OPERATION, 44))
+
+    val result = task.run(
+      new GroupWriterFactory(state), TaskContext.empty(), rows,
+      useCommitCoordinator = false, Map.empty)
+
+    assert(state.calls === Seq("write(40)", "write(41)", "write(42)", "write(44)"))
+    assert(result.numRows === 4L)
+    assert(result.rowLevelSummary.contains(summary(
+      scanned = 4L,
+      copied = 1L,
+      deleted = 1L,
+      updated = 2L,
+      inserted = 1L,
+      notMatchedBySourceUpdated = 1L)))
+  }
+
   test("delta task maps semantic operations and never calls connector for controls") {
     val state = new DeltaWriterState
     val projections = WriteDeltaProjections(
@@ -96,6 +121,46 @@ class RowLevelSemanticWritingTaskSuite extends SparkFunSuite {
       matchedUpdated = 1L,
       matchedDeleted = 2L,
       notMatchedBySourceUpdated = 1L)))
+  }
+
+  test("delta task without metadata exhaustively maps plain and split semantic operations") {
+    val state = new DeltaWriterState
+    val projections = WriteDeltaProjections(
+      rowProjection = Some(projection(1)),
+      rowIdProjection = projection(2),
+      metadataProjection = None)
+    val task = DeltaWritingSparkTask(projections, Map.empty)
+    val rows = Iterator(
+      row(DELETE_OPERATION, 30, 300),
+      row(UPDATE_OPERATION, 31, 301),
+      row(REINSERT_OPERATION, 32, 302),
+      row(SPLIT_UPDATE_DELETE_OPERATION, 33, 303),
+      row(SPLIT_UPDATE_REINSERT_OPERATION, 34, 304),
+      row(NOT_MATCHED_BY_SOURCE_DELETE_OPERATION, 35, 305),
+      row(NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_DELETE_OPERATION, 36, 306),
+      row(NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_REINSERT_OPERATION, 37, 307),
+      row(DELETE_CONTROL_OPERATION, 38, 308))
+
+    val result = task.run(
+      new SemanticTestDeltaWriterFactory(state), TaskContext.empty(), rows,
+      useCommitCoordinator = false, Map.empty)
+
+    assert(state.calls === Seq(
+      "delete(null,300)",
+      "update(null,301,31)",
+      "reinsert(null,32)",
+      "delete(null,303)",
+      "reinsert(null,34)",
+      "delete(null,305)",
+      "delete(null,306)",
+      "reinsert(null,37)"))
+    assert(result.numRows === 8L)
+    assert(result.rowLevelSummary.contains(summary(
+      scanned = 7L,
+      deleted = 3L,
+      updated = 4L,
+      notMatchedBySourceUpdated = 1L,
+      notMatchedBySourceDeleted = 1L)))
   }
 
   private def projection(ordinal: Int): ProjectingInternalRow = {
@@ -155,20 +220,24 @@ private class SemanticTestDeltaWriterFactory(state: DeltaWriterState) extends De
   override def createWriter(partitionId: Int, taskId: Long): DeltaWriter[InternalRow] =
     new DeltaWriter[InternalRow] {
       override def delete(metadata: InternalRow, id: InternalRow): Unit =
-        state.calls += s"delete(${metadata.getInt(0)},${id.getInt(0)})"
+        state.calls += s"delete(${value(metadata)},${id.getInt(0)})"
       override def update(
           metadata: InternalRow,
           id: InternalRow,
           record: InternalRow): Unit = {
         state.calls +=
-          s"update(${metadata.getInt(0)},${id.getInt(0)},${record.getInt(0)})"
+          s"update(${value(metadata)},${id.getInt(0)},${record.getInt(0)})"
       }
       override def reinsert(metadata: InternalRow, record: InternalRow): Unit =
-        state.calls += s"reinsert(${metadata.getInt(0)},${record.getInt(0)})"
+        state.calls += s"reinsert(${value(metadata)},${record.getInt(0)})"
       override def insert(record: InternalRow): Unit =
         state.calls += s"insert(${record.getInt(0)})"
       override def commit(): WriterCommitMessage = SemanticWriterCommitMessage
       override def abort(): Unit = {}
       override def close(): Unit = {}
+
+      private def value(metadata: InternalRow): String = {
+        if (metadata == null) "null" else metadata.getInt(0).toString
+      }
     }
 }

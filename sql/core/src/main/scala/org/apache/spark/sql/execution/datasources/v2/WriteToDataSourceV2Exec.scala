@@ -382,6 +382,8 @@ case class ReplaceDataExec(
     tableName: String,
     transaction: Option[Transaction] = None) extends RowLevelWriteExec {
 
+  override private[v2] val rowLevelPhysicalMode: String = "REPLACE_DATA"
+
   override def writingTask: WritingSparkTask[_] = {
     projections.metadataProjection match {
       case Some(metadataProj) =>
@@ -428,6 +430,8 @@ case class WriteDeltaExec(
     rowLevelCommand: RowLevelOperation.Command,
     tableName: String,
     transaction: Option[Transaction] = None) extends RowLevelWriteExec {
+
+  override private[v2] val rowLevelPhysicalMode: String = "WRITE_DELTA"
 
   override lazy val writingTask: WritingSparkTask[_] = {
     if (projections.metadataProjection.isDefined) {
@@ -511,6 +515,7 @@ trait V2ExistingTableWriteExec extends V2TableWriteExec with TransactionalExec {
  */
 trait RowLevelWriteExec extends V2ExistingTableWriteExec {
   def rowLevelCommand: RowLevelOperation.Command
+  private[v2] def rowLevelPhysicalMode: String
 
   override protected def requiresRowLevelTaskSummary: Boolean = true
 
@@ -715,15 +720,19 @@ trait V2TableWriteExec
           store, batchWrite.asInstanceOf[HasRecoveryTaskCommitStore].recoveryId,
           recoverable.commitMessageCodec(), metricSchema, requiresRowLevelTaskSummary)
         if (requiresRowLevelTaskSummary && this.isInstanceOf[RowLevelWriteExec]) {
-          val command = this.asInstanceOf[RowLevelWriteExec].rowLevelCommand.toString
+          val rowLevelExec = this.asInstanceOf[RowLevelWriteExec]
+          val command = rowLevelExec.rowLevelCommand.toString
           val manifestInput =
             batchWrite.asInstanceOf[HasRecoveryTaskCommitStore].rowLevelManifestInput
           require(manifestInput.isDefined,
-            s"Recovery of row-level ${this.asInstanceOf[RowLevelWriteExec].rowLevelCommand} " +
+            s"Recovery of row-level ${rowLevelExec.rowLevelCommand} " +
               "requires a Spark-owned generation manifest")
           require(manifestInput.get.command == command,
             s"Row-level recovery manifest command ${manifestInput.get.command} does not match " +
               s"physical command $command")
+          require(manifestInput.get.physicalMode == rowLevelExec.rowLevelPhysicalMode,
+            s"Row-level recovery manifest mode ${manifestInput.get.physicalMode} does not match " +
+              s"physical mode ${rowLevelExec.rowLevelPhysicalMode}")
         }
         RecoveryTaskCommitEnvelope.validateContext(context)
         val compatibilityMetadata = Option(
@@ -731,17 +740,14 @@ trait V2TableWriteExec
           throw new IllegalStateException(
             "A recoverable batch write returned null compatibility metadata")
         }
-        val durableCompatibilityMetadata =
-          batchWrite.asInstanceOf[HasRecoveryTaskCommitStore].rowLevelManifestInput match {
-            case Some(input) =>
-              require(input.recoveryId == context.recoveryId,
-                "Row-level write manifest and task commit context have different recovery IDs")
-              RowLevelWriteManifest.encode(input.copy(
-                connectorCompatibilityMetadata = compatibilityMetadata))
-            case None => compatibilityMetadata
+        val rowLevelManifest =
+          batchWrite.asInstanceOf[HasRecoveryTaskCommitStore].rowLevelManifestInput.map { input =>
+            require(input.recoveryId == context.recoveryId,
+              "Row-level write manifest and task commit context have different recovery IDs")
+            RowLevelWriteManifest.encode(input)
           }
         val proposedManifest = RecoveryTaskCommitEnvelope.writeManifest(
-          context, rdd.getNumPartitions, durableCompatibilityMetadata)
+          context, rdd.getNumPartitions, compatibilityMetadata, rowLevelManifest)
         RecoveryTaskCommitEnvelope.validateManifestSize(context, proposedManifest)
         val resolvedManifest = Option(
           store.resolveWriteManifest(context.recoveryId, proposedManifest)).getOrElse {

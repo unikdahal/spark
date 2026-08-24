@@ -25,10 +25,10 @@ import scala.jdk.CollectionConverters._
 
 import org.apache.spark.sql.catalyst.analysis.{RecoveryAnchorResolver, WriteRecoveryInfo}
 import org.apache.spark.sql.catalyst.expressions.PredicateHelper
-import org.apache.spark.sql.catalyst.plans.logical.{AppendData, InsertOnlyMerge, LogicalPlan, OverwriteByExpression, OverwritePartitionsDynamic, ReplaceData, WriteDelta}
+import org.apache.spark.sql.catalyst.plans.logical.{AppendData, InsertOnlyMerge, LogicalPlan,
+  OverwriteByExpression, OverwritePartitionsDynamic, ReplaceData, RowLevelWrite, WriteDelta}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
-import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.WriteDeltaProjections
 import org.apache.spark.sql.connector.catalog.{SupportsRecoveryAnchor, SupportsRecoveryWrite, Table}
 import org.apache.spark.sql.connector.distributions.Distribution
@@ -140,7 +140,8 @@ class V2Writes(recoveryResolver: () => Option[RecoveryAnchorResolver])
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       WriteToDataSourceV2(Some(r), microBatchWrite, newQuery, customMetrics)
 
-    case rd @ ReplaceData(r: DataSourceV2Relation, _, query, _, projections, _, None) =>
+    case rd @ ReplaceData(
+        r: DataSourceV2Relation, _, query, originalTable, projections, _, None) =>
       val rowSchema = projections.rowProjection.schema
       val metadataSchema = projections.metadataProjection.map(_.schema)
       val writeOptions = mergeOptions(Map.empty, r.options.asCaseSensitiveMap.asScala.toMap)
@@ -148,25 +149,27 @@ class V2Writes(recoveryResolver: () => Option[RecoveryAnchorResolver])
         r.table, writeOptions, rowSchema, metadataSchema, operation = Some(rd), resolver = resolver)
       val connectorWrite = prepared.builder.build()
       val manifestInput = buildRowLevelManifestInput(
-        rd, query, r.table, connectorWrite, prepared.recoveryId, resolver,
+        rd, query, originalTable.schema, r, connectorWrite, prepared.recoveryId, resolver,
         physicalMode = "REPLACE_DATA",
-        rowSchema = Some(rowSchema), rowIdSchema = None, metadataSchema = metadataSchema)
+        RowLevelSchemas(Some(rowSchema), None, metadataSchema))
       val write = requireRecoverableWrite(
         r.table, connectorWrite, prepared.recoveryId, resolver, manifestInput)
       val newQuery = DistributionAndOrderingUtils.prepareQuery(write, query, r.funCatalog)
       rd.copy(write = Some(write), query = newQuery)
 
-    case wd @ WriteDelta(r: DataSourceV2Relation, _, query, _, projections, _, None) =>
+    case wd @ WriteDelta(
+        r: DataSourceV2Relation, _, query, originalTable, projections, _, None) =>
       val writeOptions = mergeOptions(Map.empty, r.options.asCaseSensitiveMap.asScala.toMap)
       val prepared = newDeltaWriteBuilder(
         r.table, writeOptions, projections, operation = Some(wd), resolver = resolver)
       val connectorWrite = prepared.builder.build()
       val manifestInput = buildRowLevelManifestInput(
-        wd, query, r.table, connectorWrite, prepared.recoveryId, resolver,
+        wd, query, originalTable.schema, r, connectorWrite, prepared.recoveryId, resolver,
         physicalMode = "WRITE_DELTA",
-        rowSchema = projections.rowProjection.map(_.schema),
-        rowIdSchema = Some(projections.rowIdProjection.schema),
-        metadataSchema = projections.metadataProjection.map(_.schema))
+        RowLevelSchemas(
+          projections.rowProjection.map(_.schema),
+          Some(projections.rowIdProjection.schema),
+          projections.metadataProjection.map(_.schema)))
       val deltaWrite = requireRecoverableDeltaWrite(
         r.table, connectorWrite, prepared.recoveryId, resolver, manifestInput)
       val newQuery = DistributionAndOrderingUtils.prepareQuery(deltaWrite, query, r.funCatalog)
@@ -336,15 +339,15 @@ class V2Writes(recoveryResolver: () => Option[RecoveryAnchorResolver])
   private def buildRowLevelManifestInput(
       operation: LogicalPlan,
       query: LogicalPlan,
-      table: Table,
+      sourceSchema: StructType,
+      relation: DataSourceV2Relation,
       write: Write,
       recoveryId: Option[String],
       resolver: Option[RecoveryAnchorResolver],
       physicalMode: String,
-      rowSchema: Option[StructType],
-      rowIdSchema: Option[StructType],
-      metadataSchema: Option[StructType]): Option[RowLevelWriteManifestInput] = {
+      schemas: RowLevelSchemas): Option[RowLevelWriteManifestInput] = {
     resolver.map { recoveryResolver =>
+      val table = relation.table
       val stableRecoveryId = recoveryId.getOrElse {
         throw new IllegalStateException("A recoverable row-level write has no durable identity")
       }
@@ -359,11 +362,18 @@ class V2Writes(recoveryResolver: () => Option[RecoveryAnchorResolver])
         case _ => throw new IllegalStateException(
           s"Row-level write table ${table.name()} has no row-level operation")
       }
+      val rowLevelWrite = operation match {
+        case write: RowLevelWrite => write
+        case _ => throw new IllegalStateException(
+          s"Recoverable row-level operation has unexpected plan ${operation.getClass.getName}")
+      }
       val ordered = write match {
         case requirements: RequiresDistributionAndOrdering => Some(requirements)
         case _ => None
       }
-      val sourceTables = operation.collect {
+      // Include relations referenced from scalar and predicate subqueries. QueryPlan.collect alone
+      // deliberately skips them, which would leave a source anchor outside the generation fence.
+      val sourceTables = operation.collectWithSubqueries {
         case relation: DataSourceV2Relation => unwrapRowLevelTable(relation.table)
       }
       val sourceAnchors = sourceTables.map {
@@ -385,26 +395,49 @@ class V2Writes(recoveryResolver: () => Option[RecoveryAnchorResolver])
       val ordering = ordered.toSeq.flatMap { requirements =>
         Option(requirements.requiredOrdering()).getOrElse {
           throw new IllegalStateException("A row-level write returned null required ordering")
-        }.map(_.describe())
+        }.map(RowLevelWriteRequirementEncoding.ordering)
       }
       val canonicalBytes = operation.canonicalized.asCode.getBytes(StandardCharsets.UTF_8)
+      val canonicalOperationSha256 =
+        MessageDigest.getInstance("SHA-256").digest(canonicalBytes)
+      def expressionDigest(
+          expression: org.apache.spark.sql.catalyst.expressions.Expression): Array[Byte] = {
+        MessageDigest.getInstance("SHA-256").digest(
+          expression.canonicalized.asCode.getBytes(StandardCharsets.UTF_8))
+      }
+      val conflictFilter = operation match {
+        case replace: ReplaceData => replace.groupFilterCondition
+        case delta: WriteDelta => delta.groupFilterCondition
+        case _ => None
+      }
+      val sinkId = sink.recoverySinkId()
       RowLevelWriteManifestInput(
         recoveryExecutionId = recoveryResolver.recoveryExecutionId,
         recoveryId = stableRecoveryId,
-        generation = stableRecoveryId,
-        sinkId = sink.recoverySinkId(),
-        tableName = sinkTable.name(),
+        generation = RowLevelWriteManifest.generation(
+          recoveryResolver.recoveryExecutionId,
+          stableRecoveryId,
+          sinkId,
+          canonicalOperationSha256),
+        sinkId = sinkId,
+        catalogIdentity = relation.catalog.map(_.name()).getOrElse {
+          throw new IllegalStateException(
+            s"Recoverable row-level table ${relation.name} has no catalog identity")
+        },
+        tableName = relation.name,
         command = rowLevelOperation.command().toString,
         physicalMode = physicalMode,
-        canonicalOperationSha256 =
-          MessageDigest.getInstance("SHA-256").digest(canonicalBytes),
-        inputSchemaJson = Some(
-          DataTypeUtils.fromAttributes(query.children.flatMap(_.output)).json),
+        canonicalOperationSha256 = canonicalOperationSha256,
+        conditionSha256 = expressionDigest(rowLevelWrite.condition),
+        conflictFilterSha256 = conflictFilter.map(expressionDigest),
+        inputSchemaJson = Some(sourceSchema.json),
         outputSchemaJson = Some(query.schema.json),
-        rowSchemaJson = rowSchema.map(_.json),
-        rowIdSchemaJson = rowIdSchema.map(_.json),
-        metadataSchemaJson = metadataSchema.map(_.json),
-        distributionDescription = distribution.map(_.toString).getOrElse("unspecified"),
+        rowSchemaJson = schemas.row.map(_.json),
+        rowIdSchemaJson = schemas.rowId.map(_.json),
+        metadataSchemaJson = schemas.metadata.map(_.json),
+        distributionDescription = distribution
+          .map(RowLevelWriteRequirementEncoding.distribution)
+          .getOrElse("unspecified"),
         distributionStrictlyRequired = ordered.exists(_.distributionStrictlyRequired()),
         requiredNumPartitions = ordered.map(requirements =>
           Math.max(0, requirements.requiredNumPartitions())).getOrElse(0),
@@ -413,8 +446,7 @@ class V2Writes(recoveryResolver: () => Option[RecoveryAnchorResolver])
             Math.max(0L, requirements.advisoryPartitionSizeInBytes())).getOrElse(0L),
         orderingDescriptions = ordering,
         sourceAnchors = sourceAnchors,
-        transactionId = None,
-        connectorCompatibilityMetadata = Array.emptyByteArray)
+        transactionId = None)
     }
   }
 
@@ -608,3 +640,12 @@ private class RecoveryRequiredDeltaBatchWrite(
 object V2Writes {
   val ruleName: String = classOf[V2Writes].getName
 }
+
+/**
+ * The row schemas a recoverable row-level write pins into its durable generation manifest. All
+ * three participate in the manifest, so they are built and carried together.
+ */
+private case class RowLevelSchemas(
+    row: Option[StructType],
+    rowId: Option[StructType],
+    metadata: Option[StructType])

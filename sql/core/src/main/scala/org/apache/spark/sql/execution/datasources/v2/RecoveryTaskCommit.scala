@@ -50,10 +50,12 @@ private[sql] object RecoveryTaskCommitEnvelope {
   private val Version1 = 1
   private val Version2 = 2
   private val Version3 = 3
+  private val ManifestVersion4 = 4
   private val RowLevelSummaryVersion = 1
   private val RowLevelCounterCount = 9
   private val MaxIdentityBytes = 64 * 1024
   private val MaxCompatibilityMetadataBytes = 1024 * 1024
+  private val MaxRowLevelManifestBytes = 16 * 1024 * 1024
   private val MaxPayloadBytes = 16 * 1024 * 1024
   private val MaxMetrics = 1024
   private val MaxMetricSchemaBytes = 1024 * 1024
@@ -65,28 +67,47 @@ private[sql] object RecoveryTaskCommitEnvelope {
   def writeManifest(
       context: RecoveryTaskCommitContext,
       numPartitions: Int,
-      compatibilityMetadata: Array[Byte]): Array[Byte] = {
+      compatibilityMetadata: Array[Byte],
+      rowLevelManifest: Option[Array[Byte]] = None): Array[Byte] = {
     validateContext(context)
     require(numPartitions >= 0, s"Physical partition count must be non-negative: $numPartitions")
     require(compatibilityMetadata != null, "Recovery compatibility metadata must not be null")
     require(compatibilityMetadata.length <= MaxCompatibilityMetadataBytes,
       s"Recovery compatibility metadata is ${compatibilityMetadata.length} bytes; maximum is " +
         MaxCompatibilityMetadataBytes)
+    require(rowLevelManifest != null, "Row-level write manifest option must not be null")
+    rowLevelManifest.foreach { manifest =>
+      require(context.rowLevelSummaryRequired,
+        "A Spark-owned row-level write manifest requires row-level task summaries")
+      require(manifest != null, "Spark-owned row-level write manifest must not be null")
+      require(manifest.length <= MaxRowLevelManifestBytes,
+        s"Spark-owned row-level write manifest is ${manifest.length} bytes; maximum is " +
+          MaxRowLevelManifestBytes)
+    }
     val coreBytes = new ByteArrayOutputStream()
     val core = new DataOutputStream(coreBytes)
     core.writeInt(Magic)
-    val formatVersion = requiredFormatVersion(context)
+    // Version 4 is used only for the durable write-generation manifest. Task envelopes retain
+    // their v1/v2/v3 layouts, and non-row-level write manifests remain byte-compatible.
+    val formatVersion = if (rowLevelManifest.isDefined) ManifestVersion4 else {
+      requiredFormatVersion(context)
+    }
     core.writeInt(formatVersion)
     writeString(core, context.recoveryId)
     core.writeInt(numPartitions)
     writeString(core, context.codec.codecId())
     core.writeInt(context.codec.version())
-    if (formatVersion == Version3) core.writeBoolean(context.metricSchema.isDefined)
+    if (formatVersion >= Version3) core.writeBoolean(context.metricSchema.isDefined)
     context.metricSchema.foreach(writeMetricSchema(core, _))
-    if (formatVersion == Version3) {
+    if (formatVersion >= Version3) {
       core.writeInt(RowLevelSummaryVersion)
       core.writeInt(RowLevelCounterCount)
       core.writeInt(RowDeltaUtils.ROW_OPERATION_PROTOCOL_VERSION)
+    }
+    if (formatVersion == ManifestVersion4) {
+      val semanticManifest = rowLevelManifest.get
+      core.writeInt(semanticManifest.length)
+      core.write(semanticManifest)
     }
     core.writeInt(compatibilityMetadata.length)
     core.write(compatibilityMetadata)

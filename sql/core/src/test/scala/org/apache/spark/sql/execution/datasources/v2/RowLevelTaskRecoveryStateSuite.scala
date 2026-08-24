@@ -47,7 +47,7 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
 
   test("a globally committed row-level write requires an authoritative total summary") {
     val state = new FixedRowLevelRecoveryState(committed = true, Optional.empty())
-    val exec = execute(new FixedRowLevelWritingTask(Some(RowLevelTaskSummary.empty())), state)
+    val exec = runRecoveryTask(new FixedRowLevelWritingTask(Some(RowLevelTaskSummary.empty())), state)
 
     val error = intercept[Exception] {
       exec.executeCollect()
@@ -58,7 +58,7 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
 
   test("a recovery task without its required row-level summary fails closed") {
     val state = new FixedRowLevelRecoveryState(committed = false, Optional.empty())
-    val exec = execute(new FixedRowLevelWritingTask(None), state)
+    val exec = runRecoveryTask(new FixedRowLevelWritingTask(None), state)
 
     val error = intercept[Exception] {
       exec.executeCollect()
@@ -69,7 +69,7 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
 
   test("row-level task summary aggregation rejects overflow") {
     val state = new FixedRowLevelRecoveryState(committed = false, Optional.empty())
-    val exec = execute(OverflowRowLevelWritingTask, state)
+    val exec = runRecoveryTask(OverflowRowLevelWritingTask, state)
 
     val error = intercept[Exception] {
       exec.executeCollect()
@@ -81,7 +81,7 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
   test("canonical per-partition row-level summaries are restored exactly once") {
     val state = new FixedRowLevelRecoveryState(committed = false, Optional.empty())
     val perTask = new RowLevelTaskSummary(10L, 2L, 3L, 4L, 5L, 6L, 7L, 8L, 9L)
-    val exec = execute(new FixedRowLevelWritingTask(Some(perTask)), state)
+    val exec = runRecoveryTask(new FixedRowLevelWritingTask(Some(perTask)), state)
 
     exec.executeCollect()
 
@@ -91,7 +91,7 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
   test("a globally committed authoritative row-level summary is restored exactly") {
     val total = new RowLevelTaskSummary(20L, 4L, 6L, 8L, 10L, 12L, 14L, 16L, 18L)
     val state = new FixedRowLevelRecoveryState(committed = true, Optional.of(total))
-    val exec = execute(new FixedRowLevelWritingTask(None), state)
+    val exec = runRecoveryTask(new FixedRowLevelWritingTask(None), state)
 
     exec.executeCollect()
 
@@ -101,10 +101,13 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
   test("a changed Spark-owned row-level generation manifest fails before task adoption") {
     val state = new FixedRowLevelRecoveryState(committed = false, Optional.empty())
     val summary = Some(RowLevelTaskSummary.empty())
-    execute(new FixedRowLevelWritingTask(summary), state, Some(baseManifestInput)).executeCollect()
+    runRecoveryTask(
+      new FixedRowLevelWritingTask(summary),
+      state,
+      Some(baseManifestInput)).executeCollect()
 
     val changed = baseManifestInput.copy(command = "UPDATE")
-    val replacement = execute(new FixedRowLevelWritingTask(summary), state, Some(changed))
+    val replacement = runRecoveryTask(new FixedRowLevelWritingTask(summary), state, Some(changed))
     val error = intercept[Exception] {
       replacement.executeCollect()
     }
@@ -150,7 +153,23 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
     assert(RowLevelRecoveryWriterFactory.writersCreated.get() === 0)
   }
 
-  private def execute(
+  test("a row-level manifest with the wrong physical mode fails before writers") {
+    val query = spark.range(0L, 2L, 1L, 2).queryExecution.executedPlan
+    val wrongMode = baseManifestInput.copy(command = "UPDATE", physicalMode = "WRITE_DELTA")
+    val exec = RowLevelRecoveryCommandTestExec(
+      query,
+      new RowLevelRecoveryTestWrite(
+        new FixedRowLevelRecoveryState(committed = false, Optional.empty()), Some(wrongMode)),
+      new FixedRowLevelWritingTask(Some(RowLevelTaskSummary.empty())))
+
+    val error = intercept[Exception] {
+      exec.executeCollect()
+    }
+    assert(Utils.exceptionString(error).contains("does not match physical mode"))
+    assert(RowLevelRecoveryWriterFactory.writersCreated.get() === 0)
+  }
+
+  private def runRecoveryTask(
       task: WritingSparkTask[DataWriter[InternalRow]],
       state: BatchWriteRecoveryState,
       manifestInput: Option[RowLevelWriteManifestInput] = None): RowLevelRecoveryTestExec = {
@@ -165,10 +184,13 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
     recoveryId = "row-level-recovery-test",
     generation = "generation-1",
     sinkId = "sink-1",
+    catalogIdentity = "catalog",
     tableName = "catalog.ns.table",
     command = "DELETE",
     physicalMode = "REPLACE_DATA",
     canonicalOperationSha256 = Array.fill(32)(1.toByte),
+    conditionSha256 = Array.fill(32)(2.toByte),
+    conflictFilterSha256 = None,
     inputSchemaJson = Some("{\"type\":\"struct\",\"fields\":[]}"),
     outputSchemaJson = Some("{\"type\":\"struct\",\"fields\":[]}"),
     rowSchemaJson = Some("{\"type\":\"struct\",\"fields\":[]}"),
@@ -180,8 +202,7 @@ class RowLevelTaskRecoveryStateSuite extends SharedSparkSession {
     advisoryPartitionSizeInBytes = 0L,
     orderingDescriptions = Seq.empty,
     sourceAnchors = Seq(RowLevelWriteSourceAnchor("source-1", "snapshot-1")),
-    transactionId = None,
-    connectorCompatibilityMetadata = Array.emptyByteArray)
+    transactionId = None)
 }
 
 private case class RowLevelRecoveryCommandTestExec(
@@ -191,6 +212,7 @@ private case class RowLevelRecoveryCommandTestExec(
     transaction: Option[Transaction] = None) extends RowLevelWriteExec {
 
   override val rowLevelCommand: RowLevelOperation.Command = RowLevelOperation.Command.UPDATE
+  override private[v2] val rowLevelPhysicalMode: String = "REPLACE_DATA"
   override val refreshCache: () => Unit = () => {}
   override val tableName: String = "catalog.ns.table"
   override def writingTask: WritingSparkTask[_] = task

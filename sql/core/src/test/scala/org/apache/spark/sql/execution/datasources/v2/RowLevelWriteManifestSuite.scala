@@ -21,6 +21,9 @@ import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.connector.distributions.{Distribution, Distributions}
+import org.apache.spark.sql.connector.expressions.{Expression, Expressions, NullOrdering,
+  SortDirection}
 
 class RowLevelWriteManifestSuite extends SparkFunSuite {
   private val digest = MessageDigest.getInstance("SHA-256").digest("operation".getBytes("UTF-8"))
@@ -29,10 +32,13 @@ class RowLevelWriteManifestSuite extends SparkFunSuite {
     recoveryId = "write-1",
     generation = "generation-1",
     sinkId = "catalog.ns.table",
+    catalogIdentity = "catalog",
     tableName = "catalog.ns.table",
     command = "MERGE",
     physicalMode = "REPLACE_DATA",
     canonicalOperationSha256 = digest,
+    conditionSha256 = Array.fill[Byte](32)(2),
+    conflictFilterSha256 = Some(Array.fill[Byte](32)(3)),
     inputSchemaJson = Some("{\"type\":\"struct\",\"fields\":[]}"),
     outputSchemaJson = Some("{\"type\":\"struct\",\"fields\":[{\"name\":\"id\"}]}"),
     rowSchemaJson = Some("{\"row\":1}"),
@@ -46,8 +52,7 @@ class RowLevelWriteManifestSuite extends SparkFunSuite {
     sourceAnchors = Seq(
       RowLevelWriteSourceAnchor("source-b", "snapshot-9"),
       RowLevelWriteSourceAnchor("source-a", "snapshot-4")),
-    transactionId = Some("transaction-1"),
-    connectorCompatibilityMetadata = Array[Byte](1, 2, 3))
+    transactionId = Some("transaction-1"))
 
   test("row-level write manifest is deterministic and canonicalizes source order") {
     val encoded = RowLevelWriteManifest.encode(baseline)
@@ -59,6 +64,18 @@ class RowLevelWriteManifestSuite extends SparkFunSuite {
       MessageDigest.getInstance("SHA-256").digest(core).toSeq)
   }
 
+  test("Spark-owned generation is deterministic and fences provider write-ID reuse") {
+    val generation = RowLevelWriteManifest.generation(
+      baseline.recoveryExecutionId, baseline.recoveryId, baseline.sinkId, digest)
+    assert(RowLevelWriteManifest.generation(
+      baseline.recoveryExecutionId, baseline.recoveryId, baseline.sinkId, digest) === generation)
+    assert(RowLevelWriteManifest.generation(
+      baseline.recoveryExecutionId, baseline.recoveryId, baseline.sinkId,
+      Array.fill[Byte](32)(7)) !== generation)
+    assert(RowLevelWriteManifest.generation(
+      baseline.recoveryExecutionId, "aliased-write", baseline.sinkId, digest) !== generation)
+  }
+
   test("row-level write manifest binds every resolved generation field") {
     val encoded = RowLevelWriteManifest.encode(baseline).toSeq
     val changes = Seq(
@@ -66,10 +83,13 @@ class RowLevelWriteManifestSuite extends SparkFunSuite {
       baseline.copy(recoveryId = "write-2"),
       baseline.copy(generation = "generation-2"),
       baseline.copy(sinkId = "other-sink"),
+      baseline.copy(catalogIdentity = "other-catalog"),
       baseline.copy(tableName = "other-table"),
       baseline.copy(command = "UPDATE"),
       baseline.copy(physicalMode = "WRITE_DELTA"),
       baseline.copy(canonicalOperationSha256 = Array.fill[Byte](32)(7)),
+      baseline.copy(conditionSha256 = Array.fill[Byte](32)(7)),
+      baseline.copy(conflictFilterSha256 = None),
       baseline.copy(inputSchemaJson = None),
       baseline.copy(outputSchemaJson = None),
       baseline.copy(rowSchemaJson = None),
@@ -82,8 +102,7 @@ class RowLevelWriteManifestSuite extends SparkFunSuite {
       baseline.copy(orderingDescriptions = baseline.orderingDescriptions.reverse),
       baseline.copy(sourceAnchors = baseline.sourceAnchors.updated(
         0, RowLevelWriteSourceAnchor("source-b", "snapshot-10"))),
-      baseline.copy(transactionId = None),
-      baseline.copy(connectorCompatibilityMetadata = Array[Byte](1, 2, 4)))
+      baseline.copy(transactionId = None))
     changes.foreach(changed => assert(RowLevelWriteManifest.encode(changed).toSeq !== encoded))
   }
 
@@ -99,14 +118,15 @@ class RowLevelWriteManifestSuite extends SparkFunSuite {
       baseline.copy(command = "INSERT"),
       baseline.copy(physicalMode = "UNKNOWN"),
       baseline.copy(canonicalOperationSha256 = Array.emptyByteArray),
+      baseline.copy(conditionSha256 = Array.emptyByteArray),
+      baseline.copy(conflictFilterSha256 = Some(Array.emptyByteArray)),
       baseline.copy(requiredNumPartitions = -1),
       baseline.copy(advisoryPartitionSizeInBytes = -1L),
       baseline.copy(orderingDescriptions = null),
       baseline.copy(sourceAnchors = Seq(
         RowLevelWriteSourceAnchor("source-a", "snapshot-1"),
         RowLevelWriteSourceAnchor("source-a", "snapshot-2"))),
-      baseline.copy(transactionId = Some("")),
-      baseline.copy(connectorCompatibilityMetadata = null)).foreach { invalid =>
+      baseline.copy(transactionId = Some(""))).foreach { invalid =>
       intercept[IllegalArgumentException](RowLevelWriteManifest.encode(invalid))
     }
   }
@@ -118,6 +138,26 @@ class RowLevelWriteManifestSuite extends SparkFunSuite {
     intercept[IllegalArgumentException] {
       RowLevelWriteManifest.encode(baseline.copy(
         tableName = new String(new Array[Byte](64 * 1024 + 1), StandardCharsets.US_ASCII)))
+    }
+  }
+
+  test("distribution and ordering requirements use structural fail-closed encodings") {
+    val id = Expressions.column("nested.id")
+    val clustered = Distributions.clustered(
+      Array[Expression](id, Expressions.bucket(8, "bucket_col")))
+    val clusteredEncoding = RowLevelWriteRequirementEncoding.distribution(clustered)
+    assert(RowLevelWriteRequirementEncoding.distribution(clustered) === clusteredEncoding)
+    assert(RowLevelWriteRequirementEncoding.distribution(
+      Distributions.clustered(Array[Expression](Expressions.column("nested.other")))) !==
+        clusteredEncoding)
+
+    val ascending = Expressions.sort(id, SortDirection.ASCENDING, NullOrdering.NULLS_FIRST)
+    val descending = Expressions.sort(id, SortDirection.DESCENDING, NullOrdering.NULLS_LAST)
+    assert(RowLevelWriteRequirementEncoding.ordering(ascending) !==
+      RowLevelWriteRequirementEncoding.ordering(descending))
+
+    intercept[IllegalArgumentException] {
+      RowLevelWriteRequirementEncoding.distribution(new Distribution {})
     }
   }
 }

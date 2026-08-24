@@ -177,6 +177,27 @@ class RecoveryTaskCommitSuite extends SparkFunSuite {
       rowLevelContext, 8, metadata).toSeq === rowLevel.toSeq)
   }
 
+  test("version 4 write manifest binds Spark semantics separately from connector metadata") {
+    val connectorMetadata = "connector-generation=7".getBytes(StandardCharsets.UTF_8)
+    val sparkManifest = "spark-row-level-generation=9".getBytes(StandardCharsets.UTF_8)
+    val manifest = RecoveryTaskCommitEnvelope.writeManifest(
+      rowLevelContext, 8, connectorMetadata, Some(sparkManifest))
+
+    assert(RecoveryTaskCommitEnvelope.writeManifest(
+      rowLevelContext, 8, connectorMetadata, Some(sparkManifest)).toSeq === manifest.toSeq)
+    assert(RecoveryTaskCommitEnvelope.writeManifest(
+      rowLevelContext, 8, "connector-generation=8".getBytes(StandardCharsets.UTF_8),
+      Some(sparkManifest)).toSeq !== manifest.toSeq)
+    assert(RecoveryTaskCommitEnvelope.writeManifest(
+      rowLevelContext, 8, connectorMetadata,
+      Some("spark-row-level-generation=10".getBytes(StandardCharsets.UTF_8))).toSeq !==
+        manifest.toSeq)
+    intercept[IllegalArgumentException] {
+      RecoveryTaskCommitEnvelope.writeManifest(
+        context, 8, connectorMetadata, Some(sparkManifest))
+    }
+  }
+
   test("task commit envelope is bound to recovery ID, partition, and codec") {
     val encoded = RecoveryTaskCommitEnvelope.encode(context, 3, IntegerCommit(91), 42L)
 

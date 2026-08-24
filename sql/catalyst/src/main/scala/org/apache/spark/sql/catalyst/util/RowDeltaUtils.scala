@@ -28,8 +28,13 @@ object RowDeltaUtils {
   final val DELETE_OPERATION: Int = 1
   final val UPDATE_OPERATION: Int = 2
   final val INSERT_OPERATION: Int = 3
+  // Legacy physical reinsert code. New split-update producers use origin-specific codes below,
+  // but readers must retain this meaning for plans produced by the version-1 protocol.
   final val REINSERT_OPERATION: Int = 4
   final val COPY_OPERATION: Int = 5
+  // Reserved control code for a scanned target row with no logical or physical mutation. MERGE
+  // currently emits action/copy rows, but keeping this code explicit makes fall-through transport
+  // fail-closed and avoids reassigning a durable version-1 value.
   final val NO_WRITE_OPERATION: Int = 6
   final val DELETE_CONTROL_OPERATION: Int = 7
   final val MATCHED_UPDATE_OPERATION: Int = 8

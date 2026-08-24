@@ -18,11 +18,36 @@
 package org.apache.spark.sql.execution.datasources.v2
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.sql.catalyst.util.RowDeltaUtils
 import org.apache.spark.sql.connector.write.RowLevelTaskSummary
 import org.apache.spark.sql.execution.datasources.v2.RowLevelTaskSummaryAccumulator.ActionCode._
 
 /** Contract tests for mapping Spark-owned row-action codes to durable task counters. */
 class RowLevelTaskSummaryAccumulatorSuite extends SparkFunSuite {
+
+  test("row action protocol version 1 preserves every numeric assignment") {
+    assert(RowDeltaUtils.ROW_OPERATION_PROTOCOL_VERSION === 1)
+    assert(Seq(
+      RowDeltaUtils.DELETE_OPERATION,
+      RowDeltaUtils.UPDATE_OPERATION,
+      RowDeltaUtils.INSERT_OPERATION,
+      RowDeltaUtils.REINSERT_OPERATION,
+      RowDeltaUtils.COPY_OPERATION,
+      RowDeltaUtils.NO_WRITE_OPERATION,
+      RowDeltaUtils.DELETE_CONTROL_OPERATION,
+      RowDeltaUtils.MATCHED_UPDATE_OPERATION,
+      RowDeltaUtils.MATCHED_DELETE_OPERATION,
+      RowDeltaUtils.NOT_MATCHED_BY_SOURCE_UPDATE_OPERATION,
+      RowDeltaUtils.NOT_MATCHED_BY_SOURCE_DELETE_OPERATION,
+      RowDeltaUtils.MATCHED_DELETE_CONTROL_OPERATION,
+      RowDeltaUtils.NOT_MATCHED_BY_SOURCE_DELETE_CONTROL_OPERATION,
+      RowDeltaUtils.SPLIT_UPDATE_DELETE_OPERATION,
+      RowDeltaUtils.SPLIT_UPDATE_REINSERT_OPERATION,
+      RowDeltaUtils.MATCHED_SPLIT_UPDATE_DELETE_OPERATION,
+      RowDeltaUtils.MATCHED_SPLIT_UPDATE_REINSERT_OPERATION,
+      RowDeltaUtils.NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_DELETE_OPERATION,
+      RowDeltaUtils.NOT_MATCHED_BY_SOURCE_SPLIT_UPDATE_REINSERT_OPERATION) === (1 to 19))
+  }
 
   test("COPY INSERT UPDATE and DELETE map to their plain logical counters") {
     assert(record(COPY) === summary(scanned = 1L, copied = 1L))
@@ -74,6 +99,26 @@ class RowLevelTaskSummaryAccumulatorSuite extends SparkFunSuite {
 
   test("NO_WRITE records a scanned target row without inventing a writer operation") {
     assert(record(NO_WRITE) === summary(scanned = 1L))
+  }
+
+  test("reinsert and delete controls have exhaustive physical and logical mappings") {
+    val reinsert = new RowLevelTaskSummaryAccumulator
+    assert(reinsert.record(REINSERT).contains(RowDeltaUtils.REINSERT_OPERATION))
+    assert(reinsert.result() === summary(scanned = 1L, updated = 1L))
+
+    val plainDelete = new RowLevelTaskSummaryAccumulator
+    assert(plainDelete.record(DELETE_CONTROL).isEmpty)
+    assert(plainDelete.result() === summary(scanned = 1L, deleted = 1L))
+
+    val matchedDelete = new RowLevelTaskSummaryAccumulator
+    assert(matchedDelete.record(MATCHED_DELETE_CONTROL).isEmpty)
+    assert(matchedDelete.result() ===
+      summary(scanned = 1L, deleted = 1L, matchedDeleted = 1L))
+
+    val notMatchedBySourceDelete = new RowLevelTaskSummaryAccumulator
+    assert(notMatchedBySourceDelete.record(NOT_MATCHED_BY_SOURCE_DELETE_CONTROL).isEmpty)
+    assert(notMatchedBySourceDelete.result() === summary(
+      scanned = 1L, deleted = 1L, notMatchedBySourceDeleted = 1L))
   }
 
   test("a mixed action stream preserves exact disjoint totals") {
