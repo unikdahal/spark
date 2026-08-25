@@ -30,6 +30,15 @@ public interface SupportsRecoveryAnchor extends Table {
   String currentRecoveryAnchor();
 
   /**
+   * Called once, before {@link #currentRecoveryAnchor()} is read and before the anchor is durably
+   * accepted. Implementations use it to protect whatever the anchor names - for example pinning
+   * the selected snapshot under a deterministic name derived from {@code recoveryExecutionId} and
+   * {@link #recoverySourceId()} - so a replacement driver derives the same protection and cannot
+   * adopt a different input state. The default does nothing.
+   */
+  default void beforeRecoveryAnchor(String recoveryExecutionId) {}
+
+  /**
    * Returns a new table pinned to {@code anchor}. The returned table's schema and all subsequent
    * scans must describe exactly that immutable state. Implementations must not mutate this table.
    */

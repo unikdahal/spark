@@ -25,7 +25,15 @@ import org.apache.spark.sql.connector.recovery.RecoveryTaskCommitStore
 /** Immutable source state considered while resolving a resumable batch query relation. */
 @DeveloperApi
 @Experimental
-case class SourceRecoveryInfo(sourceId: String, currentAnchor: String)
+case class SourceRecoveryInfo(
+    sourceId: String,
+    currentAnchor: String,
+    /**
+     * Stable identity of the logical execution performing this read. Connectors use it to derive
+     * deterministic recovery pins BEFORE the durable anchor is accepted, so a replacement driver
+     * computes the same pin name and cannot adopt a different input state.
+     */
+    recoveryExecutionId: String)
 
 /** Immutable information identifying a batch write considered for recovery. */
 @DeveloperApi
@@ -67,12 +75,20 @@ private[sql] object RecoveryAnchorUtils {
   def resolveTable(table: Table, resolver: RecoveryAnchorResolver): Table = table match {
     case recoverable: SupportsRecoveryAnchor =>
       val sourceId = recoverable.recoverySourceId()
-      val currentAnchor = recoverable.currentRecoveryAnchor()
       require(sourceId != null && sourceId.nonEmpty,
         "A recovery source identity must not be empty")
+      // Give the connector its execution identity BEFORE the selected state is read, so any
+      // protection (snapshot pins) exists by the time the anchor names it and is durably
+      // accepted below.
+      recoverable.beforeRecoveryAnchor(resolver.recoveryExecutionId)
+      val currentAnchor = recoverable.currentRecoveryAnchor()
       require(currentAnchor != null && currentAnchor.nonEmpty,
         s"Recovery source $sourceId did not select an immutable input state")
-      val anchor = resolver.resolveSourceAnchor(SourceRecoveryInfo(sourceId, currentAnchor))
+      val anchor = resolver.resolveSourceAnchor(
+        SourceRecoveryInfo(
+          sourceId,
+          currentAnchor,
+          resolver.recoveryExecutionId))
       require(anchor != null && anchor.nonEmpty,
         s"Recovery resolver returned an empty anchor for source $sourceId")
       recoverable.withRecoveryAnchor(anchor) match {
