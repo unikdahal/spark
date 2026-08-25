@@ -23,6 +23,7 @@ import java.util.{Base64, List => JList, Optional}
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.connector.metric.CustomTaskMetric
+import org.apache.spark.sql.connector.write.RowLevelTaskSummary
 import org.apache.spark.sql.connector.recovery.RecoveryTaskCommitStore
 import org.apache.spark.sql.connector.write.{RecoveryCommitMessageCodec,
   RecoveryTaskMetricDescriptor, RecoveryTaskMetricSchema, WriterCommitMessage}
@@ -47,6 +48,7 @@ class RecoveryTaskCommitCompatibilitySuite extends SparkFunSuite {
   private val regenerate = System.getenv("SPARK_GENERATE_GOLDEN_FILES") == "1"
   private val fixtureName = "recovery/task-commit-envelope-v1.txt"
   private val fixtureV2Name = "recovery/task-commit-envelope-v2.txt"
+  private val fixtureV3Name = "recovery/task-commit-envelope-v3.txt"
 
   private val recoveryId = "compatibility-execution"
   private val partitionId = 3
@@ -152,6 +154,50 @@ class RecoveryTaskCommitCompatibilitySuite extends SparkFunSuite {
           "compatible")
       assert(java.util.Arrays.equals(fixture("manifest"), manifest),
         "the version 2 manifest layout or durable metric schema changed")
+    }
+  }
+
+  test("the version 3 row-level envelope and version 4 manifest layouts are stable") {
+    val rowLevelContext = context.copy(rowLevelSummaryRequired = true)
+    val summary = new RowLevelTaskSummary(
+      11L, 22L, 33L, 44L, 55L, 66L, 77L, 88L, 99L)
+    val envelope = RecoveryTaskCommitEnvelope.encode(
+      rowLevelContext, partitionId, message, numRows, Seq.empty, Some(summary))
+    // Version 4 is the write-generation manifest used only when a row-level manifest is present.
+    val manifest = RecoveryTaskCommitEnvelope.writeManifest(
+      rowLevelContext,
+      numPartitions,
+      compatibilityMetadata,
+      Some("compatibility-row-level-manifest".getBytes(StandardCharsets.UTF_8)))
+
+    if (regenerate) {
+      val encoder = Base64.getEncoder
+      val text = s"envelope=${encoder.encodeToString(envelope)}\n" +
+        s"manifest=${encoder.encodeToString(manifest)}\n"
+      Files.createDirectories(fixturePath(fixtureV3Name).getParent)
+      Files.write(fixturePath(fixtureV3Name), text.getBytes(StandardCharsets.UTF_8))
+      logWarning(s"Regenerated $fixtureV3Name")
+    } else {
+      val fixture = readFixture(fixtureV3Name)
+
+      val decoded = RecoveryTaskCommitEnvelope.decode(
+        rowLevelContext, partitionId, fixture("envelope"))
+      assert(decoded.message === message,
+        "a version 3 record written by an earlier build no longer decodes to the same " +
+          "commit message")
+      assert(decoded.numRows === numRows)
+      assert(decoded.rowLevelSummary.isDefined,
+        "the row-level summary vanished from the decoded record")
+      assert(decoded.rowLevelSummary.get === summary,
+        "row-level counters changed meaning; durable delete/update/insert accounting would " +
+          "be silently misread")
+
+      assert(java.util.Arrays.equals(fixture("envelope"), envelope),
+        "the version 3 envelope layout changed; durable row-level records would no longer be " +
+          "compatible")
+      assert(java.util.Arrays.equals(fixture("manifest"), manifest),
+        "the version 4 write-generation manifest layout changed; a replacement driver would " +
+          "fail its byte-for-byte manifest comparison against earlier builds")
     }
   }
 }
