@@ -264,6 +264,7 @@ private[sql] object ShuffleRecoveryEligibilityRules {
       catalystExpressions + "Alias",
       catalystExpressions + "And",
       catalystExpressions + "AttributeReference",
+      catalystExpressions + "BloomFilterMightContain",
       catalystExpressions + "BoundReference",
       catalystExpressions + "CaseWhen",
       catalystExpressions + "Cast",
