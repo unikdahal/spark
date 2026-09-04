@@ -685,7 +685,9 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     val localFlags = planFlags(plan)
     val expressionSummary = plan match {
       case exchange: ShuffleExchangeExec =>
-        summarizeExpressions(observePartitioning(exchange.outputPartitioning).expressionRoots, rules)
+        summarizeExpressions(
+          observePartitioning(exchange.outputPartitioning).expressionRoots,
+          rules)
       case _ if isStructuralWrapper(plan) =>
         ExpressionSummary(ReasonSummary.Empty, ShuffleRecoveryObservationFlags())
       case _ => summarizeExpressions(plan.expressions, rules)
@@ -993,7 +995,10 @@ private[sql] final class ShuffleRecoveryOpportunityListener(
 
   override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = observe(qe)
 
-  override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = observe(qe)
+  override def onFailure(
+      funcName: String,
+      qe: QueryExecution,
+      exception: Exception): Unit = observe(qe)
 
   private def observe(qe: QueryExecution): Unit = {
     val key = java.lang.Long.valueOf(qe.id)
@@ -1019,7 +1024,9 @@ private[sql] final class ShuffleRecoveryOpportunityListener(
   }
 
   private def reportError(error: Throwable): Unit = {
-    logWarning("Shuffle recovery opportunity analysis failed; query execution is unaffected.", error)
+    logWarning(
+      "Shuffle recovery opportunity analysis failed; query execution is unaffected.",
+      error)
     try {
       callbackLock.synchronized {
         onError(error)
