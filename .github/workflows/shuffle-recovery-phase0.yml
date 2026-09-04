@@ -2,8 +2,7 @@
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
-# regarding copyright ownership.
-# The ASF licenses this file to You under the Apache License, Version 2.0 (the
+# regarding copyright ownership.  The ASF licenses this file to You under the Apache License, Version 2.0 (the
 # "License"); you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
@@ -106,7 +105,9 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          compile_log="${RUNNER_TEMP}/shuffle-recovery-sql-test-compile.log"
+          diagnostic_dir="${GITHUB_WORKSPACE}/sql/core/target/shuffle-recovery-phase0"
+          mkdir -p "${diagnostic_dir}"
+          compile_log="${diagnostic_dir}/sql-test-compile.log"
           set +e
           ./build/sbt -Phadoop-3 -Phive "sql/Test/compile" 2>&1 | tee "${compile_log}"
           compile_status=${PIPESTATUS[0]}
@@ -165,6 +166,7 @@ jobs:
           name: shuffle-recovery-phase0-opportunity-analyzer-${{ github.run_id }}
           if-no-files-found: error
           path: |
+            sql/core/target/shuffle-recovery-phase0/sql-test-compile.log
             sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl
             **/target/test-reports/*ShuffleRecoveryOpportunityAnalyzerSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
