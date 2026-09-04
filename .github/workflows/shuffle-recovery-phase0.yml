@@ -103,7 +103,25 @@ jobs:
           fi
 
       - name: Compile SQL production and test code
-        run: ./build/sbt -Phadoop-3 -Phive "sql/Test/compile"
+        shell: bash
+        run: |
+          set -uo pipefail
+          compile_log="${RUNNER_TEMP}/shuffle-recovery-sql-test-compile.log"
+          set +e
+          ./build/sbt -Phadoop-3 -Phive "sql/Test/compile" 2>&1 | tee "${compile_log}"
+          compile_status=${PIPESTATUS[0]}
+          set -e
+          if [[ ${compile_status} -ne 0 ]]; then
+            {
+              echo "### sql/Test/compile diagnostics"
+              echo '```text'
+              if ! grep -E '^\[error\]' "${compile_log}" | tail -n 200; then
+                tail -n 200 "${compile_log}"
+              fi
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          exit "${compile_status}"
 
       - name: Run focused opportunity analyzer suite
         env:
