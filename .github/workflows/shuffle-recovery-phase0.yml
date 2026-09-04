@@ -132,6 +132,11 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityAnalyzerSuite"
 
+      - name: Run adaptive partition-rule regression suite
+        run: |
+          ./build/sbt -Phadoop-3 -Phive \
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryAdaptivePartitionRulesSuite"
+
       - name: Run listener-manager regression suite
         run: >-
           ./build/sbt -Phadoop-3 -Phive
@@ -145,6 +150,13 @@ jobs:
             -name '*ShuffleRecoveryOpportunityAnalyzerSuite*.xml' -print -quit)"
           if [[ -z "${report}" ]]; then
             echo "Focused opportunity analyzer suite produced no test report." >&2
+            exit 1
+          fi
+
+          adaptive_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml' -print -quit)"
+          if [[ -z "${adaptive_report}" ]]; then
+            echo "Adaptive partition-rule suite produced no test report." >&2
             exit 1
           fi
 
@@ -169,5 +181,6 @@ jobs:
             sql/core/target/shuffle-recovery-phase0/sql-test-compile.log
             sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl
             **/target/test-reports/*ShuffleRecoveryOpportunityAnalyzerSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
             **/target/*.log
