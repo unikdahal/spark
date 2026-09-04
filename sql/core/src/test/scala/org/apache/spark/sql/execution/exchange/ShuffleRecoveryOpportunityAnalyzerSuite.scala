@@ -494,7 +494,7 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
 
   private case class UnknownExpression(child: Expression)
     extends UnaryExpression with Unevaluable {
-    override def dataType = child.dataType
+    override def dataType: org.apache.spark.sql.types.DataType = child.dataType
 
     override def nullable: Boolean = child.nullable
 
@@ -509,7 +509,7 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
 
   private case class HostilePartitioning() extends Partitioning {
     override lazy val numPartitions: Int = {
-      throw new AssertionError("unknown partitioning must not be inspected")
+      throw new IllegalStateException("unknown partitioning must not be inspected")
     }
   }
 }
