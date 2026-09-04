@@ -1,0 +1,191 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: P0-01 temporary review repair
+
+on:
+  push:
+    branches:
+      - spip/p0-01-opportunity-analyzer
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: spip/p0-01-opportunity-analyzer
+
+      - name: Apply listener lifecycle repairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          source = Path(
+              "sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/"
+              "ShuffleRecoveryOpportunityAnalyzer.scala")
+          text = source.read_text()
+          text = text.replace("import java.util.concurrent.ConcurrentHashMap\n", "")
+
+          old = '''  private val callbackLock = new Object
+  private val seenExecutions = new ConcurrentHashMap[java.lang.Long, java.lang.Boolean]()
+
+  override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = observe(qe)
+
+  override def onFailure(
+      funcName: String,
+      qe: QueryExecution,
+      exception: Exception): Unit = observe(qe)
+
+  private def observe(qe: QueryExecution): Unit = {
+    val key = java.lang.Long.valueOf(qe.id)
+    if (seenExecutions.putIfAbsent(key, java.lang.Boolean.TRUE) == null) {
+      try {
+        val sparkConf = qe.sparkSession.sparkContext.getConf
+        val shuffleManager = sparkConf.get("spark.shuffle.manager", "sort")
+        val runtimeState = ShuffleRecoveryRuntimeState(
+          pushBasedShuffleEnabled = sparkConf.getBoolean("spark.shuffle.push.enabled", false),
+          incompatibleFlags = if (shuffleManager == "sort") Nil else Seq("CUSTOM_SHUFFLE_MANAGER"))
+        val executionId = f"query-${qe.id}%020d"
+        val records = ShuffleRecoveryOpportunityAnalyzer.analyze(
+          qe.executedPlan, executionId, rules, runtimeState)
+        callbackLock.synchronized {
+          onRecords(records)
+        }
+      } catch {
+        case NonFatal(error) =>
+          seenExecutions.remove(key)
+          reportError(error)
+      }
+    }
+  }
+'''
+          new = '''  private val callbackLock = new Object
+  private val dedupeLock = new Object
+  private val recentExecutionIds = mutable.LinkedHashSet.empty[Long]
+  private val maxRememberedExecutions = 4096
+
+  override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = observe(qe)
+
+  override def onFailure(
+      funcName: String,
+      qe: QueryExecution,
+      exception: Exception): Unit = {}
+
+  private def observe(qe: QueryExecution): Unit = {
+    if (markFirstObservation(qe.id)) {
+      try {
+        val sparkConf = qe.sparkSession.sparkContext.getConf
+        val shuffleManager = sparkConf.get("spark.shuffle.manager", "sort")
+        val runtimeState = ShuffleRecoveryRuntimeState(
+          pushBasedShuffleEnabled = sparkConf.getBoolean("spark.shuffle.push.enabled", false),
+          incompatibleFlags = if (shuffleManager == "sort") Nil else Seq("CUSTOM_SHUFFLE_MANAGER"))
+        val executionId = f"query-${qe.id}%020d"
+        val records = ShuffleRecoveryOpportunityAnalyzer.analyze(
+          qe.executedPlan, executionId, rules, runtimeState)
+        callbackLock.synchronized {
+          onRecords(records)
+        }
+      } catch {
+        case NonFatal(error) =>
+          forgetObservation(qe.id)
+          reportError(error)
+      }
+    }
+  }
+
+  private def markFirstObservation(executionId: Long): Boolean = dedupeLock.synchronized {
+    if (recentExecutionIds.contains(executionId)) {
+      false
+    } else {
+      recentExecutionIds += executionId
+      while (recentExecutionIds.size > maxRememberedExecutions) {
+        recentExecutionIds -= recentExecutionIds.head
+      }
+      true
+    }
+  }
+
+  private def forgetObservation(executionId: Long): Unit = dedupeLock.synchronized {
+    recentExecutionIds -= executionId
+  }
+'''
+          if text.count(old) != 1:
+              raise RuntimeError(f"expected one listener block, found {text.count(old)}")
+          text = text.replace(old, new)
+          source.write_text(text)
+
+          suite = Path(
+              "sql/core/src/test/scala/org/apache/spark/sql/execution/exchange/"
+              "ShuffleRecoveryOpportunityAnalyzerSuite.scala")
+          tests = suite.read_text()
+          anchor = '''  private def maybeWriteEvidence(
+      records: Seq[ShuffleRecoveryExchangeObservation]): Unit = {
+'''
+          additions = '''  test("failed queries do not enter the completed opportunity corpus") {
+    val captured = new ConcurrentLinkedQueue[Seq[ShuffleRecoveryExchangeObservation]]()
+    val listener = new ShuffleRecoveryOpportunityListener(rules, batch => captured.add(batch))
+    val qe = spark.range(4).repartition(2, $"id").queryExecution
+
+    listener.onFailure("collect", qe, new RuntimeException("expected"))
+
+    assert(captured.isEmpty)
+  }
+
+  test("listener duplicate history is bounded") {
+    val callbackCount = new AtomicInteger(0)
+    val listener = new ShuffleRecoveryOpportunityListener(
+      rules, _ => callbackCount.incrementAndGet())
+    val first = spark.range(1).queryExecution
+
+    listener.onSuccess("collect", first, 0L)
+    (0 until 5000).foreach { index =>
+      val qe = spark.range(index.toLong, index.toLong + 1L).queryExecution
+      listener.onSuccess("collect", qe, 0L)
+    }
+    val beforeReplay = callbackCount.get()
+    listener.onSuccess("collect", first, 0L)
+
+    assert(callbackCount.get() === beforeReplay + 1)
+  }
+
+'''
+          if tests.count(anchor) != 1:
+              raise RuntimeError(f"expected one test insertion anchor, found {tests.count(anchor)}")
+          tests = tests.replace(anchor, additions + anchor)
+          suite.write_text(tests)
+          PY
+          git diff --check
+
+      - name: Commit reviewed source and tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add \
+            sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryOpportunityAnalyzer.scala \
+            sql/core/src/test/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryOpportunityAnalyzerSuite.scala
+          git commit -m "Bound listener lifecycle and exclude failed queries"
+          git push origin HEAD:spip/p0-01-opportunity-analyzer
