@@ -87,7 +87,7 @@ jobs:
         run: git diff --check "${BASE_SHA}...HEAD"
 
       - name: Run Scala style checks
-        run: ./dev/scalastyle "-Phadoop-3 -Phive"
+        run: timeout --signal=TERM 20m ./dev/scalastyle "-Phadoop-3 -Phive"
 
       - name: Run Java checkstyle when Java is affected
         env:
