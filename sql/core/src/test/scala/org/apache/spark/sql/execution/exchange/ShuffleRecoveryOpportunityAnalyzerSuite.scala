@@ -437,7 +437,7 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     val listener = new ShuffleRecoveryOpportunityListener(rules, batch => captured.add(batch))
     val qe = spark.range(4).repartition(2, $"id").queryExecution
 
-    listener.onFailure("collect", qe, new RuntimeError("expected"))
+    listener.onFailure("collect", qe, new RuntimeException("expected"))
 
     assert(captured.isEmpty)
   }
