@@ -412,7 +412,7 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
       error => errors.add(error))
     assert(!spark.listenerManager.listListeners().contains(listener))
 
-    val baseline = spark.range(8).collect().map(_.getLong(0)).toSeq
+    val baseline = spark.range(8).collect().toSeq
     assert(baseline === (0L until 8L).toSeq)
 
     spark.listenerManager.register(listener)
