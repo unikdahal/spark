@@ -25,8 +25,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{
-  Ascending, Attribute, DynamicPruningExpression, Expression, Literal, SortOrder,
-  UnaryExpression, Unevaluable}
+  Ascending, Attribute, BloomFilterMightContain, DynamicPruningExpression, Expression, Literal,
+  SortOrder, UnaryExpression, Unevaluable}
 import org.apache.spark.sql.catalyst.plans.physical.{
   HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan, UnaryExecNode, UnionExec}
@@ -169,6 +169,23 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     assert(refused.flags.dynamicPruning)
     assert(admitted.eligible)
     assert(admitted.flags.dynamicPruning)
+  }
+
+  test("runtime filters are an independently parameterized miss") {
+    val runtimeFilter = BloomFilterMightContain(Literal(Array[Byte](1)), Literal(1L))
+    val carrier = ExpressionCarrierExec(runtimeFilter, rangePlan())
+    val carrierRules = rules.copy(
+      allowedOperatorClassNames = rules.allowedOperatorClassNames + carrier.getClass.getName)
+
+    val refused = analyze(hashExchange(carrier), analyzerRules = carrierRules).head
+    val admitted = analyze(
+      hashExchange(carrier),
+      analyzerRules = carrierRules.copy(allowRuntimeFilters = true)).head
+
+    assert(refused.immediateMissReason.contains(RuntimeFilterPresent))
+    assert(refused.flags.runtimeFilter)
+    assert(admitted.eligible)
+    assert(admitted.flags.runtimeFilter)
   }
 
   test("source-token and lineage categories are independently parameterized") {
