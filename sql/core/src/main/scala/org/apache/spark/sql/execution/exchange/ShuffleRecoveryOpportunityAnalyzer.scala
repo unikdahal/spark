@@ -977,6 +977,41 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
 }
 
 /**
+ * Tracks active and recently completed listener observations without allowing bounded history
+ * eviction to admit a duplicate callback for an execution that is still being processed.
+ */
+private[sql] final class ShuffleRecoveryExecutionDeduplicator(
+    maxRememberedCompletedExecutions: Int = 4096) {
+  require(maxRememberedCompletedExecutions > 0, "completed execution history must be positive")
+
+  private val inFlightExecutionIds = mutable.HashSet.empty[Long]
+  private val recentCompletedExecutionIds = mutable.LinkedHashSet.empty[Long]
+
+  def tryStart(executionId: Long): Boolean = synchronized {
+    if (inFlightExecutionIds.contains(executionId) ||
+        recentCompletedExecutionIds.contains(executionId)) {
+      false
+    } else {
+      inFlightExecutionIds += executionId
+      true
+    }
+  }
+
+  def markCompleted(executionId: Long): Unit = synchronized {
+    if (inFlightExecutionIds.remove(executionId)) {
+      recentCompletedExecutionIds += executionId
+      while (recentCompletedExecutionIds.size > maxRememberedCompletedExecutions) {
+        recentCompletedExecutionIds -= recentCompletedExecutionIds.head
+      }
+    }
+  }
+
+  def markFailed(executionId: Long): Unit = synchronized {
+    inFlightExecutionIds -= executionId
+  }
+}
+
+/**
  * Explicit, thread-safe adapter for evidence runs.
  *
  * Registration is never automatic, so an analyzer that is not installed has no query-path cost.
@@ -991,9 +1026,7 @@ private[sql] final class ShuffleRecoveryOpportunityListener(
   extends QueryExecutionListener with Logging {
 
   private val callbackLock = new Object
-  private val dedupeLock = new Object
-  private val recentExecutionIds = mutable.LinkedHashSet.empty[Long]
-  private val maxRememberedExecutions = 4096
+  private val deduplicator = new ShuffleRecoveryExecutionDeduplicator()
 
   override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = observe(qe)
 
@@ -1003,7 +1036,7 @@ private[sql] final class ShuffleRecoveryOpportunityListener(
       exception: Exception): Unit = {}
 
   private def observe(qe: QueryExecution): Unit = {
-    if (markFirstObservation(qe.id)) {
+    if (deduplicator.tryStart(qe.id)) {
       try {
         val sparkConf = qe.sparkSession.sparkContext.getConf
         val shuffleManager = sparkConf.get("spark.shuffle.manager", "sort")
@@ -1016,28 +1049,13 @@ private[sql] final class ShuffleRecoveryOpportunityListener(
         callbackLock.synchronized {
           onRecords(records)
         }
+        deduplicator.markCompleted(qe.id)
       } catch {
         case NonFatal(error) =>
-          forgetObservation(qe.id)
+          deduplicator.markFailed(qe.id)
           reportError(error)
       }
     }
-  }
-
-  private def markFirstObservation(executionId: Long): Boolean = dedupeLock.synchronized {
-    if (recentExecutionIds.contains(executionId)) {
-      false
-    } else {
-      recentExecutionIds += executionId
-      while (recentExecutionIds.size > maxRememberedExecutions) {
-        recentExecutionIds -= recentExecutionIds.head
-      }
-      true
-    }
-  }
-
-  private def forgetObservation(executionId: Long): Unit = dedupeLock.synchronized {
-    recentExecutionIds -= executionId
   }
 
   private def reportError(error: Throwable): Unit = {
