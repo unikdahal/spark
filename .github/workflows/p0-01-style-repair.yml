@@ -1,0 +1,91 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements. See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License. You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: P0-01 temporary style repair
+
+on:
+  push:
+    branches:
+      - spip/p0-01-opportunity-analyzer
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: spip/p0-01-opportunity-analyzer
+
+      - name: Apply exact scalastyle repairs
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path(
+              "sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/"
+              "ShuffleRecoveryOpportunityAnalyzer.scala")
+          text = path.read_text()
+          replacements = [
+              (
+                  "        summarizeExpressions(observePartitioning("
+                  "exchange.outputPartitioning).expressionRoots, rules)",
+                  "        summarizeExpressions(\n"
+                  "          observePartitioning(exchange.outputPartitioning).expressionRoots,\n"
+                  "          rules)"),
+              (
+                  "  override def onFailure(funcName: String, qe: QueryExecution, "
+                  "exception: Exception): Unit = observe(qe)",
+                  "  override def onFailure(\n"
+                  "      funcName: String,\n"
+                  "      qe: QueryExecution,\n"
+                  "      exception: Exception): Unit = observe(qe)"),
+              (
+                  "    logWarning(\"Shuffle recovery opportunity analysis failed; "
+                  "query execution is unaffected.\", error)",
+                  "    logWarning(\n"
+                  "      \"Shuffle recovery opportunity analysis failed; "
+                  "query execution is unaffected.\",\n"
+                  "      error)"),
+          ]
+          for old, new in replacements:
+              count = text.count(old)
+              if count != 1:
+                  raise RuntimeError(f"expected one exact match, found {count}: {old!r}")
+              text = text.replace(old, new)
+          path.write_text(text)
+          PY
+          git diff --check
+
+      - name: Commit repaired source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --quiet; then
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryOpportunityAnalyzer.scala
+          git commit -m "Fix P0-01 Scala style"
+          git push origin HEAD:spip/p0-01-opportunity-analyzer
