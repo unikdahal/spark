@@ -695,7 +695,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     val flags = childSummaries.foldLeft(localFlags.merge(expressionSummary.flags)) {
       case (acc, summary) => acc.merge(summary.flags)
     }
-    val sources = if (children.isEmpty) {
+    val inputSources = if (children.isEmpty) {
       sourceSummary(plan, rules)
     } else {
       childSummaries.foldLeft(SourceSummary()) { case (acc, summary) => acc.merge(summary.sources) }
@@ -707,7 +707,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
           exchange,
           observePartitioning(exchange.outputPartitioning),
           adaptivePartitionSpecsPresent = false,
-          sources.lineageCategory,
+          inputSources.lineageCategory,
           rules,
           runtimeState,
           expressionSummary.reasons)
@@ -716,7 +716,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     }
     val sourceReasons =
       if (!isStructuralWrapper(plan) && children.isEmpty) {
-        leafSourceReasons(sources, rules)
+        leafSourceReasons(inputSources, rules)
       } else {
         ReasonSummary.Empty
       }
@@ -728,8 +728,27 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
         combined.copy(origin = Some(NestedExchangeReason))
       case _ => combined
     }
+    val outputSources = plan match {
+      case _: ShuffleExchangeExec => shuffleOutputSources(inputSources)
+      case _ => inputSources
+    }
 
-    PlanSummary(reasons, flags, sources)
+    PlanSummary(reasons, flags, outputSources)
+  }
+
+  /**
+   * Mirrors the deterministic-level effect of Spark SQL's ordinary shuffle output without
+   * materializing a ShuffleDependency. ShuffleExchangeExec never configures an aggregator or key
+   * ordering, so Spark's reduce-side RDD is UNORDERED whenever its map input is not indeterminate.
+   * Unknown input remains unknown because it may conceal an indeterminate source.
+   */
+  private def shuffleOutputSources(input: SourceSummary): SourceSummary = {
+    val outputLineage = input.lineageCategory match {
+      case Determinate | Unordered => Unordered
+      case Indeterminate => Indeterminate
+      case Unknown => Unknown
+    }
+    input.copy(lineage = outputLineage)
   }
 
   private def leafSourceReasons(
