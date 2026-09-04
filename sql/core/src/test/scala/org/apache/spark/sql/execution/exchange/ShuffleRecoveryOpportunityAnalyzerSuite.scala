@@ -460,21 +460,52 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     assert(captured.isEmpty)
   }
 
-  test("listener duplicate history is bounded") {
-    val callbackCount = new AtomicInteger(0)
+  test("listener retries an observation after the evidence sink fails") {
+    val attempts = new AtomicInteger(0)
+    val captured = new ConcurrentLinkedQueue[Seq[ShuffleRecoveryExchangeObservation]]()
+    val errors = new ConcurrentLinkedQueue[Throwable]()
     val listener = new ShuffleRecoveryOpportunityListener(
-      rules, _ => callbackCount.incrementAndGet())
-    val first = spark.range(1).queryExecution
+      rules,
+      batch => {
+        if (attempts.getAndIncrement() == 0) {
+          throw new RuntimeException("expected")
+        }
+        captured.add(batch)
+      },
+      error => errors.add(error))
+    val qe = spark.range(4).repartition(2, $"id").queryExecution
 
-    listener.onSuccess("collect", first, 0L)
-    (0 until 5000).foreach { index =>
-      val qe = spark.range(index.toLong, index.toLong + 1L).queryExecution
-      listener.onSuccess("collect", qe, 0L)
+    listener.onSuccess("collect", qe, 0L)
+    listener.onSuccess("collect", qe, 0L)
+    listener.onSuccess("collect", qe, 0L)
+
+    assert(attempts.get() === 2)
+    assert(captured.size() === 1)
+    assert(errors.size() === 1)
+  }
+
+  test("listener dedupe protects in-flight ids from bounded history eviction") {
+    val deduplicator = new ShuffleRecoveryExecutionDeduplicator()
+    val protectedId = 1L
+
+    assert(deduplicator.tryStart(protectedId))
+    (2L to 5000L).foreach { executionId =>
+      assert(deduplicator.tryStart(executionId))
+      deduplicator.markCompleted(executionId)
     }
-    val beforeReplay = callbackCount.get()
-    listener.onSuccess("collect", first, 0L)
+    assert(!deduplicator.tryStart(protectedId))
 
-    assert(callbackCount.get() === beforeReplay + 1)
+    deduplicator.markCompleted(protectedId)
+    assert(!deduplicator.tryStart(protectedId))
+    (5001L to 10000L).foreach { executionId =>
+      assert(deduplicator.tryStart(executionId))
+      deduplicator.markCompleted(executionId)
+    }
+    assert(deduplicator.tryStart(protectedId))
+
+    deduplicator.markFailed(protectedId)
+    assert(deduplicator.tryStart(protectedId))
+    deduplicator.markFailed(protectedId)
   }
 
   private def maybeWriteEvidence(
