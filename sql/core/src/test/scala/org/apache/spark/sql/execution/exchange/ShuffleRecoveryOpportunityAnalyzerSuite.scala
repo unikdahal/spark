@@ -99,15 +99,25 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     assert(record.mapperCount.isEmpty)
   }
 
-  test("nested exchanges are observed in deterministic occurrence order") {
+  test("nested exchanges propagate shuffle output determinism in stable occurrence order") {
     val inner = hashExchange(rangePlan(), partitions = 2)
     val outer = hashExchange(inner, partitions = 3)
 
-    val records = analyze(outer)
+    val strict = analyze(outer)
 
-    assert(records.map(_.exchangeOrdinal) === Seq(0L, 1L))
-    assert(records.map(_.exchangePath) === Seq("root", "c0"))
-    assert(records.forall(_.eligible))
+    assert(strict.map(_.exchangeOrdinal) === Seq(0L, 1L))
+    assert(strict.map(_.exchangePath) === Seq("root", "c0"))
+    assert(!strict.head.eligible)
+    assert(strict.head.lineageDeterminism === Unordered)
+    assert(strict.head.immediateMissReason.contains(NonDeterministic))
+    assert(strict.head.rootMissReason.contains(NonDeterministic))
+    assert(strict(1).eligible)
+    assert(strict(1).lineageDeterminism === Determinate)
+
+    val relaxed = analyze(
+      outer,
+      analyzerRules = rules.copy(requireDeterminateLineage = false))
+    assert(relaxed.forall(_.eligible))
   }
 
   test("nested exchange misses use a cascade reason without losing the root cause") {
@@ -115,8 +125,9 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     val inner = ShuffleExchangeExec(
       RangePartitioning(Seq(SortOrder(child.output.head, Ascending)), 2), child)
     val outer = hashExchange(inner, partitions = 3)
+    val cascadeRules = rules.copy(requireDeterminateLineage = false)
 
-    val records = analyze(outer)
+    val records = analyze(outer, analyzerRules = cascadeRules)
 
     assert(records.head.immediateMissReason.contains(UpstreamIneligible))
     assert(records.head.rootMissReason.contains(RangePartitioningPresent))
