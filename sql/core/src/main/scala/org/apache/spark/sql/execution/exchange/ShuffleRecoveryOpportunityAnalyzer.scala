@@ -18,7 +18,6 @@
 package org.apache.spark.sql.execution.exchange
 
 import java.util.IdentityHashMap
-import java.util.concurrent.ConcurrentHashMap
 
 import scala.collection.mutable
 import scala.util.control.NonFatal
@@ -991,18 +990,19 @@ private[sql] final class ShuffleRecoveryOpportunityListener(
   extends QueryExecutionListener with Logging {
 
   private val callbackLock = new Object
-  private val seenExecutions = new ConcurrentHashMap[java.lang.Long, java.lang.Boolean]()
+  private val dedupeLock = new Object
+  private val recentExecutionIds = mutable.LinkedHashSet.empty[Long]
+  private val maxRememberedExecutions = 4096
 
   override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = observe(qe)
 
   override def onFailure(
       funcName: String,
       qe: QueryExecution,
-      exception: Exception): Unit = observe(qe)
+      exception: Exception): Unit = {}
 
   private def observe(qe: QueryExecution): Unit = {
-    val key = java.lang.Long.valueOf(qe.id)
-    if (seenExecutions.putIfAbsent(key, java.lang.Boolean.TRUE) == null) {
+    if (markFirstObservation(qe.id)) {
       try {
         val sparkConf = qe.sparkSession.sparkContext.getConf
         val shuffleManager = sparkConf.get("spark.shuffle.manager", "sort")
@@ -1017,10 +1017,26 @@ private[sql] final class ShuffleRecoveryOpportunityListener(
         }
       } catch {
         case NonFatal(error) =>
-          seenExecutions.remove(key)
+          forgetObservation(qe.id)
           reportError(error)
       }
     }
+  }
+
+  private def markFirstObservation(executionId: Long): Boolean = dedupeLock.synchronized {
+    if (recentExecutionIds.contains(executionId)) {
+      false
+    } else {
+      recentExecutionIds += executionId
+      while (recentExecutionIds.size > maxRememberedExecutions) {
+        recentExecutionIds -= recentExecutionIds.head
+      }
+      true
+    }
+  }
+
+  private def forgetObservation(executionId: Long): Unit = dedupeLock.synchronized {
+    recentExecutionIds -= executionId
   }
 
   private def reportError(error: Throwable): Unit = {

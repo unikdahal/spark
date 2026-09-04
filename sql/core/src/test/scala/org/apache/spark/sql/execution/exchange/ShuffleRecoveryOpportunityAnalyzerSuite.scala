@@ -432,6 +432,33 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     }
   }
 
+  test("failed queries do not enter the completed opportunity corpus") {
+    val captured = new ConcurrentLinkedQueue[Seq[ShuffleRecoveryExchangeObservation]]()
+    val listener = new ShuffleRecoveryOpportunityListener(rules, batch => captured.add(batch))
+    val qe = spark.range(4).repartition(2, $"id").queryExecution
+
+    listener.onFailure("collect", qe, new RuntimeError("expected"))
+
+    assert(captured.isEmpty)
+  }
+
+  test("listener duplicate history is bounded") {
+    val callbackCount = new AtomicInteger(0)
+    val listener = new ShuffleRecoveryOpportunityListener(
+      rules, _ => callbackCount.incrementAndGet())
+    val first = spark.range(1).queryExecution
+
+    listener.onSuccess("collect", first, 0L)
+    (0 until 5000).foreach { index =>
+      val qe = spark.range(index.toLong, index.toLong + 1L).queryExecution
+      listener.onSuccess("collect", qe, 0L)
+    }
+    val beforeReplay = callbackCount.get()
+    listener.onSuccess("collect", first, 0L)
+
+    assert(callbackCount.get() === beforeReplay + 1)
+  }
+
   private def maybeWriteEvidence(
       records: Seq[ShuffleRecoveryExchangeObservation]): Unit = {
     Option(System.getenv("SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_OUTPUT")).foreach { rawPath =>
