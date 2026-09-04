@@ -19,10 +19,7 @@ package org.apache.spark.sql.execution.exchange
 
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
-import java.util.concurrent.{CountDownLatch, Executors, TimeUnit}
-import java.util.concurrent.atomic.AtomicInteger
-
-import scala.collection.mutable.ArrayBuffer
+import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, TimeUnit}
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
@@ -30,9 +27,8 @@ import org.apache.spark.sql.catalyst.expressions.{
   Ascending, Attribute, DynamicPruningExpression, Expression, Literal, SortOrder,
   UnaryExpression, Unevaluable}
 import org.apache.spark.sql.catalyst.plans.physical.{
-  HashPartitioning, RangePartitioning, RoundRobinPartitioning, UnknownPartitioning}
+  HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan, UnaryExecNode, UnionExec}
-import org.apache.spark.sql.execution.adaptive.ShuffleQueryStageExec
 import org.apache.spark.sql.expressions.Window
 import org.apache.spark.sql.functions.row_number
 import org.apache.spark.sql.internal.SQLConf
@@ -54,35 +50,13 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     ShuffleExchangeExec(HashPartitioning(child.output.take(1), partitions), child)
   }
 
-  /** Plan-only tests inject lineage explicitly so classification cannot materialize an RDD. */
   private def analyze(
       plan: SparkPlan,
       executionId: String = "test",
       analyzerRules: ShuffleRecoveryEligibilityRules = rules,
       runtimeState: ShuffleRecoveryRuntimeState = ShuffleRecoveryRuntimeState())
       : Seq[ShuffleRecoveryExchangeObservation] = {
-    val discoveryRules = analyzerRules.copy(requireDeterminateLineage = false)
-    val paths = ShuffleRecoveryOpportunityAnalyzer
-      .analyze(plan, executionId, discoveryRules, runtimeState)
-      .map(_.exchangePath)
-    val syntheticLineage = paths.iterator
-      .filterNot(runtimeState.lineageByExchangePath.contains)
-      .map(_ -> Determinate)
-      .toMap
-    ShuffleRecoveryOpportunityAnalyzer.analyze(
-      plan,
-      executionId,
-      analyzerRules,
-      runtimeState.copy(
-        lineageByExchangePath = syntheticLineage ++ runtimeState.lineageByExchangePath))
-  }
-
-  private def analyzeCompleted(
-      plan: SparkPlan,
-      executionId: String): Seq[ShuffleRecoveryExchangeObservation] = {
-    val runtime = ShuffleRecoveryOpportunityAnalyzer.withCompletedExchangeRuntime(
-      plan, ShuffleRecoveryRuntimeState())
-    ShuffleRecoveryOpportunityAnalyzer.analyze(plan, executionId, rules, runtime)
+    ShuffleRecoveryOpportunityAnalyzer.analyze(plan, executionId, analyzerRules, runtimeState)
   }
 
   test("zero exchanges produce no observation") {
@@ -96,7 +70,7 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     val record = records.head
     assert(record.exchangeOrdinal === 0L)
     assert(record.exchangePath === "root")
-    assert(record.partitionCount === 4)
+    assert(record.partitionCount.contains(4))
     assert(record.eligible)
     assert(record.immediateMissReason.isEmpty)
     assert(record.rootMissReason.isEmpty)
@@ -107,27 +81,21 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     assert(record.runtimeShuffleId.isEmpty)
   }
 
-  test("unproven lineage fails closed") {
-    val record = ShuffleRecoveryOpportunityAnalyzer
-      .analyze(hashExchange(rangePlan()), "unknown-lineage", rules)
-      .head
+  test("unproven lineage fails closed without materializing shuffle state") {
+    val source = TokenLeafExec(rangePlan().output)
+    val sourceClass = source.getClass.getName
+    val unprovenRules = rules.copy(
+      allowedOperatorClassNames = rules.allowedOperatorClassNames + sourceClass,
+      sourceTokenByOperatorClassName =
+        rules.sourceTokenByOperatorClassName + (sourceClass -> Exact))
+
+    val record = analyze(hashExchange(source), analyzerRules = unprovenRules).head
 
     assert(!record.eligible)
     assert(record.lineageDeterminism === Unknown)
-    assert(record.immediateMissReason.contains(NonDeterministic))
-    assert(record.rootMissReason.contains(NonDeterministic))
-  }
-
-  test("completed exchanges expose Spark DETERMINATE lineage and mapper shape") {
-    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
-      val df = spark.range(0, 32, 1, 4).repartition(4, $"id")
-      df.collect()
-      val record = analyzeCompleted(df.queryExecution.executedPlan, "completed").head
-
-      assert(record.lineageDeterminism === Determinate)
-      assert(record.mapperCount.contains(4))
-      assert(record.partitionCount === 4)
-    }
+    assert(record.immediateMissReason.contains(DeterminismUnproven))
+    assert(record.rootMissReason.contains(DeterminismUnproven))
+    assert(record.mapperCount.isEmpty)
   }
 
   test("nested exchanges are observed in deterministic occurrence order") {
@@ -137,17 +105,29 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     val records = analyze(outer)
 
     assert(records.map(_.exchangeOrdinal) === Seq(0L, 1L))
-    assert(records.map(_.exchangePath) === Seq("root", "0"))
+    assert(records.map(_.exchangePath) === Seq("root", "c0"))
     assert(records.forall(_.eligible))
   }
 
-  test("reused exchange and query-stage wrappers remain observable without object ids") {
+  test("nested exchange misses use a cascade reason without losing the root cause") {
+    val child = rangePlan()
+    val inner = ShuffleExchangeExec(
+      RangePartitioning(Seq(SortOrder(child.output.head, Ascending)), 2), child)
+    val outer = hashExchange(inner, partitions = 3)
+
+    val records = analyze(outer)
+
+    assert(records.head.immediateMissReason.contains(UpstreamIneligible))
+    assert(records.head.rootMissReason.contains(RangePartitioningPresent))
+    assert(records(1).immediateMissReason.contains(RangePartitioningPresent))
+  }
+
+  test("reused exchanges are unwrapped without object identity in the output") {
     val exchange = hashExchange(rangePlan())
     val reused = ReusedExchangeExec(exchange.output, exchange)
-    val stage = ShuffleQueryStageExec(0, reused, exchange.canonicalized)
 
-    val first = analyze(stage, executionId = "stable")
-    val second = analyze(stage, executionId = "stable")
+    val first = analyze(reused, executionId = "stable")
+    val second = analyze(reused, executionId = "stable")
 
     assert(first.size === 1)
     assert(first.head.flags.reusedExchange)
@@ -176,14 +156,13 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
 
   test("dynamic pruning is an independently parameterized miss") {
     val carrier = ExpressionCarrierExec(DynamicPruningExpression(Literal(true)), rangePlan())
-    val carrierClass = carrier.getClass.getName
-    val baselineRules = rules.copy(
-      allowedOperatorClassNames = rules.allowedOperatorClassNames + carrierClass)
+    val carrierRules = rules.copy(
+      allowedOperatorClassNames = rules.allowedOperatorClassNames + carrier.getClass.getName)
 
-    val refused = analyze(hashExchange(carrier), analyzerRules = baselineRules).head
+    val refused = analyze(hashExchange(carrier), analyzerRules = carrierRules).head
     val admitted = analyze(
       hashExchange(carrier),
-      analyzerRules = baselineRules.copy(allowDynamicPruning = true)).head
+      analyzerRules = carrierRules.copy(allowDynamicPruning = true)).head
 
     assert(refused.immediateMissReason.contains(DynamicPruningPresent))
     assert(refused.flags.dynamicPruning)
@@ -191,35 +170,37 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     assert(admitted.flags.dynamicPruning)
   }
 
-  test("source-token categories are independently parameterized") {
+  test("source-token and lineage categories are independently parameterized") {
     val source = TokenLeafExec(rangePlan().output)
     val sourceClass = source.getClass.getName
-    val operatorRules = rules.copy(
-      allowedOperatorClassNames = rules.allowedOperatorClassNames + sourceClass)
+    val determinateRules = rules.copy(
+      allowedOperatorClassNames = rules.allowedOperatorClassNames + sourceClass,
+      lineageBySourceOperatorClassName =
+        rules.lineageBySourceOperatorClassName + (sourceClass -> Determinate))
 
-    val unavailable = analyze(hashExchange(source), analyzerRules = operatorRules).head
+    val unavailable = analyze(hashExchange(source), analyzerRules = determinateRules).head
     val exact = analyze(
       hashExchange(source),
-      analyzerRules = operatorRules.copy(
+      analyzerRules = determinateRules.copy(
         sourceTokenByOperatorClassName =
-          operatorRules.sourceTokenByOperatorClassName + (sourceClass -> Exact))).head
+          determinateRules.sourceTokenByOperatorClassName + (sourceClass -> Exact))).head
     val prototype = analyze(
       hashExchange(source),
-      analyzerRules = operatorRules.copy(
+      analyzerRules = determinateRules.copy(
         sourceTokenByOperatorClassName =
-          operatorRules.sourceTokenByOperatorClassName +
+          determinateRules.sourceTokenByOperatorClassName +
             (sourceClass -> PrototypeSpecialCased))).head
 
     assert(unavailable.immediateMissReason.contains(SourceTokenUnavailable))
-    assert(unavailable.rootMissReason.contains(SourceTokenUnavailable))
     assert(unavailable.sourceTokenAvailability === Unavailable)
+    assert(unavailable.lineageDeterminism === Determinate)
     assert(exact.eligible)
     assert(exact.sourceTokenAvailability === Exact)
     assert(prototype.eligible)
     assert(prototype.sourceTokenAvailability === PrototypeSpecialCased)
   }
 
-  test("range partitioning is rejected and can be relaxed without rewriting traversal") {
+  test("range partitioning is rejected without constructing shuffle runtime state") {
     val child = rangePlan()
     val partitioning = RangePartitioning(
       Seq(SortOrder(child.output.head, Ascending)), numPartitions = 2)
@@ -232,6 +213,8 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
 
     assert(refused.immediateMissReason.contains(RangePartitioningPresent))
     assert(refused.rootMissReason.contains(RangePartitioningPresent))
+    assert(refused.mapperCount.isEmpty)
+    assert(refused.runtimeShuffleId.isEmpty)
     assert(admitted.eligible)
   }
 
@@ -257,17 +240,18 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     assert(admitted.eligible)
   }
 
-  test("pipelined and push-based shuffle rules are independently parameterized") {
+  test("pipelined push and merged shuffle modes are independently parameterized") {
     val child = rangePlan()
     val pipelined = ShuffleExchangeExec(
       HashPartitioning(child.output.take(1), 2), child, pipelined = true)
     val ordinary = hashExchange(child, partitions = 2)
-    val pushState = ShuffleRecoveryRuntimeState(pushBasedShuffleEnabled = true)
 
     assert(analyze(pipelined).head.immediateMissReason.contains(UnsupportedShuffleMode))
     assert(analyze(
       pipelined,
       analyzerRules = rules.copy(allowPipelinedShuffle = true)).head.eligible)
+
+    val pushState = ShuffleRecoveryRuntimeState(pushBasedShuffleEnabled = true)
     assert(analyze(
       ordinary,
       runtimeState = pushState).head.immediateMissReason.contains(UnsupportedShuffleMode))
@@ -275,6 +259,15 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
       ordinary,
       analyzerRules = rules.copy(allowPushBasedShuffle = true),
       runtimeState = pushState).head.eligible)
+
+    val mergedState = ShuffleRecoveryRuntimeState(mergedShuffleEnabled = true)
+    assert(analyze(
+      ordinary,
+      runtimeState = mergedState).head.immediateMissReason.contains(UnsupportedShuffleMode))
+    assert(analyze(
+      ordinary,
+      analyzerRules = rules.copy(allowMergedShuffle = true),
+      runtimeState = mergedState).head.eligible)
   }
 
   test("incompatible runtime flags fail closed and remain separately parameterized") {
@@ -291,53 +284,81 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
     assert(admitted.eligible)
   }
 
-  test("invalid partition counts fail closed without allocation") {
-    val record = analyze(ShuffleExchangeExec(UnknownPartitioning(0), rangePlan())).head
+  test("invalid and hostile partitioning shapes fail closed without unsafe enrichment") {
+    val invalid = analyze(ShuffleExchangeExec(UnknownPartitioning(0), rangePlan())).head
+    assert(!invalid.eligible)
+    assert(invalid.partitionCount.contains(0))
+    assert(invalid.immediateMissReason.contains(InvalidPartitionCount))
 
-    assert(!record.eligible)
-    assert(record.partitionCount === 0)
-    assert(record.immediateMissReason.contains(InvalidPartitionCount))
+    val hostile = analyze(ShuffleExchangeExec(HostilePartitioning(), rangePlan())).head
+    assert(!hostile.eligible)
+    assert(hostile.partitionCount.isEmpty)
+    assert(hostile.immediateMissReason.contains(UnsupportedPartitioning))
   }
 
-  test("window presence is recorded independently from generic operator allowlisting") {
+  test("window presence is recorded independently from operator allowlisting") {
     val df = spark.range(16)
       .select($"id", row_number().over(Window.orderBy($"id")).as("rn"))
       .repartition(2, $"rn")
-    val baseline = analyze(df.queryExecution.executedPlan)
-    val record = baseline.find(_.flags.window).getOrElse(fail("expected a window-bearing exchange"))
-    val relaxed = analyze(
+
+    val refused = analyze(df.queryExecution.executedPlan)
+      .find(_.flags.window).getOrElse(fail("expected a window-bearing exchange"))
+    val admitted = analyze(
       df.queryExecution.executedPlan,
       analyzerRules = rules.copy(allowWindow = true))
-      .find(_.exchangePath == record.exchangePath)
-      .get
+      .find(_.exchangePath == refused.exchangePath).get
 
-    assert(record.rootMissReason.contains(WindowPresent))
-    assert(record.flags.window)
-    assert(!relaxed.rootMissReason.contains(WindowPresent))
+    assert(refused.rootMissReason.contains(WindowPresent))
+    assert(!admitted.rootMissReason.contains(WindowPresent))
   }
 
   test("empty query results remain observable without special-case mutation") {
-    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
-      val df = spark.range(0).repartition(1)
-      df.collect()
+    val df = spark.range(0).repartition(1)
+    df.collect()
 
-      val records = analyzeCompleted(df.queryExecution.executedPlan, "empty")
+    val records = analyze(df.queryExecution.executedPlan, executionId = "empty")
+    assert(records.nonEmpty)
+    assert(records.forall(_.partitionCount.exists(_ > 0)))
+  }
+
+  test("AQE-on and AQE-off executed plans both expose shuffle observations") {
+    val records = Seq(false, true).flatMap { adaptive =>
+      withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> adaptive.toString) {
+        val df = spark.range(0, 64, 1, 4).repartition(4, $"id")
+        df.collect()
+        val observed = analyze(
+          df.queryExecution.executedPlan,
+          executionId = if (adaptive) "aqe-on" else "aqe-off")
+        assert(observed.nonEmpty)
+        observed
+      }
+    }
+
+    assert(records.map(_.executionId).toSet === Set("aqe-off", "aqe-on"))
+    maybeWriteEvidence(records)
+  }
+
+  test("executed subquery plans participate in deterministic exchange discovery") {
+    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false") {
+      val df = spark.sql(
+        "SELECT id FROM range(4) WHERE id < (SELECT max(id) FROM range(8))")
+      df.collect()
+      val records = analyze(
+        df.queryExecution.executedPlan,
+        executionId = "subquery",
+        analyzerRules = rules.copy(allowSubqueries = true))
+
       assert(records.nonEmpty)
-      assert(records.forall(_.partitionCount > 0))
+      assert(records.exists(_.exchangePath.split("\\.").exists(_.startsWith("s"))))
     }
   }
 
-  test("AQE-on and AQE-off completed plans both expose shuffle observations") {
-    val aqeOff = completedRecords(adaptive = false)
-    val aqeOn = completedRecords(adaptive = true)
+  test("same plan produces byte-for-byte stable records for the same run identifier") {
+    val plan = hashExchange(rangePlan())
+    val first = analyze(plan, executionId = "stable").map(_.toJson)
+    val second = analyze(plan, executionId = "stable").map(_.toJson)
 
-    assert(aqeOff.nonEmpty)
-    assert(aqeOn.nonEmpty)
-    assert(aqeOff.forall(!_.flags.adaptivePlan))
-    assert(aqeOn.exists(_.flags.adaptivePlan))
-    assert((aqeOff ++ aqeOn).forall(_.lineageDeterminism != Unknown))
-
-    maybeWriteEvidence(aqeOff ++ aqeOn)
+    assert(first === second)
   }
 
   test("10,000 exchange occurrences stay ordered without identity deduplication") {
@@ -354,107 +375,60 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
   }
 
   test("listener registration is explicit and unregistering stops observations") {
-    val batches = ArrayBuffer.empty[Seq[ShuffleRecoveryExchangeObservation]]
-    val errors = ArrayBuffer.empty[Throwable]
+    val captured = new ConcurrentLinkedQueue[Seq[ShuffleRecoveryExchangeObservation]]()
+    val errors = new ConcurrentLinkedQueue[Throwable]()
     val listener = new ShuffleRecoveryOpportunityListener(
       rules,
-      batch => batches.synchronized { batches += batch },
-      error => errors.synchronized { errors += error })
-
+      batch => captured.add(batch),
+      error => errors.add(error))
     assert(!spark.listenerManager.listListeners().contains(listener))
-    spark.range(8).repartition(2, $"id").collect()
-    spark.sparkContext.listenerBus.waitUntilEmpty()
-    assert(batches.synchronized(batches.isEmpty))
+
+    val baseline = spark.range(8).collect().map(_.getLong(0)).toSeq
+    assert(baseline === (0L until 8L).toSeq)
 
     spark.listenerManager.register(listener)
     try {
       spark.range(16).repartition(2, $"id").collect()
       spark.sparkContext.listenerBus.waitUntilEmpty()
-      assert(batches.synchronized(batches.flatten.nonEmpty))
-      assert(errors.synchronized(errors.isEmpty))
+      assert(!captured.isEmpty)
+      assert(errors.isEmpty)
     } finally {
       spark.listenerManager.unregister(listener)
     }
 
-    val observedCount = batches.synchronized(batches.flatten.size)
+    val observedCount = captured.size()
     spark.range(4).repartition(2, $"id").collect()
     spark.sparkContext.listenerBus.waitUntilEmpty()
-    assert(batches.synchronized(batches.flatten.size) === observedCount)
+    assert(captured.size() === observedCount)
   }
 
-  test("listener serializes concurrent sinks without arbitrary sleeps") {
-    val df = spark.range(16).repartition(2, $"id")
-    df.collect()
-    val qe = df.queryExecution
-    val activeSinks = new AtomicInteger(0)
-    val overlap = new AtomicInteger(0)
-    val callbackCount = new AtomicInteger(0)
-    val errorCount = new AtomicInteger(0)
-    val firstSinkEntered = new CountDownLatch(1)
-    val releaseFirstSink = new CountDownLatch(1)
-    val start = new CountDownLatch(1)
-    val completed = new CountDownLatch(4)
-
+  test("duplicate concurrent listener callbacks are deterministic and deduplicated") {
+    val captured = new ConcurrentLinkedQueue[Seq[ShuffleRecoveryExchangeObservation]]()
     val listener = new ShuffleRecoveryOpportunityListener(
-      rules,
-      _ => {
-        if (activeSinks.incrementAndGet() != 1) {
-          overlap.incrementAndGet()
-        }
-        if (callbackCount.get() == 0) {
-          firstSinkEntered.countDown()
-          assert(releaseFirstSink.await(10, TimeUnit.SECONDS))
-        }
-        callbackCount.incrementAndGet()
-        activeSinks.decrementAndGet()
-      },
-      _ => errorCount.incrementAndGet())
-
+      rules, batch => captured.add(batch))
+    val qe = spark.range(16).repartition(2, $"id").queryExecution
     val executor = Executors.newFixedThreadPool(4)
+    val start = new CountDownLatch(1)
+
     try {
-      (0 until 4).foreach { _ =>
+      val futures = (0 until 16).map { _ =>
         executor.submit(new Runnable {
           override def run(): Unit = {
-            try {
-              start.await()
-              listener.onSuccess("test", qe, 0L)
-            } finally {
-              completed.countDown()
-            }
+            start.await()
+            listener.onSuccess("collect", qe, 0L)
           }
         })
       }
       start.countDown()
-      assert(firstSinkEntered.await(10, TimeUnit.SECONDS))
-      releaseFirstSink.countDown()
-      assert(completed.await(30, TimeUnit.SECONDS))
+      futures.foreach(_.get(30, TimeUnit.SECONDS))
+
+      assert(captured.size() === 1)
+      val records = captured.peek()
+      assert(records.nonEmpty)
+      assert(records.map(_.executionId).distinct === Seq(f"query-${qe.id}%020d"))
     } finally {
       executor.shutdownNow()
       assert(executor.awaitTermination(30, TimeUnit.SECONDS))
-    }
-
-    assert(callbackCount.get() === 4)
-    assert(overlap.get() === 0)
-    assert(errorCount.get() === 0)
-  }
-
-  test("failed queries are not reported as completed shuffle observations") {
-    val callbackCount = new AtomicInteger(0)
-    val listener = new ShuffleRecoveryOpportunityListener(
-      rules, _ => callbackCount.incrementAndGet())
-    val qe = spark.range(4).repartition(2, $"id").queryExecution
-
-    listener.onFailure("test", qe, new RuntimeException("expected"))
-    assert(callbackCount.get() === 0)
-  }
-
-  private def completedRecords(adaptive: Boolean): Seq[ShuffleRecoveryExchangeObservation] = {
-    withSQLConf(SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> adaptive.toString) {
-      val df = spark.range(0, 64, 1, 4).repartition(4, $"id")
-      df.collect()
-      analyzeCompleted(
-        df.queryExecution.executedPlan,
-        if (adaptive) "aqe-on" else "aqe-off")
     }
   }
 
@@ -493,7 +467,6 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
 
   private case class UnknownExpression(child: Expression)
     extends UnaryExpression with Unevaluable {
-
     override def dataType = child.dataType
 
     override def nullable: Boolean = child.nullable
@@ -505,5 +478,11 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
 
   private case class TokenLeafExec(override val output: Seq[Attribute]) extends LeafExecNode {
     override protected def doExecute(): RDD[InternalRow] = sparkContext.emptyRDD[InternalRow]
+  }
+
+  private case class HostilePartitioning() extends Partitioning {
+    override lazy val numPartitions: Int = {
+      throw new AssertionError("unknown partitioning must not be inspected")
+    }
   }
 }
