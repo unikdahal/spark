@@ -18,12 +18,11 @@
 package org.apache.spark.sql.execution.exchange
 
 import java.util.IdentityHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
-import java.util.concurrent.atomic.AtomicLong
 
 import scala.collection.mutable
-import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
 
+import org.apache.spark.rdd.DeterministicLevel
 import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression}
 import org.apache.spark.sql.catalyst.plans.physical.{
   Partitioning, RangePartitioning, RoundRobinPartitioning}
@@ -31,88 +30,133 @@ import org.apache.spark.sql.execution.{ExecSubqueryExpression, QueryExecution, S
 import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, QueryStageExec}
 import org.apache.spark.sql.util.QueryExecutionListener
 
-/**
- * Stable miss reasons emitted by the shuffle recovery opportunity analyzer.
- */
+/** Stable machine-readable reasons emitted by the shuffle recovery opportunity analyzer. */
 private[sql] sealed trait ShuffleRecoveryMissReason {
   def code: String
+  def rootRank: Int
 }
 
 private[sql] object ShuffleRecoveryMissReason {
   case object NonDeterministic extends ShuffleRecoveryMissReason {
     override val code: String = "NON_DETERMINATE"
-  }
-  case object UnsupportedOperator extends ShuffleRecoveryMissReason {
-    override val code: String = "UNSUPPORTED_OPERATOR"
-  }
-  case object CustomOperator extends ShuffleRecoveryMissReason {
-    override val code: String = "CUSTOM_OPERATOR"
-  }
-  case object UnsupportedExpression extends ShuffleRecoveryMissReason {
-    override val code: String = "UNSUPPORTED_EXPRESSION"
-  }
-  case object UnsupportedPartitioning extends ShuffleRecoveryMissReason {
-    override val code: String = "UNSUPPORTED_PARTITIONING"
-  }
-  case object RangePartitioningPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "RANGE_PARTITIONING"
-  }
-  case object SourceTokenUnavailable extends ShuffleRecoveryMissReason {
-    override val code: String = "SOURCE_TOKEN_UNAVAILABLE"
-  }
-  case object DynamicPruningPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "DPP_PRESENT"
-  }
-  case object RuntimeFilterPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "RUNTIME_FILTER_PRESENT"
-  }
-  case object SubqueryPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "SUBQUERY_PRESENT"
-  }
-  case object WindowPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "WINDOW_PRESENT"
-  }
-  case object ExpandPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "EXPAND_PRESENT"
-  }
-  case object CacheScanPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "CACHE_SCAN_PRESENT"
-  }
-  case object AdaptivePartitionSpecPresent extends ShuffleRecoveryMissReason {
-    override val code: String = "ADAPTIVE_PARTITION_SPEC"
+    override val rootRank: Int = 0
   }
   case object PythonOrArrowPresent extends ShuffleRecoveryMissReason {
     override val code: String = "PYTHON_OR_ARROW"
+    override val rootRank: Int = 1
+  }
+  case object DynamicPruningPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "DPP_PRESENT"
+    override val rootRank: Int = 2
+  }
+  case object RuntimeFilterPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "RUNTIME_FILTER_PRESENT"
+    override val rootRank: Int = 3
+  }
+  case object SubqueryPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "SUBQUERY_PRESENT"
+    override val rootRank: Int = 4
+  }
+  case object SourceTokenUnavailable extends ShuffleRecoveryMissReason {
+    override val code: String = "SOURCE_TOKEN_UNAVAILABLE"
+    override val rootRank: Int = 5
+  }
+  case object WindowPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "WINDOW_PRESENT"
+    override val rootRank: Int = 6
+  }
+  case object ExpandPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "EXPAND_PRESENT"
+    override val rootRank: Int = 7
+  }
+  case object CacheScanPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "CACHE_SCAN_PRESENT"
+    override val rootRank: Int = 8
+  }
+  case object RangePartitioningPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "RANGE_PARTITIONING"
+    override val rootRank: Int = 9
+  }
+  case object AdaptivePartitionSpecPresent extends ShuffleRecoveryMissReason {
+    override val code: String = "ADAPTIVE_PARTITION_SPECS"
+    override val rootRank: Int = 10
   }
   case object UnsupportedShuffleMode extends ShuffleRecoveryMissReason {
     override val code: String = "UNSUPPORTED_SHUFFLE_MODE"
+    override val rootRank: Int = 11
   }
   case object IncompatibleRuntimeFlag extends ShuffleRecoveryMissReason {
     override val code: String = "INCOMPATIBLE_RUNTIME_FLAG"
+    override val rootRank: Int = 12
+  }
+  case object InvalidPartitionCount extends ShuffleRecoveryMissReason {
+    override val code: String = "INVALID_PARTITION_COUNT"
+    override val rootRank: Int = 13
+  }
+  case object UnsupportedPartitioning extends ShuffleRecoveryMissReason {
+    override val code: String = "UNSUPPORTED_PARTITIONING"
+    override val rootRank: Int = 14
+  }
+  case object UnsupportedExpression extends ShuffleRecoveryMissReason {
+    override val code: String = "UNSUPPORTED_EXPRESSION"
+    override val rootRank: Int = 15
+  }
+  case object CustomOperator extends ShuffleRecoveryMissReason {
+    override val code: String = "CUSTOM_OPERATOR"
+    override val rootRank: Int = 16
+  }
+  case object UnsupportedOperator extends ShuffleRecoveryMissReason {
+    override val code: String = "UNSUPPORTED_OPERATOR"
+    override val rootRank: Int = 17
   }
 }
 
 private[sql] sealed trait ShuffleRecoverySourceTokenAvailability {
   def code: String
+  def severity: Int
 }
 
 private[sql] object ShuffleRecoverySourceTokenAvailability {
   case object Exact extends ShuffleRecoverySourceTokenAvailability {
     override val code: String = "EXACT"
-  }
-  case object Unavailable extends ShuffleRecoverySourceTokenAvailability {
-    override val code: String = "UNAVAILABLE"
+    override val severity: Int = 0
   }
   case object PrototypeSpecialCased extends ShuffleRecoverySourceTokenAvailability {
     override val code: String = "PROTOTYPE_SPECIAL_CASED"
+    override val severity: Int = 1
+  }
+  case object Unavailable extends ShuffleRecoverySourceTokenAvailability {
+    override val code: String = "UNAVAILABLE"
+    override val severity: Int = 2
+  }
+}
+
+private[sql] sealed trait ShuffleRecoveryLineageDeterminism {
+  def code: String
+}
+
+private[sql] object ShuffleRecoveryLineageDeterminism {
+  case object Determinate extends ShuffleRecoveryLineageDeterminism {
+    override val code: String = "DETERMINATE"
+  }
+  case object Unordered extends ShuffleRecoveryLineageDeterminism {
+    override val code: String = "UNORDERED"
+  }
+  case object Indeterminate extends ShuffleRecoveryLineageDeterminism {
+    override val code: String = "INDETERMINATE"
+  }
+  case object Unknown extends ShuffleRecoveryLineageDeterminism {
+    override val code: String = "UNKNOWN"
   }
 }
 
 /**
  * Conservative, parameterized rules used only to measure recovery opportunity.
  *
- * Exact class-name allowlists are intentional. A new subclass cannot silently become eligible
- * through a package prefix, reflection fallback, or an inherited implementation.
+ * Exact class-name allowlists are intentional. New Spark or extension classes fail closed instead
+ * of inheriting eligibility through a package prefix or reflection-based fallback. Individual
+ * semantic families remain independently switchable so evidence runs can widen one assumption at
+ * a time without changing traversal or record generation.
  */
 private[sql] case class ShuffleRecoveryEligibilityRules(
     name: String,
@@ -122,6 +166,7 @@ private[sql] case class ShuffleRecoveryEligibilityRules(
     allowedPartitioningClassNames: Set[String],
     sourceTokenByOperatorClassName: Map[String, ShuffleRecoverySourceTokenAvailability],
     acceptedSourceTokenCategories: Set[ShuffleRecoverySourceTokenAvailability],
+    requireDeterminateLineage: Boolean = true,
     allowDynamicPruning: Boolean = false,
     allowRuntimeFilters: Boolean = false,
     allowSubqueries: Boolean = false,
@@ -129,7 +174,12 @@ private[sql] case class ShuffleRecoveryEligibilityRules(
     allowExpand: Boolean = false,
     allowCacheScan: Boolean = false,
     allowAdaptivePartitionSpecs: Boolean = false,
-    allowMultiPartitionRoundRobin: Boolean = false) {
+    allowPythonOrArrow: Boolean = false,
+    allowRangePartitioning: Boolean = false,
+    allowMultiPartitionRoundRobin: Boolean = false,
+    allowPipelinedShuffle: Boolean = false,
+    allowPushBasedShuffle: Boolean = false,
+    allowIncompatibleRuntimeFlags: Boolean = false) {
 
   require(name.nonEmpty, "rule-set name must be non-empty")
   require(version > 0, "rule-set version must be positive")
@@ -140,48 +190,71 @@ private[sql] object ShuffleRecoveryEligibilityRules {
 
   private val execution = "org.apache.spark.sql.execution."
   private val catalystExpressions = "org.apache.spark.sql.catalyst.expressions."
-  private val aggregateExpressions =
-    "org.apache.spark.sql.catalyst.expressions.aggregate."
+  private val aggregateExpressions = "org.apache.spark.sql.catalyst.expressions.aggregate."
 
   /**
-   * Feasibility-only baseline. It is deliberately smaller than any proposed production
-   * computation-identity contract and is expected to grow only through explicit evidence.
+   * Feasibility-only baseline. It is deliberately narrower than a production computation-identity
+   * contract and must not be treated as a stable API or a claim that every allowlisted class is
+   * intrinsically safe outside the complete rule set below.
    */
   val conservative: ShuffleRecoveryEligibilityRules = ShuffleRecoveryEligibilityRules(
     name = "conservative-v1",
     version = 1,
     allowedOperatorClassNames = Set(
+      execution + "CoalesceExec",
+      execution + "CollectLimitExec",
       execution + "ColumnarToRowExec",
+      execution + "ExpandExec",
       execution + "FilterExec",
+      execution + "GenerateExec",
+      execution + "GlobalLimitExec",
       execution + "InputAdapter",
+      execution + "LocalLimitExec",
       execution + "LocalTableScanExec",
       execution + "ProjectExec",
-      execution + "RDDScanExec",
       execution + "RangeExec",
+      execution + "SampleExec",
       execution + "SortExec",
+      execution + "TakeOrderedAndProjectExec",
+      execution + "UnionExec",
       execution + "WholeStageCodegenExec",
       execution + "aggregate.HashAggregateExec",
+      execution + "aggregate.ObjectHashAggregateExec",
       execution + "aggregate.SortAggregateExec",
       execution + "columnar.InMemoryTableScanExec",
       execution + "FileSourceScanExec",
       execution + "datasources.v2.BatchScanExec",
       execution + "exchange.BroadcastExchangeExec",
       execution + "exchange.ShuffleExchangeExec",
+      execution + "joins.BroadcastHashJoinExec",
+      execution + "joins.BroadcastNestedLoopJoinExec",
+      execution + "joins.CartesianProductExec",
+      execution + "joins.ShuffledHashJoinExec",
+      execution + "joins.SortMergeJoinExec",
+      execution + "python.AggregateInPandasExec",
+      execution + "python.ArrowEvalPythonExec",
+      execution + "python.BatchEvalPythonExec",
+      execution + "python.CoGroupMapInPandasExec",
+      execution + "python.FlatMapGroupsInPandasExec",
+      execution + "python.MapInPandasExec",
+      execution + "python.WindowInPandasExec",
       execution + "window.WindowExec",
-      execution + "window.WindowGroupLimitExec",
-      execution + "ExpandExec",
-      execution + "adaptive.AQEShuffleReadExec"),
+      execution + "window.WindowGroupLimitExec"),
     allowedExpressionClassNames = Set(
       catalystExpressions + "Add",
       catalystExpressions + "Alias",
       catalystExpressions + "And",
       catalystExpressions + "AttributeReference",
+      catalystExpressions + "BoundReference",
       catalystExpressions + "CaseWhen",
       catalystExpressions + "Cast",
       catalystExpressions + "Coalesce",
+      catalystExpressions + "Concat",
+      catalystExpressions + "ConcatWs",
+      catalystExpressions + "Contains",
       catalystExpressions + "Divide",
       catalystExpressions + "DynamicPruningExpression",
-      catalystExpressions + "BloomFilterMightContain",
+      catalystExpressions + "EndsWith",
       catalystExpressions + "EqualNullSafe",
       catalystExpressions + "EqualTo",
       catalystExpressions + "GreaterThan",
@@ -191,18 +264,27 @@ private[sql] object ShuffleRecoveryEligibilityRules {
       catalystExpressions + "InSet",
       catalystExpressions + "IsNotNull",
       catalystExpressions + "IsNull",
+      catalystExpressions + "KnownNotNull",
+      catalystExpressions + "Length",
       catalystExpressions + "LessThan",
       catalystExpressions + "LessThanOrEqual",
+      catalystExpressions + "Like",
       catalystExpressions + "Literal",
+      catalystExpressions + "Lower",
       catalystExpressions + "Multiply",
+      catalystExpressions + "Murmur3Hash",
       catalystExpressions + "Not",
       catalystExpressions + "Or",
       catalystExpressions + "Pmod",
+      catalystExpressions + "PythonUDF",
+      catalystExpressions + "RLike",
       catalystExpressions + "Remainder",
       catalystExpressions + "SortOrder",
+      catalystExpressions + "StartsWith",
+      catalystExpressions + "Substring",
       catalystExpressions + "Subtract",
       catalystExpressions + "UnaryMinus",
-      catalystExpressions + "Murmur3Hash",
+      catalystExpressions + "Upper",
       aggregateExpressions + "AggregateExpression",
       aggregateExpressions + "Average",
       aggregateExpressions + "Count",
@@ -210,9 +292,13 @@ private[sql] object ShuffleRecoveryEligibilityRules {
       aggregateExpressions + "Last",
       aggregateExpressions + "Max",
       aggregateExpressions + "Min",
-      aggregateExpressions + "Sum"),
+      aggregateExpressions + "Sum",
+      execution + "InSubqueryExec",
+      execution + "ScalarSubquery"),
     allowedPartitioningClassNames = Set(
       "org.apache.spark.sql.catalyst.plans.physical.HashPartitioning",
+      "org.apache.spark.sql.catalyst.plans.physical.NullAwareHashPartitioning",
+      "org.apache.spark.sql.catalyst.plans.physical.RangePartitioning",
       "org.apache.spark.sql.catalyst.plans.physical.RoundRobinPartitioning",
       "org.apache.spark.sql.catalyst.plans.physical.SinglePartition$"),
     sourceTokenByOperatorClassName = Map(
@@ -222,7 +308,9 @@ private[sql] object ShuffleRecoveryEligibilityRules {
 
 private[sql] case class ShuffleRecoveryRuntimeState(
     pushBasedShuffleEnabled: Boolean = false,
-    incompatibleFlags: Seq[String] = Nil)
+    incompatibleFlags: Seq[String] = Nil,
+    lineageByExchangePath: Map[String, ShuffleRecoveryLineageDeterminism] = Map.empty,
+    mapperCountByExchangePath: Map[String, Int] = Map.empty)
 
 private[sql] case class ShuffleRecoveryObservationFlags(
     dynamicPruning: Boolean = false,
@@ -233,7 +321,8 @@ private[sql] case class ShuffleRecoveryObservationFlags(
     cacheScan: Boolean = false,
     adaptivePartitionSpecs: Boolean = false,
     pythonOrArrow: Boolean = false,
-    reusedExchange: Boolean = false) {
+    reusedExchange: Boolean = false,
+    adaptivePlan: Boolean = false) {
 
   def merge(other: ShuffleRecoveryObservationFlags): ShuffleRecoveryObservationFlags = {
     ShuffleRecoveryObservationFlags(
@@ -245,7 +334,8 @@ private[sql] case class ShuffleRecoveryObservationFlags(
       cacheScan = cacheScan || other.cacheScan,
       adaptivePartitionSpecs = adaptivePartitionSpecs || other.adaptivePartitionSpecs,
       pythonOrArrow = pythonOrArrow || other.pythonOrArrow,
-      reusedExchange = reusedExchange || other.reusedExchange)
+      reusedExchange = reusedExchange || other.reusedExchange,
+      adaptivePlan = adaptivePlan || other.adaptivePlan)
   }
 }
 
@@ -262,6 +352,7 @@ private[sql] case class ShuffleRecoveryExchangeObservation(
     immediateMissReason: Option[ShuffleRecoveryMissReason],
     rootMissReason: Option[ShuffleRecoveryMissReason],
     sourceTokenAvailability: ShuffleRecoverySourceTokenAvailability,
+    lineageDeterminism: ShuffleRecoveryLineageDeterminism,
     flags: ShuffleRecoveryObservationFlags,
     pipelinedShuffle: Boolean,
     pushBasedShuffleEnabled: Boolean,
@@ -284,6 +375,7 @@ private[sql] case class ShuffleRecoveryExchangeObservation(
       "immediateMissReason" -> optionalReason(immediateMissReason),
       "rootMissReason" -> optionalReason(rootMissReason),
       "sourceTokenAvailability" -> jsonString(sourceTokenAvailability.code),
+      "lineageDeterminism" -> jsonString(lineageDeterminism.code),
       "dppPresent" -> flags.dynamicPruning.toString,
       "runtimeFilterPresent" -> flags.runtimeFilter.toString,
       "subqueryPresent" -> flags.subquery.toString,
@@ -293,6 +385,7 @@ private[sql] case class ShuffleRecoveryExchangeObservation(
       "adaptivePartitionSpecsPresent" -> flags.adaptivePartitionSpecs.toString,
       "pythonOrArrowPresent" -> flags.pythonOrArrow.toString,
       "reusedExchange" -> flags.reusedExchange.toString,
+      "adaptivePlan" -> flags.adaptivePlan.toString,
       "pipelinedShuffle" -> pipelinedShuffle.toString,
       "pushBasedShuffleEnabled" -> pushBasedShuffleEnabled.toString,
       "incompatibleRuntimeFlags" -> jsonStringArray(incompatibleRuntimeFlags),
@@ -310,7 +403,7 @@ private[sql] case class ShuffleRecoveryExchangeObservation(
   private def optionalInt(value: Option[Int]): String = value.map(_.toString).getOrElse("null")
 
   private def jsonStringArray(values: Seq[String]): String = {
-    values.sorted.iterator.map(jsonString).mkString("[", ",", "]")
+    values.distinct.sorted.iterator.map(jsonString).mkString("[", ",", "]")
   }
 
   private def jsonString(value: String): String = {
@@ -324,8 +417,7 @@ private[sql] case class ShuffleRecoveryExchangeObservation(
       case '\n' => builder.append("\\n")
       case '\r' => builder.append("\\r")
       case '\t' => builder.append("\\t")
-      case c if c < ' ' =>
-        builder.append(f"\\u${c.toInt}%04x")
+      case c if c < ' ' => builder.append(f"\\u${c.toInt}%04x")
       case c => builder.append(c)
     }
     builder.append('"')
@@ -334,8 +426,33 @@ private[sql] case class ShuffleRecoveryExchangeObservation(
 }
 
 private[sql] object ShuffleRecoveryOpportunityAnalyzer {
+  import ShuffleRecoveryLineageDeterminism._
   import ShuffleRecoveryMissReason._
   import ShuffleRecoverySourceTokenAvailability._
+
+  private case class ReasonSummary(
+      immediate: Option[ShuffleRecoveryMissReason],
+      root: Option[ShuffleRecoveryMissReason])
+
+  private object ReasonSummary {
+    val Empty: ReasonSummary = ReasonSummary(None, None)
+
+    def from(reasons: Seq[ShuffleRecoveryMissReason]): ReasonSummary = {
+      ReasonSummary(reasons.headOption, rootReason(reasons))
+    }
+
+    def combine(summaries: Seq[ReasonSummary]): ReasonSummary = {
+      ReasonSummary(
+        summaries.iterator.flatMap(_.immediate).take(1).toSeq.headOption,
+        rootReason(summaries.iterator.flatMap(_.root).toSeq))
+    }
+
+    private def rootReason(
+        reasons: Seq[ShuffleRecoveryMissReason]): Option[ShuffleRecoveryMissReason] = {
+      reasons.zipWithIndex.sortBy { case (reason, index) => (reason.rootRank, index) }
+        .headOption.map(_._1)
+    }
+  }
 
   private case class SourceSummary(
       hasSource: Boolean = false,
@@ -346,8 +463,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       SourceSummary(
         hasSource = hasSource || other.hasSource,
         hasUnavailable = hasUnavailable || other.hasUnavailable,
-        hasPrototypeSpecialCase =
-          hasPrototypeSpecialCase || other.hasPrototypeSpecialCase)
+        hasPrototypeSpecialCase = hasPrototypeSpecialCase || other.hasPrototypeSpecialCase)
     }
 
     def category: ShuffleRecoverySourceTokenAvailability = {
@@ -362,19 +478,31 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
   }
 
   private case class PlanSummary(
-      immediateReason: Option[ShuffleRecoveryMissReason],
-      rootReason: Option[ShuffleRecoveryMissReason],
+      reasons: ReasonSummary,
       flags: ShuffleRecoveryObservationFlags,
       sources: SourceSummary)
 
   private case class ExpressionSummary(
-      reason: Option[ShuffleRecoveryMissReason],
+      reasons: ReasonSummary,
       flags: ShuffleRecoveryObservationFlags)
 
+  private case class TraversalFrame(
+      plan: SparkPlan,
+      pathReversed: List[Int],
+      ancestorFlags: ShuffleRecoveryObservationFlags)
+
+  private case class ExchangeOccurrence(
+      exchange: ShuffleExchangeExec,
+      path: String,
+      ancestorFlags: ShuffleRecoveryObservationFlags)
+
   private val pythonOrArrowPlanClassNames = Set(
+    "org.apache.spark.sql.execution.python.AggregateInPandasExec",
     "org.apache.spark.sql.execution.python.ArrowEvalPythonExec",
     "org.apache.spark.sql.execution.python.BatchEvalPythonExec",
-    "org.apache.spark.sql.execution.python.MapInBatchExec",
+    "org.apache.spark.sql.execution.python.CoGroupMapInPandasExec",
+    "org.apache.spark.sql.execution.python.FlatMapGroupsInPandasExec",
+    "org.apache.spark.sql.execution.python.MapInPandasExec",
     "org.apache.spark.sql.execution.python.WindowInPandasExec")
 
   private val pythonOrArrowExpressionClassNames = Set(
@@ -407,84 +535,103 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     require(executionId != null && executionId.nonEmpty, "execution id must be non-empty")
 
     val summaries = buildSummaries(plan, rules, runtimeState)
-    val records = mutable.ArrayBuffer.empty[ShuffleRecoveryExchangeObservation]
-    val stack = mutable.ArrayBuffer(
-      (plan, List.empty[Int], ShuffleRecoveryObservationFlags()))
-    var ordinal = 0L
+    exchangeOccurrences(plan).zipWithIndex.map { case (occurrence, ordinal) =>
+      classifyExchange(
+        occurrence,
+        executionId,
+        ordinal.toLong,
+        rules,
+        runtimeState,
+        summaries)
+    }
+  }
 
-    while (stack.nonEmpty) {
-      val (current, pathReversed, ancestorFlags) = stack.remove(stack.length - 1)
-      current match {
-        case exchange: ShuffleExchangeExec =>
-          records += classifyExchange(
-            exchange,
-            executionId,
-            ordinal,
-            pathReversed,
-            ancestorFlags,
-            rules,
-            runtimeState,
-            summaries)
-          ordinal += 1L
-        case _ =>
+  /**
+   * Adds only already-materialized, driver-local shuffle facts to a runtime observation.
+   *
+   * A successful ShuffleExchangeExec has already constructed its shuffle dependency through
+   * SparkPlan's cached execution path. Reading that dependency here does not submit a job or perform
+   * provider, filesystem, or network I/O. Any unexpected state is represented as UNKNOWN and fails
+   * closed instead of making the query-listener callback fail.
+   */
+  private[sql] def withCompletedExchangeRuntime(
+      plan: SparkPlan,
+      base: ShuffleRecoveryRuntimeState): ShuffleRecoveryRuntimeState = {
+    val lineages = mutable.HashMap.empty[String, ShuffleRecoveryLineageDeterminism]
+    val mapperCounts = mutable.HashMap.empty[String, Int]
+
+    exchangeOccurrences(plan).foreach { occurrence =>
+      val lineage = try {
+        occurrence.exchange.shuffleDependency.rdd.outputDeterministicLevel match {
+          case DeterministicLevel.DETERMINATE => Determinate
+          case DeterministicLevel.UNORDERED => Unordered
+          case DeterministicLevel.INDETERMINATE => Indeterminate
+        }
+      } catch {
+        case NonFatal(_) => Unknown
       }
+      lineages.put(occurrence.path, lineage)
 
-      val inheritedFlags = ancestorFlags.merge(ancestorObservationFlags(current))
-      val children = effectiveChildren(current)
-      var index = children.length - 1
-      while (index >= 0) {
-        stack += ((children(index), index :: pathReversed, inheritedFlags))
-        index -= 1
+      try {
+        val count = occurrence.exchange.numMappers
+        if (count >= 0) {
+          mapperCounts.put(occurrence.path, count)
+        }
+      } catch {
+        case NonFatal(_) =>
       }
     }
 
-    records.toSeq
+    base.copy(
+      lineageByExchangePath = lineages.toMap,
+      mapperCountByExchangePath = mapperCounts.toMap)
   }
 
   private def classifyExchange(
-      exchange: ShuffleExchangeExec,
+      occurrence: ExchangeOccurrence,
       executionId: String,
       ordinal: Long,
-      pathReversed: List[Int],
-      ancestorFlags: ShuffleRecoveryObservationFlags,
       rules: ShuffleRecoveryEligibilityRules,
       runtimeState: ShuffleRecoveryRuntimeState,
       summaries: IdentityHashMap[SparkPlan, PlanSummary])
       : ShuffleRecoveryExchangeObservation = {
+    val exchange = occurrence.exchange
     val childSummary = summaries.get(exchange.child)
     val partitioning = exchange.outputPartitioning
-    val partitioningClass = partitioning.getClass.getName
     val partitionExpressionSummary = summarizePartitioningExpressions(partitioning, rules)
-    val exchangeReason = exchangeLocalReason(
+    val lineage = runtimeState.lineageByExchangePath.getOrElse(occurrence.path, Unknown)
+    val localReasons = exchangeLocalReasons(
       exchange,
-      ancestorFlags.adaptivePartitionSpecs,
+      occurrence.ancestorFlags.adaptivePartitionSpecs,
+      lineage,
+      enforceLineage = true,
       rules,
       runtimeState,
-      partitionExpressionSummary.reason)
-
-    val immediateReason = exchangeReason.orElse(childSummary.immediateReason)
-    val rootReason = exchangeReason.orElse(childSummary.rootReason)
+      partitionExpressionSummary.reasons)
+    val reasons = ReasonSummary.combine(Seq(localReasons, childSummary.reasons))
     val flags = childSummary.flags
       .merge(partitionExpressionSummary.flags)
-      .merge(ancestorFlags)
+      .merge(occurrence.ancestorFlags)
 
     ShuffleRecoveryExchangeObservation(
       executionId = executionId,
       exchangeOrdinal = ordinal,
-      exchangePath = pathReversed.reverseIterator.mkString("."),
+      exchangePath = occurrence.path,
       childOperatorClass = exchange.child.getClass.getName,
-      partitioningClass = partitioningClass,
+      partitioningClass = partitioning.getClass.getName,
       partitionCount = partitioning.numPartitions,
       ruleSetName = rules.name,
       ruleSetVersion = rules.version,
-      eligible = immediateReason.isEmpty,
-      immediateMissReason = immediateReason,
-      rootMissReason = rootReason,
+      eligible = reasons.immediate.isEmpty,
+      immediateMissReason = reasons.immediate,
+      rootMissReason = reasons.root,
       sourceTokenAvailability = childSummary.sources.category,
+      lineageDeterminism = lineage,
       flags = flags,
       pipelinedShuffle = exchange.pipelined,
       pushBasedShuffleEnabled = runtimeState.pushBasedShuffleEnabled,
-      incompatibleRuntimeFlags = runtimeState.incompatibleFlags.distinct.sorted)
+      incompatibleRuntimeFlags = runtimeState.incompatibleFlags.distinct.sorted,
+      mapperCount = runtimeState.mapperCountByExchangePath.get(occurrence.path))
   }
 
   private def buildSummaries(
@@ -499,8 +646,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       val (plan, expanded) = stack.remove(stack.length - 1)
       if (expanded) {
         if (!summaries.containsKey(plan)) {
-          val children = effectiveChildren(plan)
-          val childSummaries = children.map(summaries.get)
+          val childSummaries = effectiveChildren(plan).map(summaries.get)
           summaries.put(plan, summarizePlan(plan, childSummaries, rules, runtimeState))
           states.put(plan, 2.toByte)
         }
@@ -532,7 +678,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       case exchange: ShuffleExchangeExec =>
         summarizePartitioningExpressions(exchange.outputPartitioning, rules)
       case _ if isStructuralWrapper(plan) =>
-        ExpressionSummary(None, ShuffleRecoveryObservationFlags())
+        ExpressionSummary(ReasonSummary.Empty, ShuffleRecoveryObservationFlags())
       case _ =>
         summarizeExpressions(plan.expressions, rules)
     }
@@ -547,106 +693,110 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       }
     }
 
-    val semanticReason = plan match {
+    val localReasons = plan match {
       case exchange: ShuffleExchangeExec =>
-        exchangeLocalReason(
+        exchangeLocalReasons(
           exchange,
           adaptivePartitionSpecsPresent = false,
+          Unknown,
+          enforceLineage = false,
           rules,
           runtimeState,
-          expressionSummary.reason)
-      case _ if isStructuralWrapper(plan) =>
-        None
-      case _ =>
-        planReason(plan, rules).orElse(expressionSummary.reason)
+          expressionSummary.reasons)
+      case _ if isStructuralWrapper(plan) => ReasonSummary.Empty
+      case _ => ReasonSummary.from(planReasons(plan, rules))
     }
-    val sourceReason =
+    val sourceReasons =
       if (!isStructuralWrapper(plan) && children.isEmpty &&
           !rules.acceptedSourceTokenCategories.contains(sources.category)) {
-        Some(SourceTokenUnavailable)
+        ReasonSummary.from(Seq(SourceTokenUnavailable))
       } else {
-        None
+        ReasonSummary.Empty
       }
+    val childReasons = childSummaries.map(_.reasons)
+    val reasons = ReasonSummary.combine(
+      Seq(localReasons, expressionSummary.reasons, sourceReasons) ++ childReasons)
 
-    val childImmediate = childSummaries.iterator.flatMap(_.immediateReason).take(1).toSeq.headOption
-    val childRoot = childSummaries.iterator.flatMap(_.rootReason).take(1).toSeq.headOption
-    val immediate = semanticReason.orElse(sourceReason).orElse(childImmediate)
-    val root = semanticReason match {
-      case Some(UnsupportedOperator) | Some(CustomOperator) | Some(UnsupportedExpression) =>
-        sourceReason.orElse(childRoot).orElse(semanticReason)
-      case Some(_) => semanticReason
-      case None => sourceReason.orElse(childRoot)
-    }
-
-    PlanSummary(immediate, root, flags, sources)
+    PlanSummary(reasons, flags, sources)
   }
 
   private def summarizePartitioningExpressions(
       partitioning: Partitioning,
-      rules: ShuffleRecoveryEligibilityRules): ExpressionSummary = {
-    partitioning match {
-      case expression: Expression =>
-        summarizeExpressions(expression.children, rules)
-      case _ =>
-        ExpressionSummary(None, ShuffleRecoveryObservationFlags())
-    }
+      rules: ShuffleRecoveryEligibilityRules): ExpressionSummary = partitioning match {
+    case expression: Expression => summarizeExpressions(expression.children, rules)
+    case _ => ExpressionSummary(ReasonSummary.Empty, ShuffleRecoveryObservationFlags())
   }
 
-  private def exchangeLocalReason(
+  private def exchangeLocalReasons(
       exchange: ShuffleExchangeExec,
       adaptivePartitionSpecsPresent: Boolean,
+      lineage: ShuffleRecoveryLineageDeterminism,
+      enforceLineage: Boolean,
       rules: ShuffleRecoveryEligibilityRules,
       runtimeState: ShuffleRecoveryRuntimeState,
-      partitionExpressionReason: Option[ShuffleRecoveryMissReason])
-      : Option[ShuffleRecoveryMissReason] = {
+      partitionExpressionReasons: ReasonSummary): ReasonSummary = {
     val partitioning = exchange.outputPartitioning
-    if (exchange.pipelined || runtimeState.pushBasedShuffleEnabled) {
-      Some(UnsupportedShuffleMode)
-    } else if (runtimeState.incompatibleFlags.nonEmpty) {
-      Some(IncompatibleRuntimeFlag)
-    } else if (partitioning.isInstanceOf[RoundRobinPartitioning] &&
-        partitioning.numPartitions > 1 && !rules.allowMultiPartitionRoundRobin) {
-      // Spark's multi-partition round-robin path can become order-sensitive when its input order
-      // is not stable. The plan-only analyzer cannot safely materialize RDDs merely to prove
-      // DeterministicLevel, so the conservative rule set refuses this shape.
-      Some(NonDeterministic)
-    } else if (partitioning.isInstanceOf[RangePartitioning]) {
-      Some(RangePartitioningPresent)
-    } else if (partitioning.numPartitions <= 0) {
-      Some(UnsupportedPartitioning)
-    } else if (adaptivePartitionSpecsPresent && !rules.allowAdaptivePartitionSpecs) {
-      Some(AdaptivePartitionSpecPresent)
-    } else if (!rules.allowedPartitioningClassNames.contains(partitioning.getClass.getName)) {
-      Some(UnsupportedPartitioning)
-    } else {
-      partitionExpressionReason
+    val reasons = mutable.ArrayBuffer.empty[ShuffleRecoveryMissReason]
+
+    if ((exchange.pipelined && !rules.allowPipelinedShuffle) ||
+        (runtimeState.pushBasedShuffleEnabled && !rules.allowPushBasedShuffle)) {
+      reasons += UnsupportedShuffleMode
     }
+    if (runtimeState.incompatibleFlags.nonEmpty && !rules.allowIncompatibleRuntimeFlags) {
+      reasons += IncompatibleRuntimeFlag
+    }
+    if (enforceLineage && rules.requireDeterminateLineage && lineage != Determinate) {
+      reasons += NonDeterministic
+    }
+    if (partitioning.isInstanceOf[RoundRobinPartitioning] &&
+        partitioning.numPartitions > 1 && !rules.allowMultiPartitionRoundRobin) {
+      reasons += NonDeterministic
+    }
+    if (partitioning.isInstanceOf[RangePartitioning] && !rules.allowRangePartitioning) {
+      reasons += RangePartitioningPresent
+    }
+    if (partitioning.numPartitions <= 0) {
+      reasons += InvalidPartitionCount
+    }
+    if (adaptivePartitionSpecsPresent && !rules.allowAdaptivePartitionSpecs) {
+      reasons += AdaptivePartitionSpecPresent
+    }
+    if (!rules.allowedPartitioningClassNames.contains(partitioning.getClass.getName)) {
+      reasons += UnsupportedPartitioning
+    }
+
+    ReasonSummary.combine(Seq(ReasonSummary.from(reasons.toSeq), partitionExpressionReasons))
   }
 
-  private def planReason(
+  private def planReasons(
       plan: SparkPlan,
-      rules: ShuffleRecoveryEligibilityRules): Option[ShuffleRecoveryMissReason] = {
+      rules: ShuffleRecoveryEligibilityRules): Seq[ShuffleRecoveryMissReason] = {
     val className = plan.getClass.getName
-    if (pythonOrArrowPlanClassNames.contains(className)) {
-      Some(PythonOrArrowPresent)
-    } else if (windowPlanClassNames.contains(className) && !rules.allowWindow) {
-      Some(WindowPresent)
-    } else if (expandPlanClassNames.contains(className) && !rules.allowExpand) {
-      Some(ExpandPresent)
-    } else if (cacheScanPlanClassNames.contains(className) && !rules.allowCacheScan) {
-      Some(CacheScanPresent)
-    } else if (adaptiveReadPlanClassNames.contains(className) &&
-        !rules.allowAdaptivePartitionSpecs) {
-      Some(AdaptivePartitionSpecPresent)
-    } else if (!rules.allowedOperatorClassNames.contains(className)) {
-      if (className.startsWith("org.apache.spark.sql.execution.")) {
-        Some(UnsupportedOperator)
-      } else {
-        Some(CustomOperator)
-      }
-    } else {
-      None
+    val reasons = mutable.ArrayBuffer.empty[ShuffleRecoveryMissReason]
+
+    if (pythonOrArrowPlanClassNames.contains(className) && !rules.allowPythonOrArrow) {
+      reasons += PythonOrArrowPresent
     }
+    if (windowPlanClassNames.contains(className) && !rules.allowWindow) {
+      reasons += WindowPresent
+    }
+    if (expandPlanClassNames.contains(className) && !rules.allowExpand) {
+      reasons += ExpandPresent
+    }
+    if (cacheScanPlanClassNames.contains(className) && !rules.allowCacheScan) {
+      reasons += CacheScanPresent
+    }
+    if (adaptiveReadPlanClassNames.contains(className) && !rules.allowAdaptivePartitionSpecs) {
+      reasons += AdaptivePartitionSpecPresent
+    }
+    if (!rules.allowedOperatorClassNames.contains(className)) {
+      if (className.startsWith("org.apache.spark.sql.execution.")) {
+        reasons += UnsupportedOperator
+      } else {
+        reasons += CustomOperator
+      }
+    }
+    reasons.toSeq
   }
 
   private def summarizeExpressions(
@@ -654,7 +804,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       rules: ShuffleRecoveryEligibilityRules): ExpressionSummary = {
     val stack = mutable.ArrayBuffer.empty[Expression]
     roots.reverseIterator.foreach(stack += _)
-    var reason: Option[ShuffleRecoveryMissReason] = None
+    val reasons = mutable.ArrayBuffer.empty[ShuffleRecoveryMissReason]
     var flags = ShuffleRecoveryObservationFlags()
 
     while (stack.nonEmpty) {
@@ -671,41 +821,39 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
         subquery = isSubquery,
         pythonOrArrow = isPythonOrArrow))
 
-      if (reason.isEmpty) {
-        reason =
-          if (!expression.deterministic) {
-            Some(NonDeterministic)
-          } else if (isPythonOrArrow) {
-            Some(PythonOrArrowPresent)
-          } else if (isDpp && !rules.allowDynamicPruning) {
-            Some(DynamicPruningPresent)
-          } else if (isRuntimeFilter && !rules.allowRuntimeFilters) {
-            Some(RuntimeFilterPresent)
-          } else if (isSubquery && !rules.allowSubqueries) {
-            Some(SubqueryPresent)
-          } else if (!rules.allowedExpressionClassNames.contains(className)) {
-            Some(UnsupportedExpression)
-          } else {
-            None
-          }
+      if (!expression.deterministic) {
+        reasons += NonDeterministic
+      }
+      if (isPythonOrArrow && !rules.allowPythonOrArrow) {
+        reasons += PythonOrArrowPresent
+      }
+      if (isDpp && !rules.allowDynamicPruning) {
+        reasons += DynamicPruningPresent
+      }
+      if (isRuntimeFilter && !rules.allowRuntimeFilters) {
+        reasons += RuntimeFilterPresent
+      }
+      if (isSubquery && !rules.allowSubqueries) {
+        reasons += SubqueryPresent
+      }
+      if (!rules.allowedExpressionClassNames.contains(className)) {
+        reasons += UnsupportedExpression
       }
 
       expression.children.reverseIterator.foreach(stack += _)
     }
 
-    ExpressionSummary(reason, flags)
+    ExpressionSummary(ReasonSummary.from(reasons.toSeq), flags)
   }
 
   private def sourceSummary(
       plan: SparkPlan,
       rules: ShuffleRecoveryEligibilityRules): SourceSummary = {
     rules.sourceTokenByOperatorClassName.get(plan.getClass.getName) match {
-      case Some(Exact) =>
-        SourceSummary(hasSource = true)
+      case Some(Exact) => SourceSummary(hasSource = true)
       case Some(PrototypeSpecialCased) =>
         SourceSummary(hasSource = true, hasPrototypeSpecialCase = true)
-      case Some(Unavailable) | None =>
-        SourceSummary(hasSource = true, hasUnavailable = true)
+      case Some(Unavailable) | None => SourceSummary(hasSource = true, hasUnavailable = true)
     }
   }
 
@@ -717,15 +865,47 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       cacheScan = cacheScanPlanClassNames.contains(className),
       adaptivePartitionSpecs = adaptiveReadPlanClassNames.contains(className),
       pythonOrArrow = pythonOrArrowPlanClassNames.contains(className),
-      reusedExchange = plan.isInstanceOf[ReusedExchangeExec])
+      reusedExchange = plan.isInstanceOf[ReusedExchangeExec],
+      adaptivePlan = plan.isInstanceOf[AdaptiveSparkPlanExec])
   }
 
-  private def ancestorObservationFlags(
-      plan: SparkPlan): ShuffleRecoveryObservationFlags = {
+  private def ancestorObservationFlags(plan: SparkPlan): ShuffleRecoveryObservationFlags = {
     val className = plan.getClass.getName
     ShuffleRecoveryObservationFlags(
       adaptivePartitionSpecs = adaptiveReadPlanClassNames.contains(className),
-      reusedExchange = plan.isInstanceOf[ReusedExchangeExec])
+      reusedExchange = plan.isInstanceOf[ReusedExchangeExec],
+      adaptivePlan = plan.isInstanceOf[AdaptiveSparkPlanExec])
+  }
+
+  private def exchangeOccurrences(plan: SparkPlan): Seq[ExchangeOccurrence] = {
+    val result = mutable.ArrayBuffer.empty[ExchangeOccurrence]
+    val stack = mutable.ArrayBuffer(
+      TraversalFrame(plan, Nil, ShuffleRecoveryObservationFlags()))
+
+    while (stack.nonEmpty) {
+      val frame = stack.remove(stack.length - 1)
+      frame.plan match {
+        case exchange: ShuffleExchangeExec =>
+          result += ExchangeOccurrence(
+            exchange,
+            pathString(frame.pathReversed),
+            frame.ancestorFlags)
+        case _ =>
+      }
+
+      val inheritedFlags = frame.ancestorFlags.merge(ancestorObservationFlags(frame.plan))
+      val children = effectiveChildren(frame.plan)
+      var index = children.length - 1
+      while (index >= 0) {
+        stack += TraversalFrame(children(index), index :: frame.pathReversed, inheritedFlags)
+        index -= 1
+      }
+    }
+    result.toSeq
+  }
+
+  private def pathString(pathReversed: List[Int]): String = {
+    if (pathReversed.isEmpty) "root" else pathReversed.reverseIterator.mkString(".")
   }
 
   private def effectiveChildren(plan: SparkPlan): Seq[SparkPlan] = plan match {
@@ -742,40 +922,48 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
 }
 
 /**
- * Thread-safe observation listener. It performs no filesystem, provider, scheduler, or tracker
- * mutation; callers explicitly register and unregister it with the session listener manager.
+ * Explicit, thread-safe adapter for evidence runs.
+ *
+ * Registration is never automatic, so an analyzer that is not installed has no query-path cost.
+ * Successful-query callbacks read only already-materialized driver-local shuffle state. Sink
+ * failures are reported to the optional error callback and never change query semantics.
  */
 private[sql] final class ShuffleRecoveryOpportunityListener(
-    rules: ShuffleRecoveryEligibilityRules)
+    rules: ShuffleRecoveryEligibilityRules,
+    onRecords: Seq[ShuffleRecoveryExchangeObservation] => Unit,
+    onError: Throwable => Unit = _ => ())
   extends QueryExecutionListener {
 
-  private val nextExecutionId = new AtomicLong(0L)
-  private val observations =
-    new ConcurrentLinkedQueue[ShuffleRecoveryExchangeObservation]()
+  private val callbackLock = new Object
 
   override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = {
-    observe(qe)
+    try {
+      val sparkConf = qe.sparkSession.sparkContext.getConf
+      val shuffleManager = sparkConf.get("spark.shuffle.manager", "sort")
+      val baseRuntime = ShuffleRecoveryRuntimeState(
+        pushBasedShuffleEnabled = sparkConf.getBoolean("spark.shuffle.push.enabled", false),
+        incompatibleFlags = if (shuffleManager == "sort") Nil else Seq("CUSTOM_SHUFFLE_MANAGER"))
+      val runtimeState = ShuffleRecoveryOpportunityAnalyzer.withCompletedExchangeRuntime(
+        qe.executedPlan, baseRuntime)
+      val records = ShuffleRecoveryOpportunityAnalyzer.analyze(
+        qe.executedPlan, qe.queryId.toString, rules, runtimeState)
+      callbackLock.synchronized {
+        onRecords(records)
+      }
+    } catch {
+      case NonFatal(e) => reportError(e)
+    }
   }
 
-  override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {
-    observe(qe)
-  }
+  override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {}
 
-  def snapshot(): Seq[ShuffleRecoveryExchangeObservation] = {
-    observations.iterator().asScala.toSeq.sortBy(record =>
-      (record.executionId, record.exchangeOrdinal))
-  }
-
-  def clear(): Unit = observations.clear()
-
-  private def observe(qe: QueryExecution): Unit = {
-    val sequence = nextExecutionId.getAndIncrement()
-    val executionId = f"query-$sequence%020d"
-    val sparkConf = qe.sparkSession.sparkContext.getConf
-    val runtimeState = ShuffleRecoveryRuntimeState(
-      pushBasedShuffleEnabled = sparkConf.getBoolean("spark.shuffle.push.enabled", false))
-    ShuffleRecoveryOpportunityAnalyzer
-      .analyze(qe.executedPlan, executionId, rules, runtimeState)
-      .foreach(observations.add)
+  private def reportError(error: Throwable): Unit = {
+    try {
+      callbackLock.synchronized {
+        onError(error)
+      }
+    } catch {
+      case NonFatal(_) =>
+    }
   }
 }
