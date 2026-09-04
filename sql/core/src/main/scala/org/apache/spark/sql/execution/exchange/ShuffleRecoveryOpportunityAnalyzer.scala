@@ -237,6 +237,7 @@ private[sql] object ShuffleRecoveryEligibilityRules {
       execution + "TakeOrderedAndProjectExec",
       execution + "UnionExec",
       execution + "WholeStageCodegenExec",
+      execution + "adaptive.AQEShuffleReadExec",
       execution + "aggregate.HashAggregateExec",
       execution + "aggregate.ObjectHashAggregateExec",
       execution + "aggregate.SortAggregateExec",
