@@ -1,10 +1,11 @@
 #
-# Licensed to the Apache Software Foundation (ASF) under one or more
-# contributor license agreements.  See the NOTICE file distributed with
-# this work for additional information regarding copyright ownership.
-# The ASF licenses this file to You under the Apache License, Version 2.0
-# (the "License"); you may not use this file except in compliance with
-# the License.  You may obtain a copy of the License at
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
 #    http://www.apache.org/licenses/LICENSE-2.0
 #
@@ -32,9 +33,9 @@ concurrency:
 
 jobs:
   opportunity-analyzer:
-    name: Opportunity analyzer
+    name: Opportunity analyzer (SQL, JDK 17)
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout pull request head
@@ -66,22 +67,20 @@ jobs:
             build/apache-maven-*
             build/*.jar
             ~/.sbt
-          key: >-
-            shuffle-recovery-build-${{ runner.os }}-${{ hashFiles('**/pom.xml',
-            'project/build.properties', 'build/mvn', 'build/sbt',
-            'build/sbt-launch-lib.bash', 'build/spark-build-info') }}
+          key: shuffle-recovery-build-${{ runner.os }}-${{ hashFiles('**/pom.xml', 'project/build.properties', 'build/mvn', 'build/sbt', 'build/sbt-launch-lib.bash', 'build/spark-build-info') }}
           restore-keys: |
             shuffle-recovery-build-${{ runner.os }}-
+            build-${{ runner.os }}-
 
       - name: Cache Coursier repository
         uses: actions/cache@v5
         with:
           path: ~/.cache/coursier
-          key: >-
-            shuffle-recovery-coursier-${{ runner.os }}-${{
-            hashFiles('**/pom.xml', '**/plugins.sbt') }}
+          key: shuffle-recovery-coursier-${{ runner.os }}-17-${{ hashFiles('**/pom.xml', '**/plugins.sbt') }}
           restore-keys: |
-            shuffle-recovery-coursier-${{ runner.os }}-
+            shuffle-recovery-coursier-${{ runner.os }}-17-
+            coursier-${{ runner.os }}-17-
+            coursier-${{ runner.os }}-
 
       - name: Check patch whitespace
         env:
@@ -100,10 +99,10 @@ jobs:
           if git diff --name-only "${BASE_SHA}...HEAD" -- '*.java' | grep -q .; then
             ./dev/lint-java
           else
-            echo "No Java files changed; checkstyle is not applicable."
+            echo "No Java files changed; Java checkstyle is not applicable."
           fi
 
-      - name: Compile SQL tests
+      - name: Compile SQL production and test code
         run: ./build/sbt -Phadoop-3 -Phive "sql/Test/compile"
 
       - name: Run focused opportunity analyzer suite
@@ -119,20 +118,36 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive
           "sql/testOnly org.apache.spark.sql.util.ExecutionListenerManagerSuite"
 
-      - name: Validate analyzer evidence
+      - name: Validate focused test discovery and analyzer evidence
         shell: bash
         run: |
           set -euo pipefail
+          report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryOpportunityAnalyzerSuite*.xml' -print -quit)"
+          if [[ -z "${report}" ]]; then
+            echo "Focused opportunity analyzer suite produced no test report." >&2
+            exit 1
+          fi
+
           evidence="sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl"
-          test -s "${evidence}"
+          if [[ ! -s "${evidence}" ]]; then
+            echo "Opportunity analyzer produced no evidence records." >&2
+            exit 1
+          fi
           grep -q '"executionId":"aqe-off"' "${evidence}"
           grep -q '"executionId":"aqe-on"' "${evidence}"
           grep -q '"exchangeOrdinal":' "${evidence}"
+          grep -q '"lineageDeterminism":' "${evidence}"
           grep -q '"eligible":' "${evidence}"
 
-      - name: Upload analyzer evidence
+      - name: Upload analyzer evidence and focused test results
+        if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: shuffle-recovery-phase0-opportunity-analyzer
-          path: sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl
+          name: shuffle-recovery-phase0-opportunity-analyzer-${{ github.run_id }}
           if-no-files-found: error
+          path: |
+            sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl
+            **/target/test-reports/*ShuffleRecoveryOpportunityAnalyzerSuite*.xml
+            **/target/test-reports/*ExecutionListenerManagerSuite*.xml
+            **/target/*.log
