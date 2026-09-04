@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.exchange
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Paths}
 import java.util.concurrent.{ConcurrentLinkedQueue, CountDownLatch, Executors, TimeUnit}
+import java.util.concurrent.atomic.AtomicInteger
 
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
