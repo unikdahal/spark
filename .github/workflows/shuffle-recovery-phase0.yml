@@ -195,12 +195,11 @@ jobs:
             **/target/test-reports/*SortShuffleManagerSuite*.xml
 
   opportunity-analyzer:
-    if: github.event_name == 'workflow_dispatch'
     name: Opportunity analyzer and weighted gate (SQL, JDK 17)
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
-      OPPORTUNITY_CORPUS_MODE: ${{ inputs.opportunity-corpus-mode }}
+      OPPORTUNITY_CORPUS_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.opportunity-corpus-mode || 'smoke' }}
       OPPORTUNITY_DIR: ${{ github.workspace }}/sql/core/target/shuffle-recovery-phase0/opportunity
 
     steps:
