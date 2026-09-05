@@ -21,16 +21,21 @@ on:
   pull_request:
     branches:
       - spip/shuffle-recovery-phase0
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited
   workflow_dispatch:
     inputs:
       opportunity-corpus-mode:
-        description: Opportunity evidence corpus size
+        description: Opportunity evidence tier
         required: true
         default: smoke
         type: choice
         options:
           - smoke
-          - larger
+          - evidence
 
 permissions:
   contents: read
@@ -43,9 +48,9 @@ jobs:
   opportunity-analyzer:
     name: Opportunity analyzer and weighted gate (SQL, JDK 17)
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
-      OPPORTUNITY_CORPUS_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.opportunity-corpus-mode || 'smoke' }}
+      OPPORTUNITY_CORPUS_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.opportunity-corpus-mode || (contains(github.event.pull_request.body, '<!-- run-phase0-opportunity-evidence -->') && 'evidence' || 'smoke') }}
       OPPORTUNITY_DIR: ${{ github.workspace }}/sql/core/target/shuffle-recovery-phase0/opportunity
 
     steps:
@@ -144,10 +149,10 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityAnalyzerSuite"
 
-      - name: Run weighted runtime and report suites
+      - name: Run weighted runtime and correlation suites
         run: |
           ./build/sbt -Phadoop-3 -Phive \
-            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite"
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeCorrelationCoverageSuite"
 
       - name: Run adaptive partition-rule regression suite
         run: |
@@ -155,6 +160,7 @@ jobs:
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryAdaptivePartitionRulesSuite"
 
       - name: Run AQE-on/off TPC opportunity corpus
+        timeout-minutes: 120
         env:
           SPARK_SHUFFLE_RECOVERY_CORPUS_MODE: ${{ env.OPPORTUNITY_CORPUS_MODE }}
           SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_DIR: ${{ env.OPPORTUNITY_DIR }}
@@ -177,6 +183,8 @@ jobs:
             -name '*ShuffleRecoveryOpportunityStudySuite*.xml' -print -quit)"
           retry_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryRuntimeWeightsSuite*.xml' -print -quit)"
+          correlation_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryRuntimeCorrelationCoverageSuite*.xml' -print -quit)"
           corpus_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryOpportunityCorpusSuite*.xml' -print -quit)"
           adaptive_report="$(find sql -type f -path '*/test-reports/*' \
@@ -185,6 +193,7 @@ jobs:
             "${analyzer_report}" \
             "${study_report}" \
             "${retry_report}" \
+            "${correlation_report}" \
             "${corpus_report}" \
             "${adaptive_report}"; do
             if [[ -z "${report}" ]]; then
@@ -206,18 +215,34 @@ jobs:
 
           raw="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.jsonl"
           rendered="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.md"
-          if [[ ! -s "${raw}" || ! -s "${rendered}" ]]; then
-            echo "Weighted opportunity corpus produced empty raw/report evidence." >&2
+          reconciliation="${OPPORTUNITY_DIR}/correlation-reconciliation-${OPPORTUNITY_CORPUS_MODE}.jsonl"
+          if [[ ! -s "${raw}" || ! -s "${rendered}" || ! -s "${reconciliation}" ]]; then
+            echo "Opportunity corpus produced empty raw/report/reconciliation evidence." >&2
             exit 1
           fi
           grep -q '"schemaVersion":1' "${raw}"
           grep -q '"disposition":"WEIGHTED"' "${raw}"
+          grep -q '"sqlExecutionId":' "${reconciliation}"
+          grep -q '"acceptedWinnerCount":' "${reconciliation}"
           grep -q 'Gate result:' "${rendered}"
           grep -q 'Scope curve and correlation coverage' "${rendered}"
           grep -q 'Failure-point opportunity' "${rendered}"
           grep -q 'Unweighted / excluded accounting' "${rendered}"
+          grep -q 'Correlation quality gate' "${rendered}"
+          grep -q 'Sample quality and sensitivity' "${rendered}"
           grep -q 'TPC-DS' "${rendered}"
           grep -q 'TPC-H' "${rendered}"
+
+          if [[ "${OPPORTUNITY_CORPUS_MODE}" == "evidence" ]]; then
+            correlated="$(grep '"ruleSetName":"exact-source-counterfactual-v1"' "${raw}" \
+              | grep -c '"disposition":"WEIGHTED"')"
+            if [[ "${correlated}" -lt 300 ]]; then
+              echo "Evidence corpus produced only ${correlated} correlated materialized exchanges." >&2
+              exit 1
+            fi
+            grep -q -- '- Result: \*\*PASS\*\*' "${rendered}"
+            grep -Eq 'Gate result: \*\*(PASS|FAIL)\*\*' "${rendered}"
+          fi
 
           {
             echo "### Phase 0-A weighted opportunity evidence"
@@ -239,6 +264,7 @@ jobs:
             **/target/test-reports/*ShuffleRecoveryOpportunityAnalyzerSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityStudySuite*.xml
             **/target/test-reports/*ShuffleRecoveryRuntimeWeightsSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryRuntimeCorrelationCoverageSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityCorpusSuite*.xml
             **/target/test-reports/*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
