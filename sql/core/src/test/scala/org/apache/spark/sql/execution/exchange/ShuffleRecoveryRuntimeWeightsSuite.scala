@@ -21,6 +21,7 @@ import java.util.Properties
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.scheduler.{
+  AccumulableInfo,
   SparkListenerStageCompleted,
   SparkListenerStageSubmitted,
   StageInfo}
@@ -104,7 +105,7 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
     assert(result.executorRunTimeMs === 21L)
   }
 
-  test("zero-task skipped stage does not move an already completed shuffle") {
+  test("zero-task skipped stage preserves completion and adds correlation IDs") {
     val listener = new ShuffleRecoveryRuntimeWeightListener
     val properties = new Properties()
     properties.setProperty(SQLExecution.EXECUTION_ID_KEY, "1")
@@ -120,11 +121,25 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
       shuffleDepId = Some(3),
       resourceProfileId = 0)
 
+    def addAccumulator(info: StageInfo, id: Long): Unit = {
+      info.accumulables.put(
+        id,
+        AccumulableInfo(
+          id,
+          name = None,
+          update = None,
+          value = None,
+          internal = false,
+          countFailedValues = false))
+    }
+
     val first = stageInfo(2)
+    addAccumulator(first, 7L)
     listener.onStageSubmitted(SparkListenerStageSubmitted(first, properties))
     listener.onStageCompleted(SparkListenerStageCompleted(first))
 
     val skipped = stageInfo(9)
+    addAccumulator(skipped, 8L)
     listener.onStageSubmitted(SparkListenerStageSubmitted(skipped, properties))
     listener.onStageCompleted(SparkListenerStageCompleted(skipped))
 
@@ -133,5 +148,6 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
     assert(result.head.complete)
     assert(result.head.stageId === 2)
     assert(result.head.completionOrder === 1L)
+    assert(result.head.accumulatorIds === Set(7L, 8L))
   }
 }
