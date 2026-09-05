@@ -284,17 +284,22 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
     attemptToStage.remove(attemptKey).flatMap(activeStages.get).foreach { accumulator =>
       if (info.failureReason.isEmpty) {
         val stageKey = StageKey(accumulator.executionId, accumulator.shuffleId)
-        if (info.numTasks == 0 && completed.contains(stageKey)) {
-          accumulator.recordAccumulatorIds(info.accumulables.keys)
-        } else {
-          completionCounter = Math.addExact(completionCounter, 1L)
-          completed.update(
-            stageKey,
-            accumulator.finish(
-              info.stageId,
-              info.attemptNumber(),
-              info.accumulables.keys,
-              completionCounter))
+        completed.get(stageKey) match {
+          case Some(runtime) if info.numTasks == 0 =>
+            val additionalIds = info.accumulables.keys.toSet
+            accumulator.recordAccumulatorIds(additionalIds)
+            completed.update(
+              stageKey,
+              runtime.copy(accumulatorIds = runtime.accumulatorIds ++ additionalIds))
+          case _ =>
+            completionCounter = Math.addExact(completionCounter, 1L)
+            completed.update(
+              stageKey,
+              accumulator.finish(
+                info.stageId,
+                info.attemptNumber(),
+                info.accumulables.keys,
+                completionCounter))
         }
       } else {
         accumulator.recordAccumulatorIds(info.accumulables.keys)
