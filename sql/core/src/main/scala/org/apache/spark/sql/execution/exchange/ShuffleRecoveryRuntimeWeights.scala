@@ -29,7 +29,8 @@ import org.apache.spark.scheduler.{
   SparkListenerEvent,
   SparkListenerStageCompleted,
   SparkListenerStageSubmitted,
-  SparkListenerTaskEnd}
+  SparkListenerTaskEnd,
+  StageInfo}
 import org.apache.spark.sql.execution.SQLExecution
 import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 
@@ -46,12 +47,14 @@ private[sql] case class ShuffleRecoveryStageRuntime(
     accumulatorIds: Set[Long],
     completionOrder: Long,
     complete: Boolean,
-    invalidReason: Option[String]) {
+    invalidReason: Option[String],
+    rddScopeIds: Set[String] = Set.empty) {
 
   require(expectedMapTasks >= 0, "expected map task count must be non-negative")
   require(successfulMapTaskWinners >= 0, "successful winner count must be non-negative")
   require(shuffleWriteBytes >= 0L, "shuffle-write bytes must be non-negative")
   require(executorRunTimeMs >= 0L, "executor run time must be non-negative")
+  require(rddScopeIds.forall(_.nonEmpty), "RDD scope IDs must be non-empty")
 }
 
 /**
@@ -81,6 +84,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
   private val submittedAttempts = mutable.HashMap.empty[(Int, Int), Long]
   private val winners = mutable.HashMap.empty[Int, Winner]
   private val accumulatorIds = mutable.HashSet.empty[Long]
+  private val rddScopeIds = mutable.HashSet.empty[String]
   private var invalidReason: Option[String] = None
 
   def startAttempt(stageAttemptId: Int): Unit = {
@@ -107,6 +111,13 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
 
   def recordAccumulatorIds(ids: Iterable[Long]): Unit = synchronized {
     accumulatorIds ++= ids
+  }
+
+  def recordRddScopeIds(ids: Iterable[String]): Unit = synchronized {
+    ids.foreach { id =>
+      require(id.nonEmpty, "RDD scope ID must be non-empty")
+      rddScopeIds += id
+    }
   }
 
   def recordSuccessfulTask(
@@ -197,7 +208,8 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       accumulatorIds.toSet,
       completionOrder,
       complete = finalInvalid.isEmpty,
-      finalInvalid)
+      finalInvalid,
+      rddScopeIds.toSet)
   }
 
   private def checkedTotals(): Either[String, (Long, Long)] = {
@@ -252,6 +264,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
       if (accumulator.expectedMapTasks != totalMapTasks) {
         accumulator.invalidate(MapperCountChangedAcrossAttempts)
       }
+      accumulator.recordRddScopeIds(scopeIds(info))
       val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
       attemptCounter = Math.addExact(attemptCounter, 1L)
       attemptToStage.put(attemptKey, stageKey)
@@ -282,6 +295,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
     val info = event.stageInfo
     val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
     attemptToStage.remove(attemptKey).flatMap(activeStages.get).foreach { accumulator =>
+      accumulator.recordRddScopeIds(scopeIds(info))
       if (info.failureReason.isEmpty) {
         val stageKey = StageKey(accumulator.executionId, accumulator.shuffleId)
         completed.get(stageKey) match {
@@ -290,7 +304,9 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
             accumulator.recordAccumulatorIds(additionalIds)
             completed.update(
               stageKey,
-              runtime.copy(accumulatorIds = runtime.accumulatorIds ++ additionalIds))
+              runtime.copy(
+                accumulatorIds = runtime.accumulatorIds ++ additionalIds,
+                rddScopeIds = runtime.rddScopeIds ++ scopeIds(info)))
           case _ =>
             completionCounter = Math.addExact(completionCounter, 1L)
             completed.update(
@@ -343,5 +359,11 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
           case _: NumberFormatException => None
         }
       }
+  }
+
+  private def scopeIds(info: StageInfo): Set[String] = {
+    info.rddInfos.iterator.flatMap { rddInfo =>
+      rddInfo.scope.iterator.flatMap(_.getAllScopes.iterator.map(_.id))
+    }.filter(_.nonEmpty).toSet
   }
 }
