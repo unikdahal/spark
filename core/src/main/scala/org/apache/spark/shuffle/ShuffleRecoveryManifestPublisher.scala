@@ -28,21 +28,17 @@ import scala.collection.mutable
 import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
-import org.apache.spark.{SparkConf, Success}
+import org.apache.spark.{MapOutputTrackerMaster, SparkConf, SparkEnv, Success}
 import org.apache.spark.internal.Logging
-import org.apache.spark.scheduler.{SparkListener, SparkListenerApplicationEnd, SparkListenerStageCompleted}
-import org.apache.spark.scheduler.{SparkListenerStageSubmitted, SparkListenerTaskEnd}
+import org.apache.spark.scheduler.{SparkListener, SparkListenerApplicationEnd}
+import org.apache.spark.scheduler.{SparkListenerStageCompleted, SparkListenerStageSubmitted}
+import org.apache.spark.scheduler.SparkListenerTaskEnd
 
 /**
- * Immutable selection frozen from Spark's ordered scheduler-listener stream.
+ * Immutable map-output selection frozen at a successful shuffle-stage completion boundary.
  *
- * `winningMapTaskIds` is ordered by map partition. It contains the exact first successful task id
- * for every partition in the successful stage attempt. TaskSetManager converts a speculative copy
- * that loses to an already-successful attempt into TaskKilled before notifying DAGScheduler, so a
- * losing speculative attempt cannot replace an entry in this vector.
- *
- * `shuffleId`, `stageId`, and `stageAttemptId` are routing/diagnostic fields only. They never
- * participate in the Phase 0 feasibility identity.
+ * `winningMapTaskIds` is ordered by map partition. Scheduler routing identifiers are diagnostic
+ * only and never participate in the feasibility identity.
  */
 private[spark] final case class ShuffleRecoveryPublication(
     shuffleId: Int,
@@ -120,7 +116,8 @@ private[shuffle] final class FilesystemShuffleRecoveryPublicationBackend(
     if (publication == null) {
       throw new IllegalArgumentException("publication descriptor must not be null")
     }
-    if (publication.shuffleId < 0 || publication.stageId < 0 || publication.stageAttemptId < 0) {
+    if (publication.shuffleId < 0 || publication.stageId < 0 ||
+        publication.stageAttemptId < 0) {
       throw new IllegalArgumentException("invalid scheduler routing identifier")
     }
     if (publication.winningMapTaskIds == null ||
@@ -137,13 +134,10 @@ private[shuffle] final class FilesystemShuffleRecoveryPublicationBackend(
 }
 
 /**
- * Certifies the exact scheduler-frozen task-attempt selection against the Phase 0 provider.
+ * Certifies the exact scheduler-frozen task-attempt selection against the reference provider.
  *
- * The provider never chooses a winner by shuffle id or by "latest" attempt. Each map task id is
- * unique within a Spark application by the ShuffleExecutorComponents contract. This helper finds
- * exactly one completed provider candidate for that frozen task id, validates its descriptor, and
- * conditionally binds it to the corresponding map index. A missing, duplicate, incomplete, or
- * conflicting candidate fails publication; it never substitutes another attempt.
+ * The provider never chooses a winner by shuffle id or by "latest" attempt. A missing, duplicate,
+ * incomplete, or conflicting candidate fails publication rather than substituting another attempt.
  */
 private[spark] object ShuffleRecoveryWinningSelection {
   private val MaxWinnerClaimBytes = 256L
@@ -187,7 +181,8 @@ private[spark] object ShuffleRecoveryWinningSelection {
       } catch {
         case _: FileAlreadyExistsException =>
           return readCommitted(provider, mapIndex, mapTaskId, reducerCount).getOrElse {
-            throw new IOException("concurrent winner binding selected a different map attempt")
+            throw new IOException(
+              "concurrent winner binding selected a different map attempt")
           }
       }
       readCommitted(provider, mapIndex, mapTaskId, reducerCount).getOrElse {
@@ -198,7 +193,8 @@ private[spark] object ShuffleRecoveryWinningSelection {
 
   private def findExactCandidate(provider: ReferenceShuffleProvider, mapTaskId: Long): Path = {
     val attempts = provider.attemptsPath
-    if (!Files.isDirectory(attempts, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(attempts)) {
+    if (!Files.isDirectory(attempts, LinkOption.NOFOLLOW_LINKS) ||
+        Files.isSymbolicLink(attempts)) {
       throw new IOException("provider attempt namespace is missing or unsafe")
     }
     val prefix = s"attempt-$mapTaskId-"
@@ -229,7 +225,9 @@ private[spark] object ShuffleRecoveryWinningSelection {
     if (!Files.isRegularFile(ready, LinkOption.NOFOLLOW_LINKS) ||
         !Files.isRegularFile(data, LinkOption.NOFOLLOW_LINKS) ||
         !Files.isRegularFile(index, LinkOption.NOFOLLOW_LINKS) ||
-        Files.isSymbolicLink(ready) || Files.isSymbolicLink(data) || Files.isSymbolicLink(index)) {
+        Files.isSymbolicLink(ready) ||
+        Files.isSymbolicLink(data) ||
+        Files.isSymbolicLink(index)) {
       throw new IOException("winning provider candidate is incomplete or unsafe")
     }
   }
@@ -248,7 +246,8 @@ private[spark] object ShuffleRecoveryWinningSelection {
     if (!Files.isDirectory(mapDirectory, LinkOption.NOFOLLOW_LINKS) ||
         Files.isSymbolicLink(mapDirectory) ||
         !Files.isRegularFile(winner, LinkOption.NOFOLLOW_LINKS) ||
-        Files.isSymbolicLink(winner) || Files.size(winner) > MaxWinnerClaimBytes) {
+        Files.isSymbolicLink(winner) ||
+        Files.size(winner) > MaxWinnerClaimBytes) {
       throw new IOException("invalid committed provider winner state")
     }
     val handle = new String(Files.readAllBytes(winner), StandardCharsets.UTF_8).trim
@@ -272,9 +271,8 @@ private[spark] object ShuffleRecoveryWinningSelection {
 /**
  * Bounded owned asynchronous publisher for optional recovery metadata.
  *
- * Submission is a non-blocking queue operation. Provider/store/filesystem work is performed only
- * by the owned worker. Publication failures are logged and counted and never fail a Spark stage
- * that has already completed successfully.
+ * Submission is non-blocking. Provider/store/filesystem work runs only on the owned worker.
+ * Publication failure is observable but can never fail an already successful Spark stage.
  */
 private[spark] final class ShuffleRecoveryManifestPublisher private[shuffle] (
     backend: ShuffleRecoveryPublicationBackend,
@@ -284,7 +282,8 @@ private[spark] final class ShuffleRecoveryManifestPublisher private[shuffle] (
   if (backend == null) {
     throw new IllegalArgumentException("publication backend must not be null")
   }
-  if (queueCapacity <= 0 || queueCapacity > ShuffleRecoveryManifestPublisher.MaxQueueCapacity) {
+  if (queueCapacity <= 0 ||
+      queueCapacity > ShuffleRecoveryManifestPublisher.MaxQueueCapacity) {
     throw new IllegalArgumentException("invalid manifest publisher queue capacity")
   }
 
@@ -301,7 +300,9 @@ private[spark] final class ShuffleRecoveryManifestPublisher private[shuffle] (
     new ArrayBlockingQueue[Runnable](queueCapacity),
     new ThreadFactory {
       override def newThread(runnable: Runnable): Thread = {
-        val thread = new Thread(runnable, s"$workerName-${threadCounter.incrementAndGet()}")
+        val thread = new Thread(
+          runnable,
+          s"$workerName-${threadCounter.incrementAndGet()}")
         thread.setDaemon(true)
         thread
       }
@@ -329,7 +330,8 @@ private[spark] final class ShuffleRecoveryManifestPublisher private[shuffle] (
               logWarning(
                 s"Shuffle recovery manifest publication failed for shuffle " +
                   s"${publication.shuffleId}, stage " +
-                  s"${publication.stageId}.${publication.stageAttemptId}", e)
+                  s"${publication.stageId}.${publication.stageAttemptId}",
+                e)
           }
         }
       })
@@ -350,10 +352,12 @@ private[spark] final class ShuffleRecoveryManifestPublisher private[shuffle] (
       executor.shutdown()
       try {
         if (!executor.awaitTermination(
-            ShuffleRecoveryManifestPublisher.CloseTimeoutSeconds, TimeUnit.SECONDS)) {
+            ShuffleRecoveryManifestPublisher.CloseTimeoutSeconds,
+            TimeUnit.SECONDS)) {
           executor.shutdownNow()
           executor.awaitTermination(
-            ShuffleRecoveryManifestPublisher.CloseTimeoutSeconds, TimeUnit.SECONDS)
+            ShuffleRecoveryManifestPublisher.CloseTimeoutSeconds,
+            TimeUnit.SECONDS)
         }
       } catch {
         case _: InterruptedException =>
@@ -370,25 +374,27 @@ private[spark] final class ShuffleRecoveryManifestPublisher private[shuffle] (
 }
 
 /**
- * Ordered listener-side coordinator that freezes winner task ids only after Spark reports a
- * successful ShuffleMapStage completion.
+ * Bounded listener-side bookkeeping for one shuffle stage across retries.
  *
- * Spark's LiveListenerBus preserves event order for one listener. A stage is tracked only after its
- * StageSubmitted event and removed on StageCompleted, so late speculative/task events after the
- * completion boundary cannot reopen or replace the frozen winner vector.
+ * Successful task events update the latest task id for their map partition. Failed stage attempts
+ * keep their accepted winners so a later retry can supply only missing partitions. On a successful
+ * completion, the vector is frozen and validated against Spark's current tracker state before it
+ * is enqueued. If listener evidence and tracker state disagree, publication is skipped.
  */
 private[shuffle] final class ShuffleRecoveryPublicationCoordinator(
     publisher: ShuffleRecoveryManifestPublisher,
     reducerCount: Int,
-    targetShuffleId: Option[Int]) extends Logging {
+    targetShuffleId: Option[Int],
+    currentSelection: ShuffleRecoveryPublication => Boolean) extends Logging {
 
-  private case class AttemptKey(stageId: Int, stageAttemptId: Int)
-  private case class AttemptState(
+  private case class StageState(
       shuffleId: Int,
       expectedMaps: Int,
+      var latestAttemptId: Int,
+      var active: Boolean,
       winners: mutable.Map[Int, Long])
 
-  private val attempts = mutable.HashMap.empty[AttemptKey, AttemptState]
+  private val stages = mutable.HashMap.empty[Int, StageState]
 
   def stageSubmitted(
       stageId: Int,
@@ -400,9 +406,36 @@ private[shuffle] final class ShuffleRecoveryPublicationCoordinator(
       logWarning("Ignoring invalid shuffle recovery stage-submission metadata")
       return
     }
-    if (targetShuffleId.forall(_ == shuffleId)) {
-      attempts(AttemptKey(stageId, stageAttemptId)) =
-        AttemptState(shuffleId, expectedMaps, mutable.HashMap.empty[Int, Long])
+    if (!targetShuffleId.forall(_ == shuffleId)) {
+      return
+    }
+
+    stages.get(stageId) match {
+      case Some(state)
+          if state.shuffleId == shuffleId && state.expectedMaps == expectedMaps =>
+        if (stageAttemptId > state.latestAttemptId) {
+          state.latestAttemptId = stageAttemptId
+          state.active = true
+        } else if (stageAttemptId == state.latestAttemptId && !state.active) {
+          state.active = true
+        }
+      case Some(_) =>
+        stages.remove(stageId)
+        logWarning(
+          s"Disabling shuffle recovery tracking for stage $stageId after incompatible metadata")
+      case None =>
+        if (stages.size >= ShuffleRecoveryPublicationCoordinator.MaxTrackedStages) {
+          logWarning(
+            "Shuffle recovery publication tracking is at its bounded stage limit; " +
+              s"skipping stage $stageId")
+        } else {
+          stages(stageId) = StageState(
+            shuffleId,
+            expectedMaps,
+            stageAttemptId,
+            active = true,
+            mutable.HashMap.empty[Int, Long])
+        }
     }
   }
 
@@ -411,11 +444,15 @@ private[shuffle] final class ShuffleRecoveryPublicationCoordinator(
       stageAttemptId: Int,
       partitionId: Int,
       mapTaskId: Long): Unit = synchronized {
-    attempts.get(AttemptKey(stageId, stageAttemptId)).foreach { state =>
-      if (partitionId >= 0 && partitionId < state.expectedMaps && mapTaskId >= 0L) {
-        // First successful task is the TaskSetManager winner. A later speculative copy is reported
-        // as TaskKilled, not Success; getOrElseUpdate is defense-in-depth against duplicates.
-        state.winners.getOrElseUpdate(partitionId, mapTaskId)
+    stages.get(stageId).foreach { state =>
+      if (state.active &&
+          state.latestAttemptId == stageAttemptId &&
+          partitionId >= 0 &&
+          partitionId < state.expectedMaps &&
+          mapTaskId >= 0L) {
+        // MapOutputTracker replaces an existing map status with a later accepted success.
+        // Keep the latest listener-ordered success and validate it at the completion boundary.
+        state.winners(partitionId) = mapTaskId
       }
     }
   }
@@ -423,59 +460,115 @@ private[shuffle] final class ShuffleRecoveryPublicationCoordinator(
   def stageCompleted(
       stageId: Int,
       stageAttemptId: Int,
-      successful: Boolean): Unit = synchronized {
-    attempts.remove(AttemptKey(stageId, stageAttemptId)).foreach { state =>
-      if (successful) {
-        val complete = state.winners.size == state.expectedMaps &&
-          (0 until state.expectedMaps).forall(state.winners.contains)
-        if (complete) {
-          val winners = Vector.tabulate(state.expectedMaps)(state.winners)
-          publisher.submit(ShuffleRecoveryPublication(
-            state.shuffleId,
-            stageId,
-            stageAttemptId,
-            winners,
-            reducerCount))
-        } else {
+      successful: Boolean): Unit = {
+    val publication = synchronized {
+      stages.get(stageId) match {
+        case Some(state)
+            if state.active && state.latestAttemptId == stageAttemptId && successful =>
+          stages.remove(stageId)
+          val complete = state.winners.size == state.expectedMaps &&
+            (0 until state.expectedMaps).forall(state.winners.contains)
+          if (complete) {
+            val winners = Vector.tabulate(state.expectedMaps)(state.winners)
+            Some(ShuffleRecoveryPublication(
+              state.shuffleId,
+              stageId,
+              stageAttemptId,
+              winners,
+              reducerCount))
+          } else {
+            logWarning(
+              s"Skipping shuffle recovery publication for stage $stageId.$stageAttemptId: " +
+                s"only ${state.winners.size}/${state.expectedMaps} winners were observed")
+            None
+          }
+
+        case Some(state)
+            if state.active && state.latestAttemptId == stageAttemptId && !successful =>
+          // Preserve winners that Spark may reuse in a later determinate retry.
+          state.active = false
+          None
+
+        case _ =>
+          None
+      }
+    }
+
+    publication.foreach { frozen =>
+      val accepted = try {
+        currentSelection(frozen)
+      } catch {
+        case NonFatal(e) =>
           logWarning(
-            s"Skipping shuffle recovery publication for stage $stageId.$stageAttemptId: " +
-              s"only ${state.winners.size}/${state.expectedMaps} winning map tasks were observed")
-        }
+            s"Unable to validate shuffle recovery winner selection for stage " +
+              s"$stageId.$stageAttemptId; skipping publication",
+            e)
+          false
+      }
+      if (accepted) {
+        publisher.submit(frozen)
+      } else {
+        logWarning(
+          s"Skipping shuffle recovery publication for stage $stageId.$stageAttemptId because " +
+            "listener winners do not match Spark's current map-output state")
       }
     }
   }
 
-  def clear(): Unit = synchronized { attempts.clear() }
+  def clear(): Unit = synchronized {
+    stages.clear()
+  }
 
-  private[shuffle] def trackedAttemptCount: Int = synchronized { attempts.size }
+  private[shuffle] def trackedAttemptCount: Int = synchronized {
+    stages.size
+  }
+}
+
+private[shuffle] object ShuffleRecoveryPublicationCoordinator {
+  private val MaxTrackedStages = 1024
 }
 
 /**
  * Phase 0 publication listener.
  *
- * This listener is intentionally loaded through Spark's existing `spark.extraListeners` mechanism
- * rather than adding a production scheduler API. It observes DAGScheduler-authored TaskEnd,
- * StageSubmitted, and StageCompleted events, snapshots only task ids on the listener thread, and
- * delegates all provider/store I/O to [[ShuffleRecoveryManifestPublisher]].
+ * Listener callbacks do bounded in-memory bookkeeping only. Provider, manifest-store, and
+ * filesystem work is delegated to [[ShuffleRecoveryManifestPublisher]].
  */
-private[spark] final class ShuffleRecoveryManifestListener(conf: SparkConf)
+private[spark] final class ShuffleRecoveryManifestListener private[shuffle] (
+    conf: SparkConf,
+    currentSelection: ShuffleRecoveryPublication => Boolean)
   extends SparkListener with Logging {
+
+  def this(conf: SparkConf) =
+    this(conf, ShuffleRecoveryManifestListener.currentSelectionMatchesTracker)
 
   private val configured = ShuffleRecoveryManifestPublisher.configFromSparkConf(conf)
   private val publisher = configured.map { config =>
     new ShuffleRecoveryManifestPublisher(
-      new FilesystemShuffleRecoveryPublicationBackend(config), config.queueCapacity)
+      new FilesystemShuffleRecoveryPublicationBackend(config),
+      config.queueCapacity)
   }
-  private val coordinator = configured.zip(publisher).headOption.map { case (config, worker) =>
-    new ShuffleRecoveryPublicationCoordinator(worker, config.reducerCount, config.targetShuffleId)
+  private val coordinator = configured.zip(publisher).headOption.map {
+    case (config, worker) =>
+      new ShuffleRecoveryPublicationCoordinator(
+        worker,
+        config.reducerCount,
+        config.targetShuffleId,
+        currentSelection)
   }
 
   override def onStageSubmitted(stageSubmitted: SparkListenerStageSubmitted): Unit = {
     val info = stageSubmitted.stageInfo
     info.shuffleDepId.foreach { shuffleId =>
       safely {
+        val mapperCount = info.rddInfos.headOption
+          .map(_.numPartitions)
+          .getOrElse(info.numTasks)
         coordinator.foreach(_.stageSubmitted(
-          info.stageId, info.attemptNumber(), shuffleId, info.numTasks))
+          info.stageId,
+          info.attemptNumber(),
+          shuffleId,
+          mapperCount))
       }
     }
   }
@@ -486,7 +579,7 @@ private[spark] final class ShuffleRecoveryManifestListener(conf: SparkConf)
         coordinator.foreach(_.taskSucceeded(
           taskEnd.stageId,
           taskEnd.stageAttemptId,
-          taskEnd.taskInfo.index,
+          taskEnd.taskInfo.partitionId,
           taskEnd.taskInfo.taskId))
       }
     }
@@ -497,7 +590,9 @@ private[spark] final class ShuffleRecoveryManifestListener(conf: SparkConf)
     if (info.shuffleDepId.isDefined) {
       safely {
         coordinator.foreach(_.stageCompleted(
-          info.stageId, info.attemptNumber(), info.failureReason.isEmpty))
+          info.stageId,
+          info.attemptNumber(),
+          info.failureReason.isEmpty))
       }
     }
   }
@@ -513,6 +608,27 @@ private[spark] final class ShuffleRecoveryManifestListener(conf: SparkConf)
     } catch {
       case NonFatal(e) =>
         logWarning("Ignoring Phase 0 shuffle recovery publication listener failure", e)
+    }
+  }
+}
+
+private[shuffle] object ShuffleRecoveryManifestListener extends Logging {
+  private def currentSelectionMatchesTracker(
+      publication: ShuffleRecoveryPublication): Boolean = {
+    val env = SparkEnv.get
+    if (env == null || publication == null) {
+      return false
+    }
+    env.mapOutputTracker match {
+      case tracker: MapOutputTrackerMaster =>
+        publication.winningMapTaskIds.forall { mapTaskId =>
+          tracker.getMapOutputLocation(publication.shuffleId, mapTaskId).isDefined
+        }
+      case _ =>
+        logWarning(
+          "Shuffle recovery publication requires the driver MapOutputTrackerMaster; " +
+            "skipping publication")
+        false
     }
   }
 }
@@ -540,8 +656,8 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
   private val DefaultQueueCapacity = 16
 
   /**
-   * Returns None for disabled or malformed Phase 0 configuration. Configuration errors disable
-   * this optional cache path rather than preventing SparkContext construction.
+   * Returns None for disabled or malformed configuration. Invalid optional recovery configuration
+   * must never prevent SparkContext construction.
    */
   def configFromSparkConf(conf: SparkConf): Option[ShuffleRecoveryPublisherConfig] = {
     if (conf == null) {
@@ -551,7 +667,8 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
       case None | Some("false") => false
       case Some("true") => true
       case Some(other) =>
-        logWarning(s"Ignoring invalid $EnabledKey=$other; shuffle recovery publication is disabled")
+        logWarning(
+          s"Ignoring invalid $EnabledKey=$other; shuffle recovery publication is disabled")
         false
     }
     if (!enabled) {
@@ -561,7 +678,9 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
       Some(parseConfig(conf))
     } catch {
       case NonFatal(e) =>
-        logWarning("Invalid Phase 0 shuffle recovery publication configuration; disabling it", e)
+        logWarning(
+          "Invalid Phase 0 shuffle recovery publication configuration; disabling it",
+          e)
         None
     }
   }
@@ -569,13 +688,16 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
   def fromSparkConf(conf: SparkConf): Option[ShuffleRecoveryManifestPublisher] =
     configFromSparkConf(conf).map { config =>
       new ShuffleRecoveryManifestPublisher(
-        new FilesystemShuffleRecoveryPublicationBackend(config), config.queueCapacity)
+        new FilesystemShuffleRecoveryPublicationBackend(config),
+        config.queueCapacity)
     }
 
   private[shuffle] def parseConfig(conf: SparkConf): ShuffleRecoveryPublisherConfig = {
-    def required(key: String): String = conf.getOption(key).filter(_.nonEmpty).getOrElse {
-      throw new IllegalArgumentException(s"missing required configuration $key")
-    }
+    def required(key: String): String =
+      conf.getOption(key).filter(_.nonEmpty).getOrElse {
+        throw new IllegalArgumentException(s"missing required configuration $key")
+      }
+
     def positiveLong(key: String): Long = {
       val value = try {
         java.lang.Long.parseLong(required(key))
@@ -588,6 +710,7 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
       }
       value
     }
+
     def positiveInt(key: String): Int = {
       val value = try {
         Integer.parseInt(required(key))
@@ -601,12 +724,11 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
       value
     }
 
-    // Under the old fetch protocol ShuffleMapTask uses partitionId as mapId, while the listener
-    // observes taskAttemptId. The Phase 0 winner proof therefore refuses that compatibility mode
-    // instead of silently treating the two identifiers as interchangeable.
+    // Under the old fetch protocol ShuffleMapTask uses partitionId as mapId while the recovery
+    // proof is keyed to task-attempt ids. Refuse that mode rather than conflating identifiers.
     if (conf.getBoolean(OldFetchProtocolKey, false)) {
       throw new IllegalArgumentException(
-        s"$OldFetchProtocolKey=true is outside the Phase 0 manifest-publication compatibility set")
+        s"$OldFetchProtocolKey=true is outside the Phase 0 publication compatibility set")
     }
 
     val generation = positiveLong(GenerationKey)
@@ -614,6 +736,7 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
     if (reducerCount > ShuffleRecoveryManifestCodec.MaxReducers) {
       throw new IllegalArgumentException("configured reducer count exceeds Phase 0 bound")
     }
+
     val queueCapacity = conf.getOption(QueueCapacityKey) match {
       case Some(value) =>
         val parsed = try {
@@ -623,11 +746,14 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
             throw new IllegalArgumentException("invalid manifest publisher queue capacity", e)
         }
         if (parsed <= 0 || parsed > MaxQueueCapacity) {
-          throw new IllegalArgumentException("manifest publisher queue capacity is out of bounds")
+          throw new IllegalArgumentException(
+            "manifest publisher queue capacity is out of bounds")
         }
         parsed
-      case None => DefaultQueueCapacity
+      case None =>
+        DefaultQueueCapacity
     }
+
     val targetShuffleId = conf.getOption(TargetShuffleIdKey).map { raw =>
       val parsed = try {
         Integer.parseInt(raw)
@@ -643,7 +769,8 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
 
     val providerRoot = Paths.get(required(ProviderRootKey)).toAbsolutePath.normalize()
     val manifestRoot = Paths.get(required(ManifestRootKey)).toAbsolutePath.normalize()
-    if (providerRoot == manifestRoot || providerRoot.startsWith(manifestRoot) ||
+    if (providerRoot == manifestRoot ||
+        providerRoot.startsWith(manifestRoot) ||
         manifestRoot.startsWith(providerRoot)) {
       throw new IllegalArgumentException(
         "provider and manifest roots must be distinct non-nested Phase 0 namespaces")
@@ -653,6 +780,7 @@ private[spark] object ShuffleRecoveryManifestPublisher extends Logging {
     val incarnation = required(IncarnationKey)
     ShuffleRecoveryManifestCodec.validateIdentifier(group, "recovery group")
     ShuffleRecoveryManifestCodec.validateIdentifier(incarnation, "incarnation id")
+
     val config = ShuffleRecoveryPublisherConfig(
       providerRoot,
       manifestRoot,
