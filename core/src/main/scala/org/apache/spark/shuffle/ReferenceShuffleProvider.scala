@@ -137,7 +137,7 @@ private[spark] final class ReferenceShuffleProvider private (
       candidateDirectory.resolve(DataFileName))
     if (index.numReducers != output.numPartitions ||
         index.dataLength != output.dataLength ||
-        Files.size(candidateDirectory.resolve(IndexFileName)) != output.indexLength) {
+        index.serializedBytes != output.indexLength) {
       throw new IOException("candidate descriptor does not match committed bytes")
     }
 
@@ -215,27 +215,34 @@ private[spark] final class ReferenceShuffleProvider private (
   }
 
   private def createWinnerClaim(path: Path, candidateName: String): Unit = {
-    val channel = java.nio.channels.FileChannel.open(
-      path,
-      StandardOpenOption.CREATE_NEW,
-      StandardOpenOption.WRITE)
+    var channel: java.nio.channels.FileChannel = null
+    var claimCreated = false
+    var claimComplete = false
     try {
+      channel = java.nio.channels.FileChannel.open(
+        path,
+        StandardOpenOption.CREATE_NEW,
+        StandardOpenOption.WRITE)
+      claimCreated = true
       val bytes = ByteBuffer.wrap(candidateName.getBytes(StandardCharsets.UTF_8))
       while (bytes.hasRemaining) {
         channel.write(bytes)
       }
       channel.force(true)
-    } catch {
-      case e: IOException =>
+      channel.close()
+      channel = null
+      claimComplete = true
+    } finally {
+      if (channel != null) {
         try {
           channel.close()
         } finally {
-          Files.deleteIfExists(path)
+          if (claimCreated && !claimComplete) {
+            Files.deleteIfExists(path)
+          }
         }
-        throw e
-    } finally {
-      if (channel.isOpen) {
-        channel.close()
+      } else if (claimCreated && !claimComplete) {
+        Files.deleteIfExists(path)
       }
     }
   }
@@ -653,21 +660,11 @@ private object ReferenceShuffleIndexCodec {
   }
 
   def read(indexFile: Path, dataFile: Path): ReferenceShuffleMapIndex = {
-    if (!Files.isRegularFile(indexFile, LinkOption.NOFOLLOW_LINKS)) {
-      throw new IOException(s"missing shuffle index: $indexFile")
-    }
     if (!Files.isRegularFile(dataFile, LinkOption.NOFOLLOW_LINKS)) {
       throw new IOException(s"missing shuffle data: $dataFile")
     }
-    val indexSize = Files.size(indexFile)
-    if (indexSize < HeaderBytes + FooterBytes || indexSize > MaxIndexBytes) {
-      throw new IOException(s"invalid shuffle index size: $indexSize")
-    }
-    if (indexSize > Int.MaxValue) {
-      throw new IOException(s"shuffle index is too large to read safely: $indexSize")
-    }
 
-    val bytes = Files.readAllBytes(indexFile)
+    val (bytes, indexSize) = readBoundedIndex(indexFile)
     val buffer = ByteBuffer.wrap(bytes)
     if (buffer.getInt() != Magic) {
       throw new IOException("invalid shuffle index magic")
@@ -747,6 +744,42 @@ private object ReferenceShuffleIndexCodec {
         s"shuffle data length $physicalDataLength does not match index length $dataLength")
     }
     ReferenceShuffleMapIndex(numReducers, dataLength, blocks.result(), indexSize)
+  }
+
+  private def readBoundedIndex(indexFile: Path): (Array[Byte], Long) = {
+    val channel = try {
+      java.nio.channels.FileChannel.open(
+        indexFile,
+        StandardOpenOption.READ,
+        LinkOption.NOFOLLOW_LINKS)
+    } catch {
+      case e: IOException => throw new IOException(s"missing shuffle index: $indexFile", e)
+    }
+    try {
+      val indexSize = channel.size()
+      if (indexSize < HeaderBytes + FooterBytes || indexSize > MaxIndexBytes) {
+        throw new IOException(s"invalid shuffle index size: $indexSize")
+      }
+      if (indexSize > Int.MaxValue) {
+        throw new IOException(s"shuffle index is too large to read safely: $indexSize")
+      }
+
+      val bytes = new Array[Byte](indexSize.toInt)
+      val buffer = ByteBuffer.wrap(bytes)
+      while (buffer.hasRemaining) {
+        val read = channel.read(buffer)
+        if (read < 0) {
+          throw new IOException("shuffle index was truncated while being read")
+        }
+      }
+      val extra = ByteBuffer.allocate(1)
+      if (channel.read(extra) >= 0) {
+        throw new IOException("shuffle index changed size while being read")
+      }
+      (bytes, indexSize)
+    } finally {
+      channel.close()
+    }
   }
 
   private def expectedSize(numReducers: Int, hasChecksums: Boolean): Long = {
