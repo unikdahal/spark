@@ -17,8 +17,6 @@
 
 package org.apache.spark.sql.execution.exchange
 
-import scala.collection.mutable
-
 private[sql] case class ShuffleRecoveryCorrelationCoverage(
     materializedExchangeCount: Long,
     correlatedExchangeCount: Long,
@@ -47,6 +45,17 @@ private[sql] case class ShuffleRecoveryQueryOpportunity(
     ShuffleRecoveryRatio(reusableExecutorRunTimeMs, completedExecutorRunTimeMs)
 }
 
+private[sql] case class ShuffleRecoveryEvidenceFailurePoint(
+    executionId: Long,
+    point: String,
+    applicable: Boolean,
+    completedExchangeCount: Long,
+    reusableExchangeCount: Long,
+    completedShuffleWriteBytes: Long,
+    reusableShuffleWriteBytes: Long,
+    completedExecutorRunTimeMs: Long,
+    reusableExecutorRunTimeMs: Long)
+
 /**
  * Quality and sensitivity analysis for the manual Phase 0-A evidence campaign.
  *
@@ -57,6 +66,9 @@ private[sql] case class ShuffleRecoveryQueryOpportunity(
 private[sql] case class ShuffleRecoveryOpportunityEvidence(
     correlation: ShuffleRecoveryCorrelationCoverage,
     correlationGateThresholdBasisPoints: Long,
+    failureDistributionVersion: String,
+    failurePoints: Seq[ShuffleRecoveryEvidenceFailurePoint],
+    finalValueGateThresholdBasisPoints: Long,
     queryOpportunity: Seq[ShuffleRecoveryQueryOpportunity],
     taskTimeOpportunity: ShuffleRecoveryRatio,
     queryWeightedOpportunityBasisPoints: Option[Long],
@@ -74,20 +86,31 @@ private[sql] case class ShuffleRecoveryOpportunityEvidence(
     _ >= correlationGateThresholdBasisPoints
   }
 
+  val finalValueGateRatio: ShuffleRecoveryRatio = {
+    val applicable = failurePoints.filter(_.applicable)
+    ShuffleRecoveryRatio(
+      checkedSum(applicable.map(_.reusableExecutorRunTimeMs), "final reusable task time"),
+      checkedSum(applicable.map(_.completedExecutorRunTimeMs), "final completed task time"))
+  }
+
+  def finalValueGateResult: Option[Boolean] = {
+    if (!correlationGatePass.contains(true)) {
+      None
+    } else {
+      finalValueGateRatio.basisPoints.map(_ >= finalValueGateThresholdBasisPoints)
+    }
+  }
+
   def toMarkdown: String = {
     val out = new StringBuilder
     line(out, "## Correlation quality gate")
     line(out, "")
-    val result = correlationGatePass match {
-      case Some(true) => "PASS"
-      case Some(false) => "FAIL"
-      case None => "N/A"
-    }
+    val correlationResult = renderResult(correlationGatePass)
     line(
       out,
       s"- Preregistered minimum: ${renderBasisPoints(correlationGateThresholdBasisPoints)} of " +
         "materially executed completed shuffle-map task time.")
-    line(out, s"- Result: **$result**")
+    line(out, s"- Result: **$correlationResult**")
     line(out, s"- Exchange coverage: ${correlation.countRatio.render}")
     line(out, s"- Shuffle-write-byte coverage: ${correlation.byteRatio.render}")
     line(out, s"- Completed task-time coverage: ${correlation.taskTimeRatio.render}")
@@ -100,6 +123,8 @@ private[sql] case class ShuffleRecoveryOpportunityEvidence(
       }
       line(out, "")
     }
+
+    appendFailureDistribution(out)
 
     line(out, "## Sample quality and sensitivity")
     line(out, "")
@@ -141,6 +166,45 @@ private[sql] case class ShuffleRecoveryOpportunityEvidence(
     out.toString()
   }
 
+  private def appendFailureDistribution(out: StringBuilder): Unit = {
+    line(out, "## Expanded failure-point opportunity and final value gate")
+    line(out, "")
+    line(out, s"- Failure distribution: `$failureDistributionVersion`")
+    line(
+      out,
+      s"- Final value gate: **${renderResult(finalValueGateResult)}** " +
+        s"(${finalValueGateRatio.render}; threshold " +
+        s"${renderBasisPoints(finalValueGateThresholdBasisPoints)})")
+    line(out, "")
+    line(
+      out,
+      "The earlier three-point report remains a compatibility diagnostic. The final Phase 0-A " +
+        "decision uses this preregistered four-point distribution.")
+    line(out, "")
+    line(
+      out,
+      "| Point | Applicable executions | Completed exchanges | Reusable exchanges | " +
+        "Reusable bytes | Reusable task time |")
+    line(out, "|---|---:|---:|---:|---:|---:|")
+    ShuffleRecoveryOpportunityEvidence.FailurePointOrder.foreach { point =>
+      val rows = failurePoints.filter(row => row.point == point && row.applicable)
+      val completedCount = checkedSum(rows.map(_.completedExchangeCount), s"$point completed count")
+      val reusableCount = checkedSum(rows.map(_.reusableExchangeCount), s"$point reusable count")
+      val completedBytes = checkedSum(rows.map(_.completedShuffleWriteBytes), s"$point completed bytes")
+      val reusableBytes = checkedSum(rows.map(_.reusableShuffleWriteBytes), s"$point reusable bytes")
+      val completedTime = checkedSum(rows.map(_.completedExecutorRunTimeMs), s"$point completed time")
+      val reusableTime = checkedSum(rows.map(_.reusableExecutorRunTimeMs), s"$point reusable time")
+      line(
+        out,
+        s"| $point | ${rows.size} | $completedCount | $reusableCount | " +
+          s"${ShuffleRecoveryRatio(reusableBytes, completedBytes).render} | " +
+          s"${ShuffleRecoveryRatio(reusableTime, completedTime).render} |")
+    }
+    line(out, "")
+    line(out, "`Reusable` remains a projection until the adoption mechanism is demonstrated.")
+    line(out, "")
+  }
+
   private def appendSplit(
       out: StringBuilder,
       title: String,
@@ -166,6 +230,12 @@ private[sql] case class ShuffleRecoveryOpportunityEvidence(
     }
   }
 
+  private def renderResult(result: Option[Boolean]): String = result match {
+    case Some(true) => "PASS"
+    case Some(false) => "FAIL"
+    case None => "N/A"
+  }
+
   private def renderOptionalBasisPoints(value: Option[Long]): String =
     value.map(renderBasisPoints).getOrElse("N/A")
 
@@ -178,6 +248,19 @@ private[sql] object ShuffleRecoveryOpportunityEvidence {
   import ShuffleRecoveryWeightDisposition._
 
   val CorrelationGateThresholdBasisPoints = 9500L
+  val FinalValueGateThresholdBasisPoints = 2000L
+  val FailureDistributionVersion = "equal-four-points-v2"
+
+  private val AfterFirstEligible = "AFTER_FIRST_ELIGIBLE_COMPLETES"
+  private val AfterMultipleUpstream = "AFTER_MULTIPLE_UPSTREAM_SHUFFLES_COMPLETE"
+  private val BeforeMostExpensive = "BEFORE_MOST_EXPENSIVE_SHUFFLE_COMPLETES"
+  private val AfterMixedWork = "AFTER_ELIGIBLE_INELIGIBLE_MIX"
+
+  val FailurePointOrder: Seq[String] = Seq(
+    AfterFirstEligible,
+    AfterMultipleUpstream,
+    BeforeMostExpensive,
+    AfterMixedWork)
 
   def build(
       snapshot: ShuffleRecoveryOpportunityStudySnapshot,
@@ -220,6 +303,9 @@ private[sql] object ShuffleRecoveryOpportunityEvidence {
     ShuffleRecoveryOpportunityEvidence(
       correlation,
       CorrelationGateThresholdBasisPoints,
+      FailureDistributionVersion,
+      buildFailurePoints(weighted, queryByExecution.keySet),
+      FinalValueGateThresholdBasisPoints,
       queryOpportunity,
       ShuffleRecoveryRatio(eligibleTime, totalTime),
       queryWeighted,
@@ -269,6 +355,71 @@ private[sql] object ShuffleRecoveryOpportunityEvidence {
         "disposition" -> quote(record.disposition.code),
         "reason" -> optionalString(record.accountingReason))
       fields.map { case (key, value) => s"${quote(key)}:$value" }.mkString("{", ",", "}")
+    }
+  }
+
+  private def buildFailurePoints(
+      weighted: Seq[ShuffleRecoveryWeightedObservation],
+      executionIds: Set[Long]): Seq[ShuffleRecoveryEvidenceFailurePoint] = {
+    val byExecution = weighted.groupBy(record => executionId(record.classification.executionId))
+    executionIds.toSeq.sorted.flatMap { id =>
+      val physical = byExecution.getOrElse(id, Nil).sortBy { record =>
+        (record.completionOrder.getOrElse(Long.MaxValue), record.classification.exchangeOrdinal)
+      }
+      val firstEligible = physical.find(_.classification.eligible).flatMap(_.completionOrder)
+      val second = physical.lift(1).flatMap(_.completionOrder)
+      val expensive = physical.sortBy { record =>
+        (-record.executorRunTimeMs.getOrElse(0L), -record.shuffleWriteBytes.getOrElse(0L),
+          record.completionOrder.getOrElse(Long.MaxValue))
+      }.headOption.flatMap(_.completionOrder)
+      val mixed = mixedCutoff(physical)
+      Seq(
+        failurePoint(id, AfterFirstEligible, physical, firstEligible, inclusive = true),
+        failurePoint(id, AfterMultipleUpstream, physical, second, inclusive = true),
+        failurePoint(id, BeforeMostExpensive, physical, expensive, inclusive = false),
+        failurePoint(id, AfterMixedWork, physical, mixed, inclusive = true))
+    }
+  }
+
+  private def mixedCutoff(
+      physical: Seq[ShuffleRecoveryWeightedObservation]): Option[Long] = {
+    if (physical.size < 3) {
+      None
+    } else {
+      (1 until physical.size - 1).iterator.flatMap { index =>
+        val prefix = physical.take(index + 1)
+        val hasEligible = prefix.exists(_.classification.eligible)
+        val hasIneligible = prefix.exists(record => !record.classification.eligible)
+        if (hasEligible && hasIneligible) physical(index).completionOrder else None
+      }.toSeq.headOption
+    }
+  }
+
+  private def failurePoint(
+      executionId: Long,
+      point: String,
+      physical: Seq[ShuffleRecoveryWeightedObservation],
+      cutoff: Option[Long],
+      inclusive: Boolean): ShuffleRecoveryEvidenceFailurePoint = {
+    cutoff match {
+      case None =>
+        ShuffleRecoveryEvidenceFailurePoint(executionId, point, applicable = false,
+          0L, 0L, 0L, 0L, 0L, 0L)
+      case Some(value) =>
+        val completed = physical.filter { record =>
+          record.completionOrder.exists(order => if (inclusive) order <= value else order < value)
+        }
+        val reusable = completed.filter(_.classification.eligible)
+        ShuffleRecoveryEvidenceFailurePoint(
+          executionId,
+          point,
+          applicable = true,
+          completed.size.toLong,
+          reusable.size.toLong,
+          checkedSum(completed.flatMap(_.shuffleWriteBytes), s"$executionId/$point bytes"),
+          checkedSum(reusable.flatMap(_.shuffleWriteBytes), s"$executionId/$point reusable bytes"),
+          checkedSum(completed.flatMap(_.executorRunTimeMs), s"$executionId/$point time"),
+          checkedSum(reusable.flatMap(_.executorRunTimeMs), s"$executionId/$point reusable time"))
     }
   }
 
