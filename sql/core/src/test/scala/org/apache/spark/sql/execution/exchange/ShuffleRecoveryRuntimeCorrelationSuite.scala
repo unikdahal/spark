@@ -137,4 +137,36 @@ class ShuffleRecoveryRuntimeCorrelationSuite extends SharedSparkSession {
       }
     }
   }
+
+  test("real multi-shuffle execution reconciles every completed shuffle stage") {
+    withSQLConf(
+      SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
+      SQLConf.SHUFFLE_PARTITIONS.key -> "4") {
+      val study = new ShuffleRecoveryOpportunityStudy(spark, Seq(gateRule))
+      study.install()
+      try {
+        val upstream = spark.range(0L, 4096L, 1L, 8)
+          .groupBy((col("id") % 32L).as("k"))
+          .count()
+        upstream.repartition(4, col("k"))
+          .groupBy((col("k") % 4L).as("bucket"))
+          .sum("count")
+          .collect()
+
+        val snapshot = study.snapshot()
+        val completedShuffleIds = snapshot.stages.filter(_.complete).map(_.shuffleId).toSet
+        val correlatedShuffleIds = snapshot.records.collect {
+          case record if record.disposition == Weighted => record.shuffleId
+        }.flatten.toSet
+        assert(completedShuffleIds.size >= 2)
+        assert(correlatedShuffleIds === completedShuffleIds)
+        assert(snapshot.records.forall { record =>
+          record.disposition != Unweighted ||
+            !record.accountingReason.contains(ShuffleRecoveryAccountingReason.NoRuntimeCorrelation)
+        })
+      } finally {
+        study.close()
+      }
+    }
+  }
 }
