@@ -131,6 +131,37 @@ private[spark] final class ShuffleRecoveryReservationManager {
     }
   }
 
+  /**
+   * Commits bounded local scheduler/tracker state while the exact reservation is still fenced.
+   *
+   * The callback must perform only in-memory work. In particular, callers must not invoke a
+   * provider, manifest store, filesystem, wait primitive, or any other operation that can block on
+   * external state while this monitor is held. Cancellation and ordinary execution use the same
+   * monitor, so exactly one of those decisions or this commit can win.
+   */
+  def consumeIfCurrent(
+      reservation: ShuffleRecoveryAdoptionReservation)(commit: => Boolean): Boolean = synchronized {
+    if (!isCurrent(reservation)) {
+      false
+    } else {
+      var committed = false
+      try {
+        committed = commit
+        committed
+      } finally {
+        states.put(
+          reservation.materializationId,
+          ShuffleRecoveryReservationTerminal(
+            advanceVersion(),
+            if (committed) {
+              "prepared adoption reservation was consumed"
+            } else {
+              "prepared adoption local installation was rejected"
+            }))
+      }
+    }
+  }
+
   /** Drops an unconsumed current reservation after a preparation miss, allowing a later retry. */
   def abandon(reservation: ShuffleRecoveryAdoptionReservation): Unit = synchronized {
     if (isCurrent(reservation)) {
