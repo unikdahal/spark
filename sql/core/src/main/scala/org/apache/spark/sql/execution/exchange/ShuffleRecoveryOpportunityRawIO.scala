@@ -51,6 +51,7 @@ private[sql] case class ShuffleRecoveryRawOpportunityRecord(
  * alter a denominator or become a permissive compatibility path.
  */
 private[sql] object ShuffleRecoveryOpportunityRawIO {
+  import ShuffleRecoveryMissReason._
   import ShuffleRecoverySourceTokenAvailability._
 
   val SchemaVersion = 1
@@ -82,6 +83,27 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     Exact.code,
     PrototypeSpecialCased.code,
     Unavailable.code)
+  private val missReasonCodes = Set(
+    NonDeterministic.code,
+    DeterminismUnproven.code,
+    PythonOrArrowPresent.code,
+    DynamicPruningPresent.code,
+    RuntimeFilterPresent.code,
+    SubqueryPresent.code,
+    SourceTokenUnavailable.code,
+    WindowPresent.code,
+    ExpandPresent.code,
+    CacheScanPresent.code,
+    RangePartitioningPresent.code,
+    AdaptivePartitionSpecPresent.code,
+    UnsupportedShuffleMode.code,
+    IncompatibleRuntimeFlag.code,
+    InvalidPartitionCount.code,
+    UnsupportedPartitioning.code,
+    UnsupportedExpression.code,
+    CustomOperator.code,
+    UnsupportedOperator.code,
+    UpstreamIneligible.code)
 
   def parseLine(line: String): ShuffleRecoveryRawOpportunityRecord = {
     require(line != null && line.nonEmpty, "raw opportunity record must be non-empty")
@@ -164,6 +186,8 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     record.completionOrder.foreach { value =>
       require(value > 0L, "completion order must be positive")
     }
+    record.immediateMissReason.foreach(validateMissReason)
+    record.rootMissReason.foreach(validateMissReason)
 
     if (record.eligible) {
       require(
@@ -177,10 +201,7 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
 
     record.disposition match {
       case "WEIGHTED" => validateWeighted(record)
-      case "UNWEIGHTED" | "EXCLUDED" =>
-        require(
-          record.accountingReason.nonEmpty,
-          s"${record.disposition} record must carry a stable accounting reason")
+      case "UNWEIGHTED" | "EXCLUDED" => validateNonWeighted(record)
       case _ =>
         throw new IllegalStateException("validated disposition became unreachable")
     }
@@ -201,6 +222,27 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     require(
       runtimeFields.forall(_.nonEmpty),
       "weighted record must carry complete runtime correlation")
+  }
+
+  private def validateNonWeighted(record: ShuffleRecoveryRawOpportunityRecord): Unit = {
+    require(
+      record.accountingReason.nonEmpty,
+      s"${record.disposition} record must carry a stable accounting reason")
+    val runtimeFields = Seq(
+      record.stageId,
+      record.stageAttemptId,
+      record.shuffleId,
+      record.mapperCount,
+      record.shuffleWriteBytes,
+      record.executorRunTimeMs,
+      record.completionOrder)
+    require(
+      runtimeFields.forall(_.isEmpty),
+      s"${record.disposition} record cannot carry runtime correlation fields")
+  }
+
+  private def validateMissReason(reason: String): Unit = {
+    require(missReasonCodes.contains(reason), s"invalid miss reason $reason")
   }
 
   private def nonNegative(value: Option[Int], label: String): Unit = {

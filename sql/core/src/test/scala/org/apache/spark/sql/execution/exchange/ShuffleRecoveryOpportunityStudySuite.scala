@@ -148,6 +148,7 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     assert(result.successfulMapTaskWinners === 2)
     assert(result.shuffleWriteBytes === 50L)
     assert(result.executorRunTimeMs === 52L)
+    assert(result.accumulatorIds === Set(7L))
   }
 
   test("successful stage with incomplete map winner coverage is explicitly invalid") {
@@ -233,6 +234,30 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     intercept[IllegalArgumentException] {
       ShuffleRecoveryOpportunityRawIO.parseLine(
         json.dropRight(1) + ",\"unexpected\":1}")
+    }
+
+    val unweighted = weighted().copy(
+      disposition = Unweighted,
+      accountingReason = Some("NO_RUNTIME_CORRELATION"),
+      stageId = None,
+      stageAttemptId = None,
+      shuffleId = None,
+      mapperCount = None,
+      shuffleWriteBytes = None,
+      executorRunTimeMs = None,
+      completionOrder = None).toJson
+    assert(ShuffleRecoveryOpportunityRawIO.parseLine(unweighted).disposition === "UNWEIGHTED")
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
+        unweighted.replace("\"stageId\":null", "\"stageId\":1"))
+    }
+
+    val ineligible = weighted(observation(eligible = false)).toJson
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
+        ineligible.replace(
+          "\"immediateMissReason\":\"SOURCE_TOKEN_UNAVAILABLE\"",
+          "\"immediateMissReason\":\"UNKNOWN_REASON\""))
     }
   }
 

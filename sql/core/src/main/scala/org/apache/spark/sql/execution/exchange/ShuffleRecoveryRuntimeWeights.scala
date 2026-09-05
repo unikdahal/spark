@@ -118,6 +118,15 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
     }
   }
 
+  /** Atomically incorporates the successful attempt's accumulator IDs before sealing the stage. */
+  def finish(
+      successfulStageAttemptId: Int,
+      finalAccumulatorIds: Iterable[Long],
+      completionOrder: Long): ShuffleRecoveryStageRuntime = synchronized {
+    accumulatorIds ++= finalAccumulatorIds
+    finish(successfulStageAttemptId, completionOrder)
+  }
+
   def finish(
       successfulStageAttemptId: Int,
       completionOrder: Long): ShuffleRecoveryStageRuntime = synchronized {
@@ -225,16 +234,20 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
     val info = event.stageInfo
     val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
     attemptToStage.remove(attemptKey).flatMap(activeStages.get).foreach { accumulator =>
-      accumulator.recordAccumulatorIds(info.accumulables.keys)
       if (info.failureReason.isEmpty) {
         completionCounter = Math.addExact(completionCounter, 1L)
-        completed += accumulator.finish(info.attemptNumber(), completionCounter)
+        completed += accumulator.finish(
+          info.attemptNumber(),
+          info.accumulables.keys,
+          completionCounter)
         val stageKey = StageKey(
           accumulator.executionId,
           accumulator.stageId,
           accumulator.shuffleId)
         activeStages.remove(stageKey)
         attemptToStage.retain((_, key) => key != stageKey)
+      } else {
+        accumulator.recordAccumulatorIds(info.accumulables.keys)
       }
     }
   }
