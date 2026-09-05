@@ -160,8 +160,14 @@ private[spark] object ReferenceShuffleProviderProcess {
       new FilesystemShuffleRecoveryPublicationBackend(config),
       queueCapacity = 4,
       workerName = "manifest-proof")
+    // The fresh-process proof has no driver MapOutputTracker. Listener/tracker agreement is
+    // validated separately; this path exercises durable publication after a frozen selection.
+    val acceptCurrentSelection: ShuffleRecoveryPublication => Boolean = _ => true
     val coordinator = new ShuffleRecoveryPublicationCoordinator(
-      publisher, config.reducerCount, Some(ShuffleId))
+      publisher,
+      config.reducerCount,
+      Some(ShuffleId),
+      acceptCurrentSelection)
 
     coordinator.stageSubmitted(StageId, 0, ShuffleId, MapTaskIds.size)
     coordinator.taskSucceeded(StageId, 0, 0, MapTaskIds(0))
@@ -186,7 +192,10 @@ private[spark] object ReferenceShuffleProviderProcess {
       queueCapacity = 2,
       workerName = "manifest-incomplete-proof")
     val incomplete = new ShuffleRecoveryPublicationCoordinator(
-      secondPublisher, config.reducerCount, Some(ShuffleId))
+      secondPublisher,
+      config.reducerCount,
+      Some(ShuffleId),
+      acceptCurrentSelection)
     incomplete.stageSubmitted(StageId + 1, 0, ShuffleId, MapTaskIds.size)
     incomplete.taskSucceeded(StageId + 1, 0, 0, MapTaskIds(0))
     incomplete.stageCompleted(StageId + 1, 0, successful = true)
@@ -212,7 +221,8 @@ private[spark] object ReferenceShuffleProviderProcess {
     // distinct payloads (pigeonhole principle). Full canonical payload matching must still select
     // the right candidate.
     val byPrefix = mutable.HashMap.empty[String, ShuffleRecoveryFeasibilityIdentity]
-    var collision: Option[(ShuffleRecoveryFeasibilityIdentity, ShuffleRecoveryFeasibilityIdentity)] = None
+    var collision: Option[
+      (ShuffleRecoveryFeasibilityIdentity, ShuffleRecoveryFeasibilityIdentity)] = None
     var i = 0
     while (i <= 256 && collision.isEmpty) {
       val candidate = zeroMapIdentity(s"collision-$i")
@@ -247,7 +257,8 @@ private[spark] object ReferenceShuffleProviderProcess {
       ShuffleRecoveryManifestCodec.decode(trailing)
     }
 
-    // Concurrent exact publication can create the immutable final name only once and cannot tear it.
+    // Concurrent exact publication can create the immutable final name only once and cannot
+    // tear it.
     val concurrentIdentity = zeroMapIdentity("concurrent")
     val concurrentManifest = zeroMapManifest("concurrent", concurrentIdentity, timestamp = 21L)
     val start = new CountDownLatch(1)
@@ -270,7 +281,8 @@ private[spark] object ReferenceShuffleProviderProcess {
     start.countDown()
     require(finished.await(30, TimeUnit.SECONDS))
     require(failures.get() == 0)
-    require(store.findCompatible("collision-group", concurrentIdentity, 2L).contains(concurrentManifest))
+    require(
+      store.findCompatible("collision-group", concurrentIdentity, 2L).contains(concurrentManifest))
   }
 
   private def exercisePublisherFailureAndBackpressure(): Unit = {
