@@ -79,6 +79,8 @@ class ReferenceShuffleProviderSuite extends SparkFunSuite {
       assert(readBlock(provider.openMap(2), 0).sameElements(Array[Byte](1, 2, 3)))
 
       val noChecksumWriter = provider.createMapOutputWriter(14L, 2)
+      val unopenedEmpty = noChecksumWriter.getPartitionWriter(0)
+      assert(unopenedEmpty.getNumBytesWritten() == 0L)
       val noChecksumStream = noChecksumWriter.getPartitionWriter(1).openStream()
       noChecksumStream.write(Array[Byte](4, 5))
       noChecksumStream.close()
@@ -86,6 +88,8 @@ class ReferenceShuffleProviderSuite extends SparkFunSuite {
       provider.commitWinner(3, noChecksum)
       val withoutChecksums = provider.openMap(3)
       assert(withoutChecksums.indexBytes == 40L + 8L * 2L)
+      assert(withoutChecksums.blockMetadata(0).isEmpty)
+      assert(withoutChecksums.getBlockData(0).isEmpty)
       assert(withoutChecksums.blockMetadata(0).checksum.isEmpty)
       assert(withoutChecksums.blockMetadata(1).checksum.isEmpty)
 
