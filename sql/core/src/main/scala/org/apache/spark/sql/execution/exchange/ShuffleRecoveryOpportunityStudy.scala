@@ -21,9 +21,12 @@ import scala.collection.mutable
 import scala.util.control.NonFatal
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
+import org.apache.spark.shuffle.ShuffleManager
+import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.execution.QueryExecution
-import org.apache.spark.sql.util.QueryExecutionListener
+import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 
 private[sql] case class ShuffleRecoveryStudyRuleSet(
     rules: ShuffleRecoveryEligibilityRules,
@@ -131,44 +134,18 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
   private val analysisFailures = mutable.ArrayBuffer.empty[(Long, String)]
   private var installed = false
 
-  private val queryListener = new QueryExecutionListener {
-    override def onSuccess(funcName: String, qe: QueryExecution, durationNs: Long): Unit = {
-      try {
-        val executionId = qe.id
-        val stableId = f"query-$executionId%020d"
-        val runtimeState = stateFor(qe)
-        val byRule = ruleSets.map { ruleSet =>
-          ruleSet -> ShuffleRecoveryOpportunityAnalyzer.analyze(
-            qe.executedPlan, stableId, ruleSet.rules, runtimeState)
-        }
-        val keys = ShuffleRecoveryExchangeRuntimeKeys.fromPlan(qe.executedPlan)
-        require(byRule.forall(_._2.size == keys.size),
-          s"classification/runtime-key count mismatch for SQL execution $executionId")
-        ShuffleRecoveryOpportunityStudy.this.synchronized {
-          completedExecutions += ShuffleRecoveryPendingExecution(executionId, byRule, keys)
-        }
-      } catch {
-        case NonFatal(error) =>
-          ShuffleRecoveryOpportunityStudy.this.synchronized {
-            analysisFailures += ((qe.id, error.getClass.getName))
-          }
-          logWarning(
-            "Shuffle recovery opportunity study analysis failed; query is unaffected.",
-            error)
-      }
-    }
-
-    override def onFailure(funcName: String, qe: QueryExecution, exception: Exception): Unit = {
-      ShuffleRecoveryOpportunityStudy.this.synchronized {
-        failedExecutions += ((qe.id, exception.getClass.getName))
-      }
+  private val queryListener = new SparkListener {
+    override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
+      case sqlEnd: SparkListenerSQLExecutionEnd if shouldReport(sqlEnd) =>
+        recordExecution(sqlEnd)
+      case _ =>
     }
   }
 
   def install(): Unit = synchronized {
     require(!installed, "study is already installed")
     spark.sparkContext.addSparkListener(runtimeListener)
-    spark.listenerManager.register(queryListener)
+    spark.sparkContext.addSparkListener(queryListener)
     installed = true
   }
 
@@ -200,18 +177,61 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
 
   override def close(): Unit = synchronized {
     if (installed) {
-      spark.listenerManager.unregister(queryListener)
+      spark.sparkContext.removeSparkListener(queryListener)
       spark.sparkContext.removeSparkListener(runtimeListener)
       installed = false
     }
   }
 
+  private def shouldReport(event: SparkListenerSQLExecutionEnd): Boolean = {
+    event.executionName.isDefined &&
+      event.qe != null &&
+      event.qe.sparkSession.sessionUUID == spark.sessionUUID
+  }
+
+  private def recordExecution(event: SparkListenerSQLExecutionEnd): Unit = {
+    val executionId = event.executionId
+    event.executionFailure match {
+      case Some(error) =>
+        synchronized {
+          failedExecutions += ((executionId, error.getClass.getName))
+        }
+      case None =>
+        val qe = event.qe
+        try {
+          val stableId = f"query-$executionId%020d"
+          val runtimeState = stateFor(qe)
+          val byRule = ruleSets.map { ruleSet =>
+            ruleSet -> ShuffleRecoveryOpportunityAnalyzer.analyze(
+              qe.executedPlan, stableId, ruleSet.rules, runtimeState)
+          }
+          val keys = ShuffleRecoveryExchangeRuntimeKeys.fromPlan(qe.executedPlan)
+          require(byRule.forall(_._2.size == keys.size),
+            s"classification/runtime-key count mismatch for SQL execution $executionId")
+          synchronized {
+            completedExecutions += ShuffleRecoveryPendingExecution(executionId, byRule, keys)
+          }
+        } catch {
+          case NonFatal(error) =>
+            synchronized {
+              analysisFailures += ((executionId, error.getClass.getName))
+            }
+            logWarning(
+              "Shuffle recovery opportunity study analysis failed; query is unaffected.",
+              error)
+        }
+    }
+  }
+
   private def stateFor(qe: QueryExecution): ShuffleRecoveryRuntimeState = {
     val sparkConf = qe.sparkSession.sparkContext.getConf
-    val shuffleManager = sparkConf.get("spark.shuffle.manager", "sort")
+    val shuffleManagerClass = ShuffleManager.getShuffleManagerClassName(sparkConf)
+    val defaultShuffleManagerClass = classOf[SortShuffleManager].getName
     ShuffleRecoveryRuntimeState(
       pushBasedShuffleEnabled = sparkConf.getBoolean("spark.shuffle.push.enabled", false),
-      incompatibleFlags = if (shuffleManager == "sort") Nil else Seq("CUSTOM_SHUFFLE_MANAGER"))
+      incompatibleFlags =
+        if (shuffleManagerClass == defaultShuffleManagerClass) Nil
+        else Seq("CUSTOM_SHUFFLE_MANAGER"))
   }
 }
 
