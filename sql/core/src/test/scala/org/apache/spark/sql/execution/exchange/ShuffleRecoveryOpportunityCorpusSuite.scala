@@ -418,7 +418,8 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
   }
 
   private def gateRuleRecords(
-      snapshot: ShuffleRecoveryOpportunityStudySnapshot): Seq[ShuffleRecoveryWeightedObservation] = {
+      snapshot: ShuffleRecoveryOpportunityStudySnapshot):
+      Seq[ShuffleRecoveryWeightedObservation] = {
     val gate = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules
     snapshot.records.filter { record =>
       record.classification.ruleSetName == gate.name &&
