@@ -71,7 +71,8 @@ class ShuffleRecoveryRuntimeCorrelationCoverageSuite extends SharedSparkSession 
       completionOrder = stageId.toLong,
       complete = true,
       invalidReason = None,
-      rddScopeIds = rddScopeIds)
+      rddScopeIds = rddScopeIds,
+      observedSuccessfulMapTaskCompletions = 1L)
   }
 
   test("RDD scope correlates a materialized exchange when SQL metric membership is absent") {
@@ -120,6 +121,20 @@ class ShuffleRecoveryRuntimeCorrelationCoverageSuite extends SharedSparkSession 
     assert(result.disposition === Weighted)
   }
 
+  test("successful duplicate attempts remain visible apart from accepted winners") {
+    val accumulator = new ShuffleRecoveryStageAccumulator(
+      executionId = 1L, stageId = 2, shuffleId = 3, expectedMapTasks = 1)
+    accumulator.startAttempt(0)
+    accumulator.recordSuccessfulTask(0, 0, 10L, 11L)
+    accumulator.recordSuccessfulTask(0, 0, 20L, 21L)
+    val result = accumulator.finish(0, completionOrder = 1L)
+
+    assert(result.successfulMapTaskWinners === 1)
+    assert(result.observedSuccessfulMapTaskCompletions === 2L)
+    assert(result.shuffleWriteBytes === 20L)
+    assert(result.executorRunTimeMs === 21L)
+  }
+
   test("real multi-shuffle execution reconciles every completed shuffle stage") {
     val study = new ShuffleRecoveryOpportunityStudy(spark, Seq(gateRule))
     study.install()
@@ -149,6 +164,9 @@ class ShuffleRecoveryRuntimeCorrelationCoverageSuite extends SharedSparkSession 
       assert(correlatedShuffleIds === materializedShuffleIds)
       assert(records.forall(_.disposition != Unweighted))
       assert(snapshot.stages.forall(_.rddScopeIds.nonEmpty))
+      assert(snapshot.stages.forall { stage =>
+        stage.observedSuccessfulMapTaskCompletions >= stage.successfulMapTaskWinners.toLong
+      })
     } finally {
       study.close()
     }
