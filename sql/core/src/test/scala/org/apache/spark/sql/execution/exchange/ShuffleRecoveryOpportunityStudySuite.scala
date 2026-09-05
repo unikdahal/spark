@@ -252,6 +252,10 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
       ShuffleRecoveryOpportunityRawIO.parseLine(
         json.dropRight(1) + ",\"unexpected\":1}")
     }
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
+        json.dropRight(1) + ",\"disposition\":\"UNWEIGHTED\"}")
+    }
 
     val unweighted = weighted().copy(
       disposition = Unweighted,
@@ -279,6 +283,19 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
         ineligible.replace(
           "\"immediateMissReason\":\"SOURCE_TOKEN_UNAVAILABLE\"",
           "\"immediateMissReason\":\"UNKNOWN_REASON\""))
+    }
+  }
+
+  test("value gate is fixed to the preregistered exact-source counterfactual rule") {
+    val observed = ShuffleRecoveryStudyRuleSets.observedBaseline
+    val record = weighted(observation(
+      ruleName = observed.rules.name,
+      ruleVersion = observed.rules.version))
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityReportBuilder.build(
+        snapshot(Seq(record)),
+        Seq(observed),
+        corpus(gateName = observed.rules.name, gateVersion = observed.rules.version))
     }
   }
 
@@ -353,7 +370,11 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
       }
       val result = study.snapshot()
       val weightedRecords = result.records.filter(_.disposition == Weighted)
+      val expectedExecutionIds = result.completedExecutionIds
+        .map(id => f"query-$id%020d")
+        .toSet
       assert(result.completedExecutionIds.size === 2)
+      assert(result.records.map(_.classification.executionId).toSet === expectedExecutionIds)
       assert(weightedRecords.nonEmpty)
       assert(weightedRecords.forall(_.shuffleWriteBytes.exists(_ >= 0L)))
       assert(weightedRecords.forall(_.executorRunTimeMs.exists(_ >= 0L)))
