@@ -2,9 +2,9 @@
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -124,7 +124,8 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
         SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
         "spark.master" -> spark.sparkContext.master),
-      failureDistributionVersion = ShuffleRecoveryOpportunityReportBuilder.FailureDistributionVersion,
+      failureDistributionVersion =
+        ShuffleRecoveryOpportunityReportBuilder.FailureDistributionVersion,
       gateRuleSetName = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules.name,
       gateRuleSetVersion = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules.version,
       gateThresholdBasisPoints = ShuffleRecoveryOpportunityReportBuilder.GateThresholdBasisPoints,

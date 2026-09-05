@@ -2,9 +2,9 @@
  * Licensed to the Apache Software Foundation (ASF) under one or more
  * contributor license agreements.  See the NOTICE file distributed with
  * this work for additional information regarding copyright ownership.
- * The ASF licenses this file to You under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
  *    http://www.apache.org/licenses/LICENSE-2.0
  *
@@ -127,7 +127,8 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
       baselineSha = ShuffleRecoveryOpportunityReportBuilder.FrozenBaselineSha,
       queries = Nil,
       sparkConfigs = Seq(SQLConf.SHUFFLE_PARTITIONS.key -> "4"),
-      failureDistributionVersion = ShuffleRecoveryOpportunityReportBuilder.FailureDistributionVersion,
+      failureDistributionVersion =
+        ShuffleRecoveryOpportunityReportBuilder.FailureDistributionVersion,
       gateRuleSetName = gateName,
       gateRuleSetVersion = gateVersion,
       gateThresholdBasisPoints = ShuffleRecoveryOpportunityReportBuilder.GateThresholdBasisPoints)
@@ -357,8 +358,11 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
       assert(weightedRecords.forall(_.shuffleWriteBytes.exists(_ >= 0L)))
       assert(weightedRecords.forall(_.executorRunTimeMs.exists(_ >= 0L)))
       assert(weightedRecords.exists(_.executorRunTimeMs.exists(_ > 0L)))
-      assert(weightedRecords.map(r => (r.classification.executionId, r.stageId, r.shuffleId)).distinct.size ===
-        weightedRecords.size)
+      assert(
+        weightedRecords
+          .map(r => (r.classification.executionId, r.stageId, r.shuffleId))
+          .distinct
+          .size === weightedRecords.size)
     } finally {
       study.close()
     }
