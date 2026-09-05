@@ -48,13 +48,17 @@ private[sql] case class ShuffleRecoveryStageRuntime(
     completionOrder: Long,
     complete: Boolean,
     invalidReason: Option[String],
-    rddScopeIds: Set[String] = Set.empty) {
+    rddScopeIds: Set[String] = Set.empty,
+    observedSuccessfulMapTaskCompletions: Long = 0L) {
 
   require(expectedMapTasks >= 0, "expected map task count must be non-negative")
   require(successfulMapTaskWinners >= 0, "successful winner count must be non-negative")
   require(shuffleWriteBytes >= 0L, "shuffle-write bytes must be non-negative")
   require(executorRunTimeMs >= 0L, "executor run time must be non-negative")
   require(rddScopeIds.forall(_.nonEmpty), "RDD scope IDs must be non-empty")
+  require(
+    observedSuccessfulMapTaskCompletions >= successfulMapTaskWinners.toLong,
+    "observed successful map-task completions cannot be below accepted winner count")
 }
 
 /**
@@ -66,7 +70,8 @@ private[sql] case class ShuffleRecoveryStageRuntime(
  * attempt ID and ordered by listener submission order. A later submitted attempt replaces an
  * earlier candidate for the same map partition. Within one attempt, the latest successful
  * completion replaces an earlier duplicate, matching MapOutputTracker's map-output registration
- * semantics.
+ * semantics. The observed-success counter is deliberately separate from accepted winners so retry
+ * and speculation reconciliation remains visible in evidence rather than being silently collapsed.
  */
 private[exchange] final class ShuffleRecoveryStageAccumulator(
     val executionId: Long,
@@ -85,6 +90,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
   private val winners = mutable.HashMap.empty[Int, Winner]
   private val accumulatorIds = mutable.HashSet.empty[Long]
   private val rddScopeIds = mutable.HashSet.empty[String]
+  private var observedSuccessfulMapTaskCompletions = 0L
   private var invalidReason: Option[String] = None
 
   def startAttempt(stageAttemptId: Int): Unit = {
@@ -148,12 +154,17 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
         case Some(_) if shuffleWriteBytes < 0L || executorRunTimeMs < 0L =>
           invalidate(NegativeRuntimeMetric)
         case Some(attemptOrder) =>
-          winners.get(mapPartitionId) match {
-            case Some(current) if current.attemptOrder > attemptOrder =>
-            case _ =>
-              winners.update(
-                mapPartitionId,
-                Winner(attemptOrder, shuffleWriteBytes, executorRunTimeMs))
+          if (observedSuccessfulMapTaskCompletions == Long.MaxValue) {
+            invalidate(RuntimeMetricOverflow)
+          } else {
+            observedSuccessfulMapTaskCompletions += 1L
+            winners.get(mapPartitionId) match {
+              case Some(current) if current.attemptOrder > attemptOrder =>
+              case _ =>
+                winners.update(
+                  mapPartitionId,
+                  Winner(attemptOrder, shuffleWriteBytes, executorRunTimeMs))
+            }
           }
       }
     }
@@ -209,7 +220,8 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       completionOrder,
       complete = finalInvalid.isEmpty,
       finalInvalid,
-      rddScopeIds.toSet)
+      rddScopeIds.toSet,
+      observedSuccessfulMapTaskCompletions)
   }
 
   private def checkedTotals(): Either[String, (Long, Long)] = {
