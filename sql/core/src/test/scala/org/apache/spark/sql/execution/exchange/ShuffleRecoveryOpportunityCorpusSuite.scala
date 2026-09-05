@@ -28,9 +28,12 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types._
 
 /**
- * Executes a deliberately tiny but real TPC-DS/TPC-H corpus using only Spark's in-tree schemas and
- * SQL resources. The tiny rows make the suite suitable for CI; the manual mode widens query and row
- * coverage without adding a benchmark-data dependency.
+ * Executes the fast deterministic opportunity smoke corpus and the separately selected manual
+ * evidence corpus using only Spark's in-tree TPC schemas and SQL resources.
+ *
+ * The generated rows are intentionally not presented as an official TPC scale factor. They keep
+ * the study reproducible while the broad query matrix supplies plan-shape coverage. The manual
+ * evidence mode is opt-in and must not become an unconditional per-PR cost.
  */
 class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCDSSchema {
 
@@ -46,14 +49,36 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
     CorpusCase("TPC-H", "tpch/q3.sql", "q3", aqe = true),
     CorpusCase("TPC-H", "tpch/q5.sql", "q5", aqe = true))
 
-  private val largerOnlyCases = Seq(
-    CorpusCase("TPC-DS", "tpcds/q7.sql", "q7", aqe = false),
-    CorpusCase("TPC-DS", "tpcds/q19.sql", "q19", aqe = true),
-    CorpusCase("TPC-DS", "tpcds/q42.sql", "q42", aqe = false),
-    CorpusCase("TPC-DS", "tpcds/q52.sql", "q52", aqe = true),
-    CorpusCase("TPC-DS", "tpcds/q73.sql", "q73", aqe = true),
-    CorpusCase("TPC-H", "tpch/q12.sql", "q12", aqe = false),
-    CorpusCase("TPC-H", "tpch/q18.sql", "q18", aqe = true))
+  // Spark's TPCDSBase uses this v1.4 set and excludes these six queries from normal golden tests
+  // because q6/q75 can be flaky and the remaining entries are covered by the v2.7 corpus there.
+  // Keeping the same practical exclusions avoids inventing a positive-result subset for this study.
+  private val tpcdsEvidenceQueries = Seq(
+    "q1", "q2", "q3", "q4", "q5", "q7", "q8", "q9", "q10", "q11",
+    "q12", "q13", "q14a", "q14b", "q15", "q16", "q17", "q18", "q19", "q20",
+    "q21", "q22", "q23a", "q23b", "q24a", "q24b", "q25", "q26", "q27", "q28", "q29",
+    "q30", "q31", "q32", "q33", "q35", "q36", "q37", "q38", "q39a", "q39b", "q40",
+    "q41", "q42", "q43", "q44", "q45", "q46", "q47", "q48", "q49", "q50",
+    "q51", "q52", "q53", "q54", "q55", "q56", "q57", "q58", "q59", "q60",
+    "q61", "q62", "q63", "q65", "q66", "q67", "q68", "q69", "q70",
+    "q71", "q72", "q73", "q76", "q77", "q79", "q80",
+    "q81", "q82", "q83", "q84", "q85", "q86", "q87", "q88", "q89", "q90",
+    "q91", "q92", "q93", "q94", "q95", "q96", "q97", "q98", "q99")
+
+  private val tpchEvidenceQueries = (1 to 22).map(index => s"q$index")
+
+  private val evidenceCases = {
+    val tpcds = tpcdsEvidenceQueries.flatMap { query =>
+      Seq(false, true).map { aqe =>
+        CorpusCase("TPC-DS", s"tpcds/$query.sql", query, aqe)
+      }
+    }
+    val tpch = tpchEvidenceQueries.flatMap { query =>
+      Seq(false, true).map { aqe =>
+        CorpusCase("TPC-H", s"tpch/$query.sql", query, aqe)
+      }
+    }
+    tpcds ++ tpch
+  }
 
   private val tpchCreateTable = Map(
     "orders" ->
@@ -95,9 +120,9 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
 
   test("produce reconciled TPC-DS and TPC-H weighted opportunity evidence") {
     val mode = sys.env.getOrElse("SPARK_SHUFFLE_RECOVERY_CORPUS_MODE", "smoke")
-    assert(Set("smoke", "larger").contains(mode), s"unsupported opportunity corpus mode: $mode")
-    val rowCount = if (mode == "larger") 4 else 2
-    val cases = if (mode == "larger") smokeCases ++ largerOnlyCases else smokeCases
+    assert(Set("smoke", "evidence").contains(mode), s"unsupported opportunity corpus mode: $mode")
+    val rowCount = if (mode == "evidence") 32 else 2
+    val cases = if (mode == "evidence") evidenceCases else smokeCases
 
     val tpcdsCases = cases.filter(_.family == "TPC-DS")
     val tpchCases = cases.filter(_.family == "TPC-H")
@@ -115,7 +140,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       "TPC corpus produced no correlated physical shuffle work")
 
     val corpus = ShuffleRecoveryCorpusDefinition(
-      name = s"spark-in-tree-tpc-$mode-v1",
+      name = s"spark-in-tree-tpc-$mode-v2",
       scale = s"$rowCount deterministic generated rows per table",
       baselineSha = ShuffleRecoveryOpportunityReportBuilder.FrozenBaselineSha,
       queries = cases.map(c => ShuffleRecoveryCorpusQuery(c.family, c.displayName, c.aqe)),
@@ -154,6 +179,13 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
     assert(rendered.contains("## Reproduction"))
     assert(rendered.contains(s"SPARK_SHUFFLE_RECOVERY_CORPUS_MODE=$mode"))
     assert(rendered.contains("not benchmark-scale performance estimates"))
+
+    if (mode == "evidence") {
+      assert(cases.size >= 200, "manual evidence corpus must remain broad")
+      assert(cases.count(_.family == "TPC-H") === 44, "TPC-H matrix must remain complete")
+      assert(cases.exists(c => c.aqe) && cases.exists(c => !c.aqe),
+        "manual evidence corpus must retain AQE on/off coverage")
+    }
 
     writeArtifacts(mode, rawLines, rendered)
   }
@@ -235,19 +267,68 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
     val schema = spark.table(tableName).schema
     val seed = spark.range(rowCount.toLong).toDF("_row_id")
     val columns = schema.fields.toIndexedSeq.map { field =>
-      deterministicValue(col("_row_id"), field.dataType).as(field.name)
+      deterministicValue(col("_row_id"), field.name, field.dataType).as(field.name)
     }
     seed.select(columns: _*).write.mode("append").insertInto(tableName)
   }
 
-  private def deterministicValue(rowId: Column, dataType: DataType): Column = dataType match {
-    case ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType | _: DecimalType =>
-      ((rowId % 3) + 1).cast(dataType)
-    case StringType => ((rowId % 3) + 1).cast(StringType)
-    case DateType => date_add(lit("2000-01-01").cast(DateType), (rowId % 3).cast(IntegerType))
-    case TimestampType => lit("2000-01-01 00:00:00").cast(TimestampType)
-    case BooleanType => (rowId % 2 === 0)
-    case other => lit(null).cast(other)
+  private def deterministicValue(rowId: Column, name: String, dataType: DataType): Column = {
+    dataType match {
+      case DateType =>
+        date_add(lit("1998-01-01").cast(DateType), (rowId % 1460).cast(IntegerType))
+      case TimestampType =>
+        lit("2000-01-01 00:00:00").cast(TimestampType)
+      case BooleanType =>
+        rowId % 2 === 0
+      case StringType =>
+        deterministicString(rowId, name)
+      case ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType |
+          _: DecimalType =>
+        deterministicNumber(rowId, name).cast(dataType)
+      case other =>
+        lit(null).cast(other)
+    }
+  }
+
+  private def deterministicNumber(rowId: Column, name: String): Column = {
+    if (name.endsWith("_year") || name == "d_year") {
+      lit(1998) + (rowId % 5)
+    } else if (name.contains("month") || name.endsWith("_moy")) {
+      (rowId % 12) + 1
+    } else if (name.contains("hour")) {
+      rowId % 24
+    } else if (name.contains("minute")) {
+      rowId % 60
+    } else if (name.contains("quantity")) {
+      (rowId % 20) + 1
+    } else if (name.contains("discount") || name.contains("tax")) {
+      rowId % 10
+    } else {
+      (rowId % 32) + 1
+    }
+  }
+
+  private def deterministicString(rowId: Column, name: String): Column = {
+    val values = if (name.contains("state")) {
+      Seq("CA", "TX", "NY", "TN", "KY", "GA", "IL", "OH")
+    } else if (name.contains("gender")) {
+      Seq("M", "F")
+    } else if (name.contains("marital")) {
+      Seq("M", "S", "D", "W")
+    } else if (name.contains("country")) {
+      Seq("UNITED STATES", "CANADA", "JAPAN", "GERMANY")
+    } else if (name.contains("shipmode")) {
+      Seq("AIR", "FOB", "MAIL", "RAIL", "REG AIR", "SHIP", "TRUCK")
+    } else if (name.contains("segment")) {
+      Seq("AUTOMOBILE", "BUILDING", "FURNITURE", "MACHINERY", "HOUSEHOLD")
+    } else if (name.contains("returnflag")) {
+      Seq("A", "N", "R")
+    } else if (name.contains("linestatus")) {
+      Seq("F", "O")
+    } else {
+      Seq("1", "2", "3", "4", "5", "6", "7", "8")
+    }
+    element_at(array(values.map(lit): _*), (rowId % values.size + 1).cast(IntegerType))
   }
 
   private def writeArtifacts(mode: String, rawLines: Seq[String], report: String): Unit = {
