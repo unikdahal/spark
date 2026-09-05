@@ -222,7 +222,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
   private def populate(tableName: String, rowCount: Int): Unit = {
     val schema = spark.table(tableName).schema
     val seed = spark.range(rowCount.toLong).toDF("_row_id")
-    val columns = schema.fields.map { field =>
+    val columns = schema.fields.toIndexedSeq.map { field =>
       deterministicValue(col("_row_id"), field.dataType).as(field.name)
     }
     seed.select(columns: _*).write.mode("append").insertInto(tableName)
