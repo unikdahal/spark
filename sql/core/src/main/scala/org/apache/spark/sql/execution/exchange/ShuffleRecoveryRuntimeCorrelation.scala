@@ -26,9 +26,18 @@ import org.apache.spark.sql.execution.metric.SQLShuffleWriteMetricsReporter
 private[sql] case class ShuffleRecoveryExchangeRuntimeKey(
     exchangeOrdinal: Long,
     exchangePath: String,
-    shuffleWriteMetricIds: Set[Long])
+    shuffleWriteMetricIds: Set[Long],
+    rddScopeId: String = "")
 
-/** Produces correlation keys without forcing a shuffle dependency. */
+/**
+ * Produces correlation keys without forcing a shuffle dependency.
+ *
+ * ShuffleExchangeExec stamps RDDs created while preparing its shuffle dependency with its
+ * deterministic SparkPlan RDD scope. That scope is a stronger execution identity than SQL metric
+ * accumulator membership: a stage may legitimately omit an exchange-local SQL metric from its
+ * StageInfo accumulables, while the RDD scope is attached directly to the RDDs that constitute the
+ * shuffle map stage. Metric IDs remain a consistency check and a fallback for older/synthetic data.
+ */
 private[exchange] object ShuffleRecoveryExchangeRuntimeKeys {
   private case class ChildRef(label: String, plan: SparkPlan)
   private case class Frame(plan: SparkPlan, pathReversed: List[String])
@@ -61,7 +70,11 @@ private[exchange] object ShuffleRecoveryExchangeRuntimeKeys {
       val metricIds = exchange.metrics.iterator.collect {
         case (name, metric) if writeMetricNames.contains(name) => metric.id
       }.toSet
-      ShuffleRecoveryExchangeRuntimeKey(ordinal.toLong, path, metricIds)
+      ShuffleRecoveryExchangeRuntimeKey(
+        ordinal.toLong,
+        path,
+        metricIds,
+        exchange.rddScopeId)
     }.toVector
   }
 
@@ -117,6 +130,7 @@ private[sql] object ShuffleRecoveryAccountingReason {
   val MissingWriteMetricKey = "MISSING_WRITE_METRIC_KEY"
   val NoRuntimeCorrelation = "NO_RUNTIME_CORRELATION"
   val AmbiguousRuntimeCorrelation = "AMBIGUOUS_RUNTIME_CORRELATION"
+  val CorrelationKeyConflict = "CORRELATION_KEY_CONFLICT"
 
   val All: Set[String] = Set(
     NegativeStageAttempt,
@@ -129,7 +143,8 @@ private[sql] object ShuffleRecoveryAccountingReason {
     ReusedPhysicalWork,
     MissingWriteMetricKey,
     NoRuntimeCorrelation,
-    AmbiguousRuntimeCorrelation)
+    AmbiguousRuntimeCorrelation,
+    CorrelationKeyConflict)
 }
 
 private[sql] case class ShuffleRecoveryWeightedObservation(
@@ -228,14 +243,29 @@ private[sql] case class ShuffleRecoveryWeightedObservation(
 }
 
 private[exchange] final class ShuffleRecoveryRuntimeStageIndex private (
-    byAccumulatorId: Map[(Long, Long), Vector[ShuffleRecoveryStageRuntime]]) {
+    byAccumulatorId: Map[(Long, Long), Vector[ShuffleRecoveryStageRuntime]],
+    byRddScopeId: Map[(Long, String), Vector[ShuffleRecoveryStageRuntime]]) {
 
-  def candidates(
+  def candidatesByAccumulator(
       executionId: Long,
       accumulatorIds: Set[Long]): Seq[ShuffleRecoveryStageRuntime] = {
+    collect(executionId, accumulatorIds.toSeq.sorted, byAccumulatorId)
+  }
+
+  def candidatesByScope(
+      executionId: Long,
+      rddScopeId: String): Seq[ShuffleRecoveryStageRuntime] = {
+    if (rddScopeId.isEmpty) Nil else byRddScopeId.getOrElse((executionId, rddScopeId), Vector.empty)
+  }
+
+  private def collect[K](
+      executionId: Long,
+      keys: Seq[K],
+      index: Map[(Long, K), Vector[ShuffleRecoveryStageRuntime]])
+      : Seq[ShuffleRecoveryStageRuntime] = {
     val unique = mutable.LinkedHashSet.empty[ShuffleRecoveryStageRuntime]
-    accumulatorIds.toSeq.sorted.foreach { accumulatorId =>
-      byAccumulatorId.get((executionId, accumulatorId)).foreach { stages =>
+    keys.foreach { key =>
+      index.get((executionId, key)).foreach { stages =>
         stages.foreach(unique += _)
       }
     }
@@ -245,21 +275,32 @@ private[exchange] final class ShuffleRecoveryRuntimeStageIndex private (
 
 private[exchange] object ShuffleRecoveryRuntimeStageIndex {
   def fromStages(stages: Seq[ShuffleRecoveryStageRuntime]): ShuffleRecoveryRuntimeStageIndex = {
-    val builders = mutable.HashMap.empty[
+    val byAccumulator = mutable.HashMap.empty[
       (Long, Long), mutable.ArrayBuffer[ShuffleRecoveryStageRuntime]]
+    val byScope = mutable.HashMap.empty[
+      (Long, String), mutable.ArrayBuffer[ShuffleRecoveryStageRuntime]]
     stages.foreach { stage =>
       stage.accumulatorIds.foreach { accumulatorId =>
-        builders
+        byAccumulator
           .getOrElseUpdate(
             (stage.executionId, accumulatorId),
             mutable.ArrayBuffer.empty[ShuffleRecoveryStageRuntime])
           .append(stage)
       }
+      stage.rddScopeIds.foreach { rddScopeId =>
+        byScope
+          .getOrElseUpdate(
+            (stage.executionId, rddScopeId),
+            mutable.ArrayBuffer.empty[ShuffleRecoveryStageRuntime])
+          .append(stage)
+      }
     }
-    val index = builders.iterator.map { case (key, values) =>
-      key -> values.toVector
-    }.toMap
-    new ShuffleRecoveryRuntimeStageIndex(index)
+    def freeze[K](source: mutable.HashMap[
+        (Long, K), mutable.ArrayBuffer[ShuffleRecoveryStageRuntime]])
+        : Map[(Long, K), Vector[ShuffleRecoveryStageRuntime]] = {
+      source.iterator.map { case (key, values) => key -> values.toVector }.toMap
+    }
+    new ShuffleRecoveryRuntimeStageIndex(freeze(byAccumulator), freeze(byScope))
   }
 }
 
@@ -294,17 +335,14 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
       stageIndex: ShuffleRecoveryRuntimeStageIndex,
       seen: mutable.HashSet[(Long, Int, Int, Int)]): ShuffleRecoveryWeightedObservation = {
     val executionId = parseExecutionId(observation.executionId)
-    val candidates = if (key.shuffleWriteMetricIds.isEmpty) {
-      Nil
-    } else {
-      stageIndex.candidates(executionId, key.shuffleWriteMetricIds)
-    }
-    candidates match {
-      case Seq(stage) if !stage.complete =>
+    selectCandidates(executionId, key, stageIndex) match {
+      case Left(reason) =>
+        unweighted(observation, reason)
+      case Right(Seq(stage)) if !stage.complete =>
         unweighted(
           observation,
           stage.invalidReason.getOrElse(IncompleteMapWinnerCoverage))
-      case Seq(stage) =>
+      case Right(Seq(stage)) =>
         val physicalKey = (
           stage.executionId,
           stage.stageId,
@@ -325,15 +363,37 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
             Some(stage.executorRunTimeMs),
             Some(stage.completionOrder))
         }
-      case Seq() =>
-        val reason = if (key.shuffleWriteMetricIds.isEmpty) {
+      case Right(Seq()) =>
+        val reason = if (key.rddScopeId.isEmpty && key.shuffleWriteMetricIds.isEmpty) {
           MissingWriteMetricKey
         } else {
           NoRuntimeCorrelation
         }
         unweighted(observation, reason)
-      case _ =>
+      case Right(_) =>
         unweighted(observation, AmbiguousRuntimeCorrelation)
+    }
+  }
+
+  private def selectCandidates(
+      executionId: Long,
+      key: ShuffleRecoveryExchangeRuntimeKey,
+      stageIndex: ShuffleRecoveryRuntimeStageIndex)
+      : Either[String, Seq[ShuffleRecoveryStageRuntime]] = {
+    val byScope = stageIndex.candidatesByScope(executionId, key.rddScopeId)
+    val byMetric = stageIndex.candidatesByAccumulator(executionId, key.shuffleWriteMetricIds)
+    byScope match {
+      case Seq(stage) if byMetric.nonEmpty && !byMetric.contains(stage) =>
+        Left(CorrelationKeyConflict)
+      case Seq(stage) =>
+        Right(Seq(stage))
+      case many if many.nonEmpty && byMetric.nonEmpty =>
+        val intersection = many.filter(byMetric.contains)
+        if (intersection.nonEmpty) Right(intersection) else Left(CorrelationKeyConflict)
+      case many if many.nonEmpty =>
+        Right(many)
+      case _ =>
+        Right(byMetric)
     }
   }
 
