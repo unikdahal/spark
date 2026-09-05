@@ -47,27 +47,27 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
     def reducerCount: Int
   }
 
-  private final case class Preparing(
-      manager: ShuffleRecoveryReservationManager,
-      reservation: ShuffleRecoveryAdoptionReservation,
-      dependency: ShuffleDependency[_, _, _],
-      mapperCount: Int,
-      reducerCount: Int) extends Decision
+  private final class Preparing(
+      val manager: ShuffleRecoveryReservationManager,
+      val reservation: ShuffleRecoveryAdoptionReservation,
+      val dependency: ShuffleDependency[_, _, _],
+      val mapperCount: Int,
+      val reducerCount: Int) extends Decision
 
-  private final case class Ready(
-      manager: ShuffleRecoveryReservationManager,
-      reservation: ShuffleRecoveryAdoptionReservation,
-      dependency: ShuffleDependency[_, _, _],
-      mapperCount: Int,
-      reducerCount: Int,
-      provider: ReferenceShuffleRecoveryClaimProvider,
-      binding: ShuffleRecoveryBinding,
-      statuses: Vector[MapStatus]) extends Decision
+  private final class Ready(
+      val manager: ShuffleRecoveryReservationManager,
+      val reservation: ShuffleRecoveryAdoptionReservation,
+      val dependency: ShuffleDependency[_, _, _],
+      val mapperCount: Int,
+      val reducerCount: Int,
+      val provider: ReferenceShuffleRecoveryClaimProvider,
+      val binding: ShuffleRecoveryBinding,
+      val statuses: Vector[MapStatus]) extends Decision
 
-  private final case class Adopted(
-      dependency: ShuffleDependency[_, _, _],
-      provider: ReferenceShuffleRecoveryClaimProvider,
-      binding: ShuffleRecoveryBinding)
+  private final class Adopted(
+      val dependency: ShuffleDependency[_, _, _],
+      val provider: ReferenceShuffleRecoveryClaimProvider,
+      val binding: ShuffleRecoveryBinding)
 
   private val pending = new ConcurrentHashMap[Int, Decision]()
   private val adopted = new ConcurrentHashMap[Int, Adopted]()
@@ -111,7 +111,7 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
     } else if (!manager.isCurrent(reservation)) {
       Left("scheduler adoption reservation is no longer current")
     } else {
-      val state = Preparing(manager, reservation, dependency, mapperCount, reducerCount)
+      val state = new Preparing(manager, reservation, dependency, mapperCount, reducerCount)
       val existing = pending.putIfAbsent(reservation.targetShuffleId, state)
       if (existing == null) Right(())
       else Left("target shuffle already has a recovery decision in flight")
@@ -162,7 +162,7 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
         safeRelease(provider, prepared.binding)
         return Left(s"unable to build recovered map status: ${e.getMessage}")
     }
-    val ready = Ready(
+    val ready = new Ready(
       preparing.manager,
       preparing.reservation,
       preparing.dependency,
@@ -322,7 +322,7 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
             ready.reducerCount)) {
           false
         } else {
-          val provenance = Adopted(ready.dependency, ready.provider, ready.binding)
+          val provenance = new Adopted(ready.dependency, ready.provider, ready.binding)
           if (adopted.putIfAbsent(shuffleId, provenance) != null) {
             resolver.removeRecoveredBinding(shuffleId, ready.binding)
             false
