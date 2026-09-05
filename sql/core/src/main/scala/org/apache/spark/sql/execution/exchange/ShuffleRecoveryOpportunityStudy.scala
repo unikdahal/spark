@@ -25,7 +25,8 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerEvent}
 import org.apache.spark.shuffle.ShuffleManager
 import org.apache.spark.shuffle.sort.SortShuffleManager
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.execution.QueryExecution
+import org.apache.spark.sql.execution.{QueryExecution, SparkPlan}
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 
 private[sql] case class ShuffleRecoveryStudyRuleSet(
@@ -124,6 +125,10 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
     ruleSets: Seq[ShuffleRecoveryStudyRuleSet] = ShuffleRecoveryStudyRuleSets.all)
   extends AutoCloseable with Logging {
 
+  private case class AnalyzedPlan(
+      byRule: Seq[(ShuffleRecoveryStudyRuleSet, Seq[ShuffleRecoveryExchangeObservation])],
+      runtimeKeys: Seq[ShuffleRecoveryExchangeRuntimeKey])
+
   require(ruleSets.nonEmpty, "at least one rule set is required")
   require(ruleSets.map(r => (r.rules.name, r.rules.version)).distinct.size == ruleSets.size,
     "rule-set name/version pairs must be unique")
@@ -206,15 +211,21 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
         try {
           val stableId = f"query-$executionId%020d"
           val runtimeState = stateFor(qe)
-          val byRule = ruleSets.map { ruleSet =>
-            ruleSet -> ShuffleRecoveryOpportunityAnalyzer.analyze(
-              qe.executedPlan, stableId, ruleSet.rules, runtimeState)
+          val current = analyzePlan(qe.executedPlan, stableId, runtimeState)
+          val executionStages = runtimeListener.snapshot().filter(_.executionId == executionId)
+          val captured = qe.executedPlan match {
+            case adaptive: AdaptiveSparkPlanExec =>
+              appendMaterializedInitialPlan(
+                current,
+                analyzePlan(adaptive.initialPlan, stableId, runtimeState),
+                executionStages)
+            case _ => current
           }
-          val keys = ShuffleRecoveryExchangeRuntimeKeys.fromPlan(qe.executedPlan)
-          require(byRule.forall(_._2.size == keys.size),
-            s"classification/runtime-key count mismatch for SQL execution $executionId")
           synchronized {
-            completedExecutions += ShuffleRecoveryPendingExecution(executionId, byRule, keys)
+            completedExecutions += ShuffleRecoveryPendingExecution(
+              executionId,
+              captured.byRule,
+              captured.runtimeKeys)
           }
         } catch {
           case NonFatal(error) =>
@@ -226,6 +237,71 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
               error)
         }
     }
+  }
+
+  private def analyzePlan(
+      plan: SparkPlan,
+      stableId: String,
+      runtimeState: ShuffleRecoveryRuntimeState): AnalyzedPlan = {
+    val byRule = ruleSets.map { ruleSet =>
+      ruleSet -> ShuffleRecoveryOpportunityAnalyzer.analyze(
+        plan, stableId, ruleSet.rules, runtimeState)
+    }
+    val keys = ShuffleRecoveryExchangeRuntimeKeys.fromPlan(plan)
+    require(byRule.forall(_._2.size == keys.size),
+      s"classification/runtime-key count mismatch for $stableId")
+    AnalyzedPlan(byRule, keys)
+  }
+
+  /**
+   * AQE may complete shuffle query stages and later remove their exchanges from the final plan.
+   * Such task time is materially executed and must remain in the correlation denominator. Append
+   * only initial-plan exchanges that match completed runtime stages and are no longer represented
+   * by the final plan. Planned-but-unmaterialized initial exchanges are deliberately not appended.
+   */
+  private def appendMaterializedInitialPlan(
+      current: AnalyzedPlan,
+      initial: AnalyzedPlan,
+      stages: Seq[ShuffleRecoveryStageRuntime]): AnalyzedPlan = {
+    val completedStages = stages.filter(_.complete)
+    val unrepresentedStages = completedStages.filterNot { stage =>
+      current.runtimeKeys.exists(key => runtimeKeyMatchesStage(key, stage))
+    }
+    val historicalIndices = initial.runtimeKeys.indices.filter { index =>
+      unrepresentedStages.exists(stage => runtimeKeyMatchesStage(initial.runtimeKeys(index), stage))
+    }
+    if (historicalIndices.isEmpty) {
+      current
+    } else {
+      val firstHistoricalOrdinal = current.runtimeKeys.size.toLong
+      val historicalKeys = historicalIndices.zipWithIndex.map { case (initialIndex, offset) =>
+        val key = initial.runtimeKeys(initialIndex)
+        key.copy(
+          exchangeOrdinal = firstHistoricalOrdinal + offset,
+          exchangePath = s"historical-initial.${key.exchangePath}")
+      }
+      val mergedByRule = current.byRule.zip(initial.byRule).map {
+        case ((currentRule, currentObservations), (initialRule, initialObservations)) =>
+          require(currentRule == initialRule, "current/initial rule-set order mismatch")
+          val historicalObservations = historicalIndices.zipWithIndex.map {
+            case (initialIndex, offset) =>
+              val observation = initialObservations(initialIndex)
+              observation.copy(
+                exchangeOrdinal = firstHistoricalOrdinal + offset,
+                exchangePath = s"historical-initial.${observation.exchangePath}",
+                flags = observation.flags.copy(adaptivePlan = true))
+          }
+          currentRule -> (currentObservations ++ historicalObservations)
+      }
+      AnalyzedPlan(mergedByRule, current.runtimeKeys ++ historicalKeys)
+    }
+  }
+
+  private def runtimeKeyMatchesStage(
+      key: ShuffleRecoveryExchangeRuntimeKey,
+      stage: ShuffleRecoveryStageRuntime): Boolean = {
+    key.rddScopeId.exists(stage.rddScopeIds.contains) ||
+      key.shuffleWriteMetricIds.exists(stage.accumulatorIds.contains)
   }
 
   private def stateFor(qe: QueryExecution): ShuffleRecoveryRuntimeState = {
