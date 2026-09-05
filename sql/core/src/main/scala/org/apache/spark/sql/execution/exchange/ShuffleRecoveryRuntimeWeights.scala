@@ -132,9 +132,9 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       submittedAttempts.get((currentStageId, stageAttemptId)) match {
         case None =>
           invalidate(TaskForUnknownStageAttempt)
-        case Some(attemptOrder) if mapPartitionId < 0 || mapPartitionId >= expectedMapTasks =>
+        case Some(_) if mapPartitionId < 0 || mapPartitionId >= expectedMapTasks =>
           invalidate(MapPartitionOutOfRange)
-        case Some(attemptOrder) if shuffleWriteBytes < 0L || executorRunTimeMs < 0L =>
+        case Some(_) if shuffleWriteBytes < 0L || executorRunTimeMs < 0L =>
           invalidate(NegativeRuntimeMetric)
         case Some(attemptOrder) =>
           winners.get(mapPartitionId) match {
@@ -283,15 +283,19 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
     val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
     attemptToStage.remove(attemptKey).flatMap(activeStages.get).foreach { accumulator =>
       if (info.failureReason.isEmpty) {
-        completionCounter = Math.addExact(completionCounter, 1L)
         val stageKey = StageKey(accumulator.executionId, accumulator.shuffleId)
-        completed.update(
-          stageKey,
-          accumulator.finish(
-            info.stageId,
-            info.attemptNumber(),
-            info.accumulables.keys,
-            completionCounter))
+        if (info.numTasks == 0 && completed.contains(stageKey)) {
+          accumulator.recordAccumulatorIds(info.accumulables.keys)
+        } else {
+          completionCounter = Math.addExact(completionCounter, 1L)
+          completed.update(
+            stageKey,
+            accumulator.finish(
+              info.stageId,
+              info.attemptNumber(),
+              info.accumulables.keys,
+              completionCounter))
+        }
       } else {
         accumulator.recordAccumulatorIds(info.accumulables.keys)
       }
