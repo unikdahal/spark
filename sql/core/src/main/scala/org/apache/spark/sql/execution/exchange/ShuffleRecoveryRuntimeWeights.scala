@@ -57,7 +57,8 @@ private[sql] case class ShuffleRecoveryStageRuntime(
  *
  * `StageInfo.numTasks` can be only the partitions submitted for one retry, so total RDD partition
  * count is supplied separately as the coverage denominator. A later attempt replaces an earlier
- * candidate for the same map partition; duplicate successes within one attempt are counted once.
+ * candidate for the same map partition. Within one attempt, the latest successful completion
+ * replaces an earlier duplicate, matching MapOutputTracker's map-output registration semantics.
  */
 private[exchange] final class ShuffleRecoveryStageAccumulator(
     val executionId: Long,
@@ -110,7 +111,6 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       } else {
         winners.get(mapPartitionId) match {
           case Some(current) if current.stageAttemptId > stageAttemptId =>
-          case Some(current) if current.stageAttemptId == stageAttemptId =>
           case _ =>
             winners.update(
               mapPartitionId,

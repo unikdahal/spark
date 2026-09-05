@@ -151,6 +151,20 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     assert(result.accumulatorIds === Set(7L))
   }
 
+  test("same-attempt duplicate success follows latest MapOutputTracker registration") {
+    val accumulator = new ShuffleRecoveryStageAccumulator(
+      executionId = 1L, stageId = 2, shuffleId = 3, expectedMapTasks = 1)
+    accumulator.startAttempt(0)
+    accumulator.recordSuccessfulTask(0, mapPartitionId = 0, shuffleWriteBytes = 10L, 11L)
+    accumulator.recordSuccessfulTask(0, mapPartitionId = 0, shuffleWriteBytes = 20L, 21L)
+
+    val result = accumulator.finish(0, Set.empty, completionOrder = 1L)
+    assert(result.complete)
+    assert(result.successfulMapTaskWinners === 1)
+    assert(result.shuffleWriteBytes === 20L)
+    assert(result.executorRunTimeMs === 21L)
+  }
+
   test("successful stage with incomplete map winner coverage is explicitly invalid") {
     val accumulator = new ShuffleRecoveryStageAccumulator(1L, 2, 3, expectedMapTasks = 2)
     accumulator.startAttempt(0)
