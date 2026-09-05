@@ -51,6 +51,15 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       snapshot: ShuffleRecoveryOpportunityStudySnapshot,
       executions: Vector[ExecutedCase])
 
+  private case class CorrelationQuality(
+      weightedStageCount: Long,
+      completedStageCount: Long,
+      weightedBytes: Long,
+      completedBytes: Long,
+      weightedTaskTimeMs: Long,
+      completedTaskTimeMs: Long,
+      taskTimeBasisPoints: Long)
+
   private val CorrelationGateBasisPoints = 9500L
 
   private val smokeCases = Seq(
@@ -132,30 +141,54 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       smokeCases
     }
 
-    val tpcdsCases = benchmarkCases.filter(_.family == "TPC-DS")
-    val tpchCases = benchmarkCases.filter(_.family == "TPC-H")
     val tpcdsRun = withTpcdsTables(rowCount) {
-      runSqlCases(tpcdsCases)
+      runSqlCases(benchmarkCases.filter(_.family == "TPC-DS"))
     }
     val tpchRun = withTpchTables(rowCount) {
-      runSqlCases(tpchCases)
+      runSqlCases(benchmarkCases.filter(_.family == "TPC-H"))
     }
-    val syntheticRun = if (evidenceMode) runSyntheticCases() else emptyRun
-    val combined = combine(Seq(tpcdsRun, tpchRun, syntheticRun))
-
-    combined.snapshot.validateAccounting(ShuffleRecoveryStudyRuleSets.all)
-    assert(combined.snapshot.completedExecutionIds.size === combined.executions.size)
-    assert(combined.snapshot.records.nonEmpty, "TPC corpus produced no shuffle observations")
-    assert(combined.snapshot.records.exists {
-      _.disposition == ShuffleRecoveryWeightDisposition.Weighted
-    }, "TPC corpus produced no correlated physical shuffle work")
-
-    val correlation = validateCorrelationQuality(combined.snapshot, evidenceMode)
-    val corpus = ShuffleRecoveryCorpusDefinition(
+    val benchmarkRun = combine(Seq(tpcdsRun, tpchRun))
+    assert(benchmarkRun.executions.forall(_.family != "SYNTHETIC"))
+    val benchmarkCorpus = corpusDefinition(
       name = s"spark-in-tree-tpc-$mode-v2",
       scale = s"$rowCount deterministic generated rows per benchmark table",
+      executions = benchmarkRun.executions,
+      mode = mode)
+    val benchmarkReport = validateAndWriteRun(
+      outputMode = mode,
+      run = benchmarkRun,
+      corpus = benchmarkCorpus,
+      requireEvidenceScale = evidenceMode)
+    assert(benchmarkReport.contains("TPC-DS"))
+    assert(benchmarkReport.contains("TPC-H"))
+    assert(!benchmarkReport.contains("| SYNTHETIC |"))
+
+    if (evidenceMode) {
+      val syntheticRun = runSyntheticCases()
+      assert(syntheticRun.executions.forall(_.family == "SYNTHETIC"))
+      val syntheticCorpus = corpusDefinition(
+        name = "spark-controlled-synthetic-evidence-v1",
+        scale = "controlled deterministic synthetic shuffle shapes",
+        executions = syntheticRun.executions,
+        mode = mode)
+      validateAndWriteRun(
+        outputMode = "synthetic-evidence",
+        run = syntheticRun,
+        corpus = syntheticCorpus,
+        requireEvidenceScale = false)
+    }
+  }
+
+  private def corpusDefinition(
+      name: String,
+      scale: String,
+      executions: Seq[ExecutedCase],
+      mode: String): ShuffleRecoveryCorpusDefinition = {
+    ShuffleRecoveryCorpusDefinition(
+      name = name,
+      scale = scale,
       baselineSha = ShuffleRecoveryOpportunityReportBuilder.FrozenBaselineSha,
-      queries = combined.executions.map { executed =>
+      queries = executions.map { executed =>
         ShuffleRecoveryCorpusQuery(executed.family, executed.displayName, executed.aqe)
       },
       sparkConfigs = Seq(
@@ -169,9 +202,24 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       gateRuleSetVersion = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules.version,
       gateThresholdBasisPoints = ShuffleRecoveryOpportunityReportBuilder.GateThresholdBasisPoints,
       reproductionCommands = Seq(reproductionCommand(mode)))
+  }
+
+  private def validateAndWriteRun(
+      outputMode: String,
+      run: CorpusRun,
+      corpus: ShuffleRecoveryCorpusDefinition,
+      requireEvidenceScale: Boolean): String = {
+    run.snapshot.validateAccounting(ShuffleRecoveryStudyRuleSets.all)
+    assert(run.snapshot.completedExecutionIds.size === run.executions.size)
+    assert(run.snapshot.records.nonEmpty, s"$outputMode corpus produced no shuffle observations")
+    assert(run.snapshot.records.exists {
+      _.disposition == ShuffleRecoveryWeightDisposition.Weighted
+    }, s"$outputMode corpus produced no correlated physical shuffle work")
+
+    val correlation = validateCorrelationQuality(run.snapshot, requireEvidenceScale)
     val report = ShuffleRecoveryOpportunityReportBuilder.build(
-      combined.snapshot, ShuffleRecoveryStudyRuleSets.all, corpus)
-    val gateRecords = gateRuleRecords(combined.snapshot)
+      run.snapshot, ShuffleRecoveryStudyRuleSets.all, corpus)
+    val gateRecords = gateRuleRecords(run.snapshot)
     val hasUnweightedGateEvidence = gateRecords.exists {
       _.disposition == ShuffleRecoveryWeightDisposition.Unweighted
     }
@@ -179,25 +227,25 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       report.valueGate.result.nonEmpty ||
         hasUnweightedGateEvidence ||
         report.valueGate.completedExecutorRunTimeMs == 0L,
-      "TPC corpus value gate may be N/A only for unweighted evidence or zero task time")
-    val rawLines = combined.snapshot.deterministicJsonLines(ShuffleRecoveryStudyRuleSets.all)
+      s"$outputMode value gate may be N/A only for unweighted evidence or zero task time")
+    val rawLines = run.snapshot.deterministicJsonLines(ShuffleRecoveryStudyRuleSets.all)
     assert(rawLines.nonEmpty)
     ShuffleRecoveryOpportunityRawIO.parseLines(rawLines)
     val rendered = report.toMarkdown
     val rebuilt = ShuffleRecoveryOpportunityReportBuilder.build(
-      combined.snapshot, ShuffleRecoveryStudyRuleSets.all, corpus).toMarkdown
+      run.snapshot, ShuffleRecoveryStudyRuleSets.all, corpus).toMarkdown
     assert(rendered === rebuilt)
     assert(rendered.contains("## Reproduction"))
-    assert(rendered.contains(s"SPARK_SHUFFLE_RECOVERY_CORPUS_MODE=$mode"))
     assert(rendered.contains("not benchmark-scale performance estimates"))
 
     writeArtifacts(
-      mode,
+      outputMode,
       rawLines,
       rendered,
-      renderCorrelationReport(mode, correlation, combined.snapshot),
-      renderReconciliation(gateRecords, combined.snapshot.stages),
-      renderSensitivity(combined.executions, gateRecords))
+      renderCorrelationReport(outputMode, correlation, run.snapshot),
+      renderReconciliation(gateRecords, run.snapshot.stages),
+      renderSensitivity(run.executions, gateRecords))
+    rendered
   }
 
   private def reproductionCommand(mode: String): String = {
@@ -212,7 +260,6 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
   }
 
   private def runSqlCases(cases: Seq[CorpusCase]): CorpusRun = {
-    if (cases.isEmpty) return emptyRun
     val study = new ShuffleRecoveryOpportunityStudy(spark)
     study.install()
     try {
@@ -360,24 +407,9 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       nonEmpty.flatMap(_.executions).toVector)
   }
 
-  private def emptyRun: CorpusRun = {
-    CorpusRun(
-      ShuffleRecoveryOpportunityStudySnapshot(Nil, Nil, Nil, Nil, Nil),
-      Vector.empty)
-  }
-
-  private case class CorrelationQuality(
-      weightedStageCount: Long,
-      completedStageCount: Long,
-      weightedBytes: Long,
-      completedBytes: Long,
-      weightedTaskTimeMs: Long,
-      completedTaskTimeMs: Long,
-      taskTimeBasisPoints: Long)
-
   private def validateCorrelationQuality(
       snapshot: ShuffleRecoveryOpportunityStudySnapshot,
-      evidenceMode: Boolean): CorrelationQuality = {
+      requireEvidenceScale: Boolean): CorrelationQuality = {
     val gateRecords = gateRuleRecords(snapshot)
     val weightedPhysical = gateRecords.flatMap { record =>
       for {
@@ -401,9 +433,9 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       basisPoints >= CorrelationGateBasisPoints,
       s"runtime correlation coverage $basisPoints bp is below the frozen " +
         s"$CorrelationGateBasisPoints bp gate")
-    if (evidenceMode) {
+    if (requireEvidenceScale) {
       assert(completedStages.size >= 100,
-        "manual evidence campaign must materially execute at least 100 shuffle stages")
+        "manual benchmark campaign must materially execute at least 100 shuffle stages")
     }
     CorrelationQuality(
       correlatedStages.size,
@@ -436,7 +468,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
     Seq(
       s"# Phase 0-A runtime-correlation quality ($mode)",
       "",
-      s"- Frozen minimum completed-task-time coverage: 95.0%",
+      "- Frozen minimum completed-task-time coverage: 95.0%",
       s"- Result: ${renderBasisPoints(quality.taskTimeBasisPoints)}",
       s"- Completed shuffle stages: ${quality.completedStageCount}",
       s"- Correlated completed shuffle stages: ${quality.weightedStageCount}",
@@ -449,8 +481,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       "",
       "The denominator is materially executed, completed shuffle-map-stage work. " +
         "Merely planned exchanges do not add task time or bytes.",
-      "")
-      .mkString("\n")
+      "").mkString("\n")
   }
 
   private def renderReconciliation(
@@ -542,7 +573,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
     out.append(s"- Top 5 exchange concentration: ${renderRatio(top5, totalTime)}\n")
     out.append(s"- Top 1 query concentration: ${renderRatio(topQuery, totalTime)}\n")
     out.append(s"- Top 5 query concentration: ${renderRatio(top5Queries, totalTime)}\n")
-    out.append(s"- Queries with zero eligible material work: ")
+    out.append("- Queries with zero eligible material work: ")
     out.append(queryRows.count { case (_, _, eligible, _) => eligible == 0L })
     out.append(s"/${queryRows.size}\n\n")
     appendGroupedSensitivity(out, "Benchmark family", queryRows.groupBy(_._1.family))
