@@ -45,9 +45,9 @@ private[spark] final class ReferenceShuffleRecoveryClaimProvider(
     throw new IllegalArgumentException("provider root and SparkConf must not be null")
   }
 
-  private final case class ActiveBinding(
-      binding: ShuffleRecoveryBinding,
-      provider: ReferenceShuffleProvider)
+  private final class ActiveBinding(
+      val binding: ShuffleRecoveryBinding,
+      val provider: ReferenceShuffleProvider)
 
   private val activeBindings = new ConcurrentHashMap[String, ActiveBinding]()
 
@@ -82,7 +82,7 @@ private[spark] final class ReferenceShuffleRecoveryClaimProvider(
       request.recoveryGroup,
       request.publishingGeneration,
       request.incarnationId)
-    val active = ActiveBinding(binding, provider)
+    val active = new ActiveBinding(binding, provider)
     if (activeBindings.putIfAbsent(binding.bindingId, active) != null) {
       return ShuffleRecoveryClaimUnavailable
     }
