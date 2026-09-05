@@ -227,6 +227,13 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
       record.schemaVersion == SchemaVersion,
       s"unsupported opportunity schema version ${record.schemaVersion}")
     require(record.executionId.matches("query-[0-9]{20}"), "invalid execution id")
+    val executionNumber = record.executionId.substring("query-".length)
+    try {
+      executionNumber.toLong
+    } catch {
+      case _: NumberFormatException =>
+        throw new IllegalArgumentException("execution id exceeds signed long range")
+    }
     require(record.exchangeOrdinal >= 0L, "exchange ordinal must be non-negative")
     require(record.exchangePath.nonEmpty, "exchange path must be non-empty")
     require(record.childOperatorClass.nonEmpty, "child operator class must be non-empty")
@@ -302,6 +309,15 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     require(
       ShuffleRecoveryAccountingReason.All.contains(accountingReason),
       s"invalid accounting reason $accountingReason")
+    if (record.disposition == "EXCLUDED") {
+      require(
+        accountingReason == ShuffleRecoveryAccountingReason.ReusedPhysicalWork,
+        "only reused physical work may be excluded from the denominator")
+    } else {
+      require(
+        accountingReason != ShuffleRecoveryAccountingReason.ReusedPhysicalWork,
+        "reused physical work must use the excluded disposition")
+    }
     val runtimeFields = Seq(
       record.stageId,
       record.stageAttemptId,
