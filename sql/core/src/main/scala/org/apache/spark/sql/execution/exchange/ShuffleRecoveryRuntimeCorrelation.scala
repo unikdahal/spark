@@ -365,11 +365,11 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
       scopeCandidates: Seq[ShuffleRecoveryStageRuntime],
       metricCandidates: Seq[ShuffleRecoveryStageRuntime]): Seq[ShuffleRecoveryStageRuntime] = {
     if (scopeCandidates.nonEmpty) {
-      val scopeShuffleIds = scopeCandidates.iterator.map(_.shuffleId).toSet
-      val metricConflicts = metricCandidates.exists { stage =>
-        !scopeShuffleIds.contains(stage.shuffleId)
-      }
-      if (metricConflicts) scopeCandidates ++ metricCandidates else scopeCandidates
+      val metricShuffleIds = metricCandidates.iterator.map(_.shuffleId).toSet
+      val uniqueMetricConflict = scopeCandidates.size == 1 &&
+        metricShuffleIds.size == 1 &&
+        !metricShuffleIds.contains(scopeCandidates.head.shuffleId)
+      if (uniqueMetricConflict) scopeCandidates ++ metricCandidates else scopeCandidates
     } else {
       metricCandidates
     }
