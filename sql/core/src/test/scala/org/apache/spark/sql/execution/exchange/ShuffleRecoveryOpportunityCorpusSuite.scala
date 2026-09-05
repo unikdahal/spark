@@ -132,6 +132,9 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       reproductionCommands = Seq(reproductionCommand(mode)))
     val report = ShuffleRecoveryOpportunityReportBuilder.build(
       combined, ShuffleRecoveryStudyRuleSets.all, corpus)
+    assert(
+      report.valueGate.result.nonEmpty,
+      "TPC corpus value gate must resolve after complete denominator accounting")
     val rawLines = combined.deterministicJsonLines(ShuffleRecoveryStudyRuleSets.all)
     assert(rawLines.nonEmpty)
     ShuffleRecoveryOpportunityRawIO.parseLines(rawLines)
