@@ -184,6 +184,11 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       scale: String,
       executions: Seq[ExecutedCase],
       mode: String): ShuffleRecoveryCorpusDefinition = {
+    val failureDistributionVersion = if (mode == "evidence") {
+      ShuffleRecoveryOpportunityReportBuilder.EvidenceFailureDistributionVersion
+    } else {
+      ShuffleRecoveryOpportunityReportBuilder.FailureDistributionVersion
+    }
     ShuffleRecoveryCorpusDefinition(
       name = name,
       scale = scale,
@@ -196,8 +201,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
         SQLConf.DYNAMIC_PARTITION_PRUNING_ENABLED.key -> "true",
         "spark.master" -> spark.sparkContext.master),
-      failureDistributionVersion =
-        ShuffleRecoveryOpportunityReportBuilder.FailureDistributionVersion,
+      failureDistributionVersion = failureDistributionVersion,
       gateRuleSetName = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules.name,
       gateRuleSetVersion = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules.version,
       gateThresholdBasisPoints = ShuffleRecoveryOpportunityReportBuilder.GateThresholdBasisPoints,
