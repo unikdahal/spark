@@ -105,6 +105,35 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
     assert(result.executorRunTimeMs === 21L)
   }
 
+  test("duplicate stage submissions preserve the original retry order") {
+    val accumulator = new ShuffleRecoveryStageAccumulator(
+      executionId = 1L, stageId = 2, shuffleId = 3, expectedMapTasks = 1)
+    accumulator.startAttempt(currentStageId = 2, stageAttemptId = 0, attemptOrder = 1L)
+    accumulator.startAttempt(currentStageId = 9, stageAttemptId = 0, attemptOrder = 2L)
+    accumulator.startAttempt(currentStageId = 2, stageAttemptId = 0, attemptOrder = 3L)
+
+    accumulator.recordSuccessfulTask(
+      currentStageId = 9,
+      stageAttemptId = 0,
+      mapPartitionId = 0,
+      shuffleWriteBytes = 20L,
+      executorRunTimeMs = 21L)
+    accumulator.recordSuccessfulTask(
+      currentStageId = 2,
+      stageAttemptId = 0,
+      mapPartitionId = 0,
+      shuffleWriteBytes = 999L,
+      executorRunTimeMs = 999L)
+
+    val result = accumulator.finish(
+      successfulStageId = 9,
+      successfulStageAttemptId = 0,
+      completionOrder = 1L)
+    assert(result.complete)
+    assert(result.shuffleWriteBytes === 20L)
+    assert(result.executorRunTimeMs === 21L)
+  }
+
   test("zero-task skipped stage preserves completion and adds correlation IDs") {
     val listener = new ShuffleRecoveryRuntimeWeightListener
     val properties = new Properties()
