@@ -20,9 +20,7 @@ package org.apache.spark.sql.execution.exchange
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
 
-import scala.collection.mutable.ArrayBuffer
-
-import org.apache.spark.sql.{Column, DataFrame, TPCDSSchema}
+import org.apache.spark.sql.{Column, TPCDSSchema}
 import org.apache.spark.sql.catalyst.util.resourceToString
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
@@ -51,7 +49,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
 
   private case class CorpusRun(
       snapshot: ShuffleRecoveryOpportunityStudySnapshot,
-      executions: Seq[ExecutedCase])
+      executions: Vector[ExecutedCase])
 
   private val CorrelationGateBasisPoints = 9500L
 
@@ -231,7 +229,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
         "each benchmark case must produce exactly one completed SQL execution")
       val executions = cases.zip(snapshot.completedExecutionIds).map { case (c, id) =>
         ExecutedCase(c.family, c.displayName, c.aqe, id)
-      }
+      }.toVector
       CorpusRun(snapshot, executions)
     } finally {
       study.close()
@@ -239,7 +237,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
   }
 
   private def runSyntheticCases(): CorpusRun = {
-    val cases = Seq(
+    val cases: Seq[(String, () => Unit)] = Seq(
       "sparse-shuffle" -> (() => sparseShuffle()),
       "wide-reducer-count" -> (() => wideReducerShuffle()),
       "many-mappers" -> (() => manyMapperShuffle()),
@@ -264,7 +262,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
         "each synthetic case must produce exactly one completed SQL execution")
       val executions = expanded.zip(snapshot.completedExecutionIds).map {
         case ((name, aqe, _), id) => ExecutedCase("SYNTHETIC", name, aqe, id)
-      }
+      }.toVector
       CorpusRun(snapshot, executions)
     } finally {
       study.close()
@@ -359,13 +357,13 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
         failedExecutions = nonEmpty.flatMap(_.snapshot.failedExecutions),
         analysisFailures = nonEmpty.flatMap(_.snapshot.analysisFailures),
         stages = nonEmpty.flatMap(_.snapshot.stages)),
-      nonEmpty.flatMap(_.executions))
+      nonEmpty.flatMap(_.executions).toVector)
   }
 
   private def emptyRun: CorpusRun = {
     CorpusRun(
       ShuffleRecoveryOpportunityStudySnapshot(Nil, Nil, Nil, Nil, Nil),
-      Nil)
+      Vector.empty)
   }
 
   private case class CorrelationQuality(
@@ -471,7 +469,8 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       "stageAttemptId",
       "shuffleId",
       "expectedMappers",
-      "successfulMapWinners",
+      "observedSuccessfulMapTaskCompletions",
+      "acceptedMapWinners",
       "stageComplete",
       "shuffleWriteBytes",
       "executorRunTimeMs").mkString("\t")
@@ -493,6 +492,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
         record.stageAttemptId.map(_.toString).getOrElse(""),
         record.shuffleId.map(_.toString).getOrElse(""),
         stage.map(_.expectedMapTasks.toString).getOrElse(""),
+        stage.map(_.observedSuccessfulMapTaskCompletions.toString).getOrElse(""),
         stage.map(_.successfulMapTaskWinners.toString).getOrElse(""),
         stage.map(_.complete.toString).getOrElse(""),
         record.shuffleWriteBytes.map(_.toString).getOrElse(""),
@@ -504,7 +504,6 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
   private def renderSensitivity(
       executions: Seq[ExecutedCase],
       gateRecords: Seq[ShuffleRecoveryWeightedObservation]): String = {
-    val executionIndex = executions.map(e => e.executionId -> e).toMap
     val weighted = gateRecords.filter(_.disposition == ShuffleRecoveryWeightDisposition.Weighted)
     val byExecution = weighted.groupBy { record =>
       executionNumber(record.classification.executionId).get
