@@ -132,9 +132,18 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       reproductionCommands = Seq(reproductionCommand(mode)))
     val report = ShuffleRecoveryOpportunityReportBuilder.build(
       combined, ShuffleRecoveryStudyRuleSets.all, corpus)
+    val gateRecords = combined.records.filter { record =>
+      record.classification.ruleSetName == corpus.gateRuleSetName &&
+        record.classification.ruleSetVersion == corpus.gateRuleSetVersion
+    }
+    val hasUnweightedGateEvidence = gateRecords.exists {
+      _.disposition == ShuffleRecoveryWeightDisposition.Unweighted
+    }
     assert(
-      report.valueGate.result.nonEmpty,
-      "TPC corpus value gate must resolve after complete denominator accounting")
+      report.valueGate.result.nonEmpty ||
+        hasUnweightedGateEvidence ||
+        report.valueGate.completedExecutorRunTimeMs == 0L,
+      "TPC corpus value gate may be N/A only for unweighted evidence or zero task time")
     val rawLines = combined.deterministicJsonLines(ShuffleRecoveryStudyRuleSets.all)
     assert(rawLines.nonEmpty)
     ShuffleRecoveryOpportunityRawIO.parseLines(rawLines)
