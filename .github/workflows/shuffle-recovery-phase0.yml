@@ -144,10 +144,10 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityAnalyzerSuite"
 
-      - name: Run weighted runtime and report suite
+      - name: Run weighted runtime and report suites
         run: |
           ./build/sbt -Phadoop-3 -Phive \
-            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite"
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite"
 
       - name: Run adaptive partition-rule regression suite
         run: |
@@ -175,11 +175,18 @@ jobs:
             -name '*ShuffleRecoveryOpportunityAnalyzerSuite*.xml' -print -quit)"
           study_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryOpportunityStudySuite*.xml' -print -quit)"
+          retry_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryRuntimeWeightsSuite*.xml' -print -quit)"
           corpus_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryOpportunityCorpusSuite*.xml' -print -quit)"
           adaptive_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml' -print -quit)"
-          for report in "${analyzer_report}" "${study_report}" "${corpus_report}" "${adaptive_report}"; do
+          for report in \
+            "${analyzer_report}" \
+            "${study_report}" \
+            "${retry_report}" \
+            "${corpus_report}" \
+            "${adaptive_report}"; do
             if [[ -z "${report}" ]]; then
               echo "A focused Phase 0-A suite produced no test report." >&2
               exit 1
@@ -231,6 +238,7 @@ jobs:
             sql/core/target/shuffle-recovery-phase0/opportunity/**
             **/target/test-reports/*ShuffleRecoveryOpportunityAnalyzerSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityStudySuite*.xml
+            **/target/test-reports/*ShuffleRecoveryRuntimeWeightsSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityCorpusSuite*.xml
             **/target/test-reports/*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
