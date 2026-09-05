@@ -463,7 +463,7 @@ private[spark] object ReferenceShuffleProviderProcess {
       manifest: ShuffleRecoveryManifest): String = {
     val rows = shapes.map { case (maps, reducers, bytes) =>
       s"| $maps | $reducers | $bytes | ${if (maps == 0) 0L else bytes / maps} |"
-    }.mkString("\n")
+    }.mkString("\n       |")
     s"""# Phase 0 persistent reference shuffle read representation
        |
        |## Selected Spark extension points
