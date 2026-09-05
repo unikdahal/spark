@@ -410,16 +410,20 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
     require(
       corpus.gateThresholdBasisPoints == GateThresholdBasisPoints,
       s"value gate must remain at $GateThresholdBasisPoints basis points")
-    val preregisteredGate = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules
+    val preregisteredGate = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual
     require(
-      corpus.gateRuleSetName == preregisteredGate.name &&
-        corpus.gateRuleSetVersion == preregisteredGate.version,
+      corpus.gateRuleSetName == preregisteredGate.rules.name &&
+        corpus.gateRuleSetVersion == preregisteredGate.rules.version,
       "value gate must use the preregistered exact-source counterfactual rule")
-    val gateRuleExists = ruleSets.exists { rule =>
+    require(
+      ruleSets.map(rule => (rule.rules.name, rule.rules.version)).distinct.size == ruleSets.size,
+      "scope-curve rule-set name/version pairs must be unique")
+    val gateRule = ruleSets.find { rule =>
       rule.rules.name == corpus.gateRuleSetName &&
         rule.rules.version == corpus.gateRuleSetVersion
     }
-    require(gateRuleExists, "gate rule set is not part of the declared scope curve")
+    require(gateRule.contains(preregisteredGate),
+      "value gate must use the canonical preregistered rule definition")
 
     val summaries = ruleSets.map { ruleSet =>
       val records = matchingRecords(snapshot, ruleSet.rules.name, ruleSet.rules.version)
