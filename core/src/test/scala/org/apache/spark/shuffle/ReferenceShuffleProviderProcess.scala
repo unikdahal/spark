@@ -67,7 +67,7 @@ private[spark] object ReferenceShuffleProviderProcess {
     writeEmptyShape(root, "shape-r128", maps = 4, reducers = 128, taskBase = 3000L)
     writeEmptyShape(root, "shape-r4096", maps = 2, reducers = 4096, taskBase = 4000L)
 
-    println("REFERENCE_SHUFFLE_WRITE_OK")
+    writeSuccessMarker("REFERENCE_SHUFFLE_WRITE_OK")
   }
 
   private def read(root: Path, report: Path): Unit = {
@@ -119,7 +119,7 @@ private[spark] object ReferenceShuffleProviderProcess {
     proof.cleanupGroup()
     proof.cleanupGroup()
     require(directoryIsEmpty(root), "explicit group cleanup left durable artifacts")
-    println("REFERENCE_SHUFFLE_READ_OK")
+    writeSuccessMarker("REFERENCE_SHUFFLE_READ_OK")
   }
 
   private def writeLargeBlock(root: Path): Unit = {
@@ -325,6 +325,11 @@ private[spark] object ReferenceShuffleProviderProcess {
       i += 1
     }
     crc.getValue
+  }
+
+  private def writeSuccessMarker(marker: String): Unit = {
+    System.out.write((marker + "\n").getBytes(StandardCharsets.UTF_8))
+    System.out.flush()
   }
 
   private def directoryIsEmpty(path: Path): Boolean = {
