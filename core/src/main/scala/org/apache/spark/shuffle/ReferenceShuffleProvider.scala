@@ -507,10 +507,23 @@ private final class ReferenceShuffleMapOutputWriter(
   }
 
   private def closePartitionWriters(): Unit = {
+    var firstError: IOException = null
     partitionWriters.foreach { writer =>
       if (writer != null) {
-        writer.closeIfOpen()
+        try {
+          writer.closeIfOpen()
+        } catch {
+          case e: IOException =>
+            if (firstError == null) {
+              firstError = e
+            } else {
+              firstError.addSuppressed(e)
+            }
+        }
       }
+    }
+    if (firstError != null) {
+      throw firstError
     }
   }
 
