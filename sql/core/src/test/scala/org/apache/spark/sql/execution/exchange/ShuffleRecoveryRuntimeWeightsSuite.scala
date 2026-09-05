@@ -20,7 +20,10 @@ package org.apache.spark.sql.execution.exchange
 import java.util.Properties
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.scheduler.{SparkListenerStageCompleted, SparkListenerStageSubmitted, StageInfo}
+import org.apache.spark.scheduler.{
+  SparkListenerStageCompleted,
+  SparkListenerStageSubmitted,
+  StageInfo}
 import org.apache.spark.sql.execution.SQLExecution
 
 class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
