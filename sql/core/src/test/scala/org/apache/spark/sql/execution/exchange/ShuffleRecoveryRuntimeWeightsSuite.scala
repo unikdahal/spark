@@ -17,7 +17,11 @@
 
 package org.apache.spark.sql.execution.exchange
 
+import java.util.Properties
+
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.scheduler.{SparkListenerStageCompleted, SparkListenerStageSubmitted, StageInfo}
+import org.apache.spark.sql.execution.SQLExecution
 
 class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
 
@@ -95,5 +99,36 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
     assert(result.complete)
     assert(result.shuffleWriteBytes === 20L)
     assert(result.executorRunTimeMs === 21L)
+  }
+
+  test("zero-task skipped stage does not move an already completed shuffle") {
+    val listener = new ShuffleRecoveryRuntimeWeightListener
+    val properties = new Properties()
+    properties.setProperty(SQLExecution.EXECUTION_ID_KEY, "1")
+
+    def stageInfo(stageId: Int): StageInfo = new StageInfo(
+      stageId = stageId,
+      attemptId = 0,
+      name = "shuffle",
+      numTasks = 0,
+      rddInfos = Nil,
+      parentIds = Nil,
+      details = "",
+      shuffleDepId = Some(3),
+      resourceProfileId = 0)
+
+    val first = stageInfo(2)
+    listener.onStageSubmitted(SparkListenerStageSubmitted(first, properties))
+    listener.onStageCompleted(SparkListenerStageCompleted(first))
+
+    val skipped = stageInfo(9)
+    listener.onStageSubmitted(SparkListenerStageSubmitted(skipped, properties))
+    listener.onStageCompleted(SparkListenerStageCompleted(skipped))
+
+    val result = listener.snapshot()
+    assert(result.size === 1)
+    assert(result.head.complete)
+    assert(result.head.stageId === 2)
+    assert(result.head.completionOrder === 1L)
   }
 }
