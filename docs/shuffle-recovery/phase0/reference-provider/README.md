@@ -92,9 +92,9 @@ REPORT="core/target/shuffle-recovery-phase0/reference-provider/read-representati
   read ${ROOT} ${REPORT}"
 ```
 
-The second JVM verifies sparse and zero-total maps, one-byte and skewed non-empty blocks, wide
-indexes, exact physical lengths, and explicit idempotent group cleanup. It also emits the compact
-read-representation report consumed by the dedicated Phase 0 CI workflow.
+The second JVM verifies sparse and zero-total maps, one-byte, skewed, and 64 MiB non-empty blocks,
+wide indexes, exact physical lengths and checksums, and explicit idempotent group cleanup. It also
+emits the compact read-representation report consumed by the dedicated Phase 0 CI workflow.
 
 ## Explicit limitations
 
