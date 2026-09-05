@@ -21,7 +21,7 @@ import java.io.{ByteArrayInputStream, ByteArrayOutputStream, DataInputStream, Da
 import java.nio.ByteBuffer
 import java.nio.channels.FileChannel
 import java.nio.charset.{CodingErrorAction, StandardCharsets}
-import java.nio.file.{FileAlreadyExistsException, Files, LinkOption, Path, StandardCopyOption, StandardOpenOption}
+import java.nio.file.{FileAlreadyExistsException, Files, LinkOption, Path, StandardOpenOption}
 import java.security.MessageDigest
 import java.util.{Base64, UUID}
 
@@ -31,11 +31,10 @@ import scala.util.control.NonFatal
 import org.apache.spark.internal.Logging
 
 /**
- * Feasibility-only recovery identity used to prove cross-driver shuffle adoption.
+ * Deliberately narrow Phase 0 identity used only to prove the cold-driver mechanism.
  *
- * This encoding is intentionally narrower than the proposed production computation-identity
- * contract and must not be treated as a stable API. Every field is reviewed for the deterministic
- * feasibility workload; attempt-local scheduler identifiers are deliberately absent.
+ * This is not the proposed production recovery identity. Every field is explicitly reviewed for
+ * the deterministic feasibility workload; attempt-local scheduler ids are deliberately absent.
  */
 private[spark] final case class ShuffleRecoveryFeasibilityIdentity(
     sourceToken: String,
@@ -54,6 +53,8 @@ private[spark] final case class ShuffleRecoveryFeasibilityIdentity(
   private[shuffle] lazy val digest: String =
     ShuffleRecoveryManifestCodec.sha256Hex(canonicalPayload.toArray)
 
+  // The short namespace is only an index fan-out key. Full digest and full canonical payload are
+  // always checked before a candidate can match.
   private[shuffle] lazy val lookupPrefix: String = digest.substring(0, 2)
 }
 
@@ -97,12 +98,7 @@ private[spark] final case class ShuffleRecoveryMapArtifact(
     dataLength: Long,
     indexLength: Long)
 
-/**
- * Immutable, bounded description of one complete reference-provider shuffle incarnation.
- *
- * The manifest contains O(M) map handles and at most O(R) explicit reducer aggregates. It never
- * serializes Spark scheduler objects, MapStatus, or a dense mapper-by-reducer matrix.
- */
+/** Immutable description of one complete reference-provider shuffle incarnation. */
 private[spark] final case class ShuffleRecoveryManifest(
     recoveryGroup: String,
     generation: Long,
@@ -121,7 +117,7 @@ private[spark] object ShuffleRecoveryManifest {
 }
 
 private[shuffle] object ShuffleRecoveryIdentityCodec {
-  private val Magic = 0x53524931
+  private val Magic = 0x53524931 // SRI1
 
   def encode(identity: ShuffleRecoveryFeasibilityIdentity): Array[Byte] = {
     ShuffleRecoveryManifestCodec.validateIdentityFields(identity)
@@ -145,7 +141,8 @@ private[shuffle] object ShuffleRecoveryIdentityCodec {
     val result = bytes.toByteArray
     if (result.length > ShuffleRecoveryManifestCodec.MaxIdentityBytes) {
       throw new IllegalArgumentException(
-        s"canonical feasibility identity exceeds ${ShuffleRecoveryManifestCodec.MaxIdentityBytes} bytes")
+        s"canonical feasibility identity exceeds " +
+          s"${ShuffleRecoveryManifestCodec.MaxIdentityBytes} bytes")
     }
     result
   }
@@ -180,13 +177,14 @@ private[shuffle] object ShuffleRecoveryIdentityCodec {
       identity
     } catch {
       case e: IOException => throw e
+      case e: IllegalArgumentException => throw new IOException("invalid feasibility identity", e)
       case NonFatal(e) => throw new IOException("malformed feasibility identity", e)
     }
   }
 }
 
 private[spark] object ShuffleRecoveryManifestCodec {
-  private val Magic = 0x53524d31
+  private val Magic = 0x53524d31 // SRM1
 
   private[shuffle] val MaxManifestBytes = 4 * 1024 * 1024
   private[shuffle] val MaxIdentityBytes = 16 * 1024
@@ -199,10 +197,6 @@ private[spark] object ShuffleRecoveryManifestCodec {
     validateManifest(manifest)
     val identityPayload = manifest.identity.canonicalPayload.toArray
     val estimated = estimateEncodedSize(manifest, identityPayload.length)
-    if (estimated > MaxManifestBytes) {
-      throw new IllegalArgumentException(s"manifest exceeds $MaxManifestBytes bytes")
-    }
-
     val bytes = new ByteArrayOutputStream(estimated)
     val out = new DataOutputStream(bytes)
     out.writeInt(Magic)
@@ -213,8 +207,7 @@ private[spark] object ShuffleRecoveryManifestCodec {
     out.writeInt(ShuffleRecoveryFeasibilityIdentity.EncodingVersion)
     writeString(out, manifest.identity.digest, "identity digest")
     writeBytes(out, identityPayload, MaxIdentityBytes, "identity payload")
-    writeString(
-      out, manifest.identity.providerCompatibilityId, "provider compatibility id")
+    writeString(out, manifest.identity.providerCompatibilityId, "provider compatibility id")
     out.writeInt(manifest.mapperCount)
     out.writeInt(manifest.reducerCount)
     out.writeInt(manifest.descriptorVersion)
@@ -231,8 +224,7 @@ private[spark] object ShuffleRecoveryManifestCodec {
         out.writeBoolean(true)
         out.writeInt(values.size)
         values.foreach(out.writeLong)
-      case None =>
-        out.writeBoolean(false)
+      case None => out.writeBoolean(false)
     }
     out.writeLong(manifest.publicationTimestampMillis)
     out.flush()
@@ -263,14 +255,17 @@ private[spark] object ShuffleRecoveryManifestCodec {
       if (identityVersion != ShuffleRecoveryFeasibilityIdentity.EncodingVersion) {
         throw new IOException(s"unsupported feasibility identity version: $identityVersion")
       }
-      val identityDigest = readString(in, "identity digest")
+      val expectedDigest = readString(in, "identity digest")
+      if (!expectedDigest.matches("[0-9a-f]{64}")) {
+        throw new IOException("malformed feasibility identity digest")
+      }
       val identityPayload = readBytes(in, MaxIdentityBytes, "identity payload")
       val actualDigest = sha256Hex(identityPayload)
-      if (!constantTimeEquals(identityDigest, actualDigest)) {
+      if (!constantTimeEquals(expectedDigest, actualDigest)) {
         throw new IOException("feasibility identity digest mismatch")
       }
       val identity = ShuffleRecoveryIdentityCodec.decode(identityPayload)
-      if (!constantTimeEquals(identity.digest, identityDigest)) {
+      if (!constantTimeEquals(identity.digest, expectedDigest)) {
         throw new IOException("canonical feasibility identity digest mismatch")
       }
       val providerCompatibilityId = readString(in, "provider compatibility id")
@@ -282,17 +277,19 @@ private[spark] object ShuffleRecoveryManifestCodec {
       val descriptorVersion = in.readInt()
       val handleCount = in.readInt()
       validateCountsBeforeAllocation(mapperCount, reducerCount, handleCount)
+
       val artifacts = Vector.newBuilder[ShuffleRecoveryMapArtifact]
-      var index = 0
-      while (index < handleCount) {
+      var mapIndex = 0
+      while (mapIndex < handleCount) {
         artifacts += ShuffleRecoveryMapArtifact(
           in.readInt(),
           in.readLong(),
           readString(in, "provider handle"),
           in.readLong(),
           in.readLong())
-        index += 1
+        mapIndex += 1
       }
+
       val reducerBytes = if (in.readBoolean()) {
         val count = in.readInt()
         if (count != reducerCount || count < 0 || count > MaxReducers) {
@@ -312,6 +309,7 @@ private[spark] object ShuffleRecoveryManifestCodec {
       if (in.available() != 0) {
         throw new IOException("trailing manifest bytes")
       }
+
       val manifest = ShuffleRecoveryManifest(
         recoveryGroup,
         generation,
@@ -433,8 +431,7 @@ private[spark] object ShuffleRecoveryManifestCodec {
         throw new IOException("map artifact count exceeds manifest allocation budget")
       }
     } catch {
-      case _: ArithmeticException =>
-        throw new IOException("map artifact count overflow")
+      case _: ArithmeticException => throw new IOException("map artifact count overflow")
     }
   }
 
@@ -458,7 +455,9 @@ private[spark] object ShuffleRecoveryManifestCodec {
     manifest.mapArtifacts.foreach { artifact =>
       add(28L + encodedLength(artifact.providerHandle))
     }
-    manifest.reducerBytes.foreach(values => add(4L + Math.multiplyExact(values.size.toLong, 8L)))
+    manifest.reducerBytes.foreach { values =>
+      add(4L + Math.multiplyExact(values.size.toLong, 8L))
+    }
     size.toInt
   }
 
@@ -557,11 +556,10 @@ private[spark] case object ShuffleRecoveryManifestAlreadyPublished
 /**
  * Local-filesystem Phase 0 manifest store.
  *
- * Bodies and index references are immutable files. Publication commits the body first and only then
- * exposes an immutable index reference using a same-filesystem atomic rename. This is deliberately
- * a local filesystem mechanism; it does not claim that rename is a transaction primitive for
- * object stores. A failed index commit may leave an unreachable body, but can never expose a torn
- * manifest. Later retirement can remove an exact index reference without rewriting body bytes.
+ * A committed body or index reference is created with a no-replace hard-link operation only after
+ * its temporary file has been fully written and fsynced. A reader therefore observes either no
+ * final name or complete immutable bytes. This deliberately relies on one local filesystem with
+ * hard-link and directory-fsync support; it is not an object-store transaction model.
  */
 private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logging {
   import ShuffleRecoveryManifestStore._
@@ -580,18 +578,14 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
 
     val bodyResult = commitImmutable(body, bodyBytes)
     val referenceBytes = encodeReference(manifest, body.getFileName.toString)
-    try {
-      commitImmutable(reference, referenceBytes)
-    } catch {
-      case NonFatal(e) if bodyResult == ShuffleRecoveryManifestAlreadyPublished => throw e
-      case NonFatal(e) => throw e
-    }
+    commitImmutable(reference, referenceBytes)
     bodyResult
   }
 
   /**
    * Finds a full-payload-compatible candidate from a bounded short-digest namespace.
-   * Same/future generations are ignored; malformed candidates are refused without mutation.
+   * Same/future generations are ignored. A malformed candidate is ignored individually; an
+   * overfull namespace fails closed instead of turning an unbounded directory into lookup work.
    */
   def findCompatible(
       recoveryGroup: String,
@@ -603,22 +597,36 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
       throw new IllegalArgumentException("current generation must be positive")
     }
     val index = indexDirectory(recoveryGroup, identity.lookupPrefix)
-    if (!Files.isDirectory(index, LinkOption.NOFOLLOW_LINKS)) {
+    if (!Files.isDirectory(index, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(index)) {
       return None
     }
 
-    boundedReferences(index).sortBy(reference => -reference.generation).iterator.flatMap { ref =>
+    val references = boundedReferencePaths(index).flatMap { path =>
+      try {
+        Some(readReference(path))
+      } catch {
+        case NonFatal(e) =>
+          logWarning(s"Ignoring malformed shuffle recovery index reference $path", e)
+          None
+      }
+    }
+
+    references.sortBy(reference => -reference.generation).iterator.flatMap { ref =>
       if (ref.generation >= currentGeneration) {
         Iterator.empty
       } else {
         try {
           val body = bodiesDirectory(recoveryGroup).resolve(ref.bodyName)
+          if (!body.normalize().startsWith(bodiesDirectory(recoveryGroup))) {
+            throw new IOException("manifest body reference escaped body directory")
+          }
           val manifest = readManifestBody(body)
           val fullPayloadMatches = manifest.identity.digest == identity.digest &&
             manifest.identity.canonicalPayload == identity.canonicalPayload
           if (manifest.recoveryGroup == recoveryGroup &&
               manifest.generation == ref.generation &&
               manifest.incarnationId == ref.incarnationId &&
+              ref.identityDigest == identity.digest &&
               fullPayloadMatches &&
               manifest.identity.providerCompatibilityId == identity.providerCompatibilityId) {
             Iterator.single(manifest)
@@ -635,8 +643,8 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
   }
 
   private[shuffle] def readManifestBody(path: Path): ShuffleRecoveryManifest = {
-    if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS)) {
-      throw new IOException("manifest body is not a regular file")
+    if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) || Files.isSymbolicLink(path)) {
+      throw new IOException("manifest body is not a safe regular file")
     }
     val length = Files.size(path)
     if (length < 0L || length > ShuffleRecoveryManifestCodec.MaxManifestBytes) {
@@ -671,17 +679,16 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
   }
 
   private def createSafeDirectories(directory: Path): Unit = {
-    if (!directory.normalize().startsWith(normalizedRoot)) {
+    val normalized = directory.toAbsolutePath.normalize()
+    if (!normalized.startsWith(normalizedRoot)) {
       throw new IOException("manifest path escaped configured root")
     }
-    val relative = normalizedRoot.relativize(directory.normalize())
-    if (!Files.exists(normalizedRoot, LinkOption.NOFOLLOW_LINKS)) {
-      Files.createDirectories(normalizedRoot)
-    }
+    Files.createDirectories(normalizedRoot)
     if (!Files.isDirectory(normalizedRoot, LinkOption.NOFOLLOW_LINKS) ||
         Files.isSymbolicLink(normalizedRoot)) {
       throw new IOException("manifest root is not a safe directory")
     }
+    val relative = normalizedRoot.relativize(normalized)
     var current = normalizedRoot
     relative.iterator().asScala.foreach { component =>
       current = current.resolve(component)
@@ -699,13 +706,14 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
   private def commitImmutable(
       target: Path,
       bytes: Array[Byte]): ShuffleRecoveryManifestPublishResult = {
+    if (bytes == null) {
+      throw new IllegalArgumentException("immutable publication bytes must not be null")
+    }
+    createSafeDirectories(target.getParent)
     val temp = target.resolveSibling(s".${target.getFileName}.tmp-${UUID.randomUUID()}")
     var channel: FileChannel = null
     try {
-      channel = FileChannel.open(
-        temp,
-        StandardOpenOption.CREATE_NEW,
-        StandardOpenOption.WRITE)
+      channel = FileChannel.open(temp, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE)
       val buffer = ByteBuffer.wrap(bytes)
       while (buffer.hasRemaining) {
         channel.write(buffer)
@@ -713,19 +721,23 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
       channel.force(true)
       channel.close()
       channel = null
+
       try {
-        Files.move(temp, target, StandardCopyOption.ATOMIC_MOVE)
+        // createLink is the local-filesystem no-replace visibility primitive: unlike ATOMIC_MOVE,
+        // it is specified to fail when the target already exists and can never replace it.
+        Files.createLink(target, temp)
+        forceDirectory(target.getParent)
         ShuffleRecoveryManifestPublished
       } catch {
         case _: FileAlreadyExistsException =>
-          Files.deleteIfExists(temp)
-          if (Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) &&
-              Files.size(target) == bytes.length &&
-              MessageDigest.isEqual(Files.readAllBytes(target), bytes)) {
+          if (sameImmutableBytes(target, bytes)) {
             ShuffleRecoveryManifestAlreadyPublished
           } else {
             throw new IOException("immutable manifest publication conflicts with existing bytes")
           }
+        case e: UnsupportedOperationException =>
+          throw new IOException(
+            "Phase 0 manifest store requires local hard-link support for no-replace commit", e)
       }
     } finally {
       if (channel != null) {
@@ -735,7 +747,23 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
     }
   }
 
-  private def boundedReferences(index: Path): Vector[IndexReference] = {
+  private def sameImmutableBytes(target: Path, expected: Array[Byte]): Boolean = {
+    Files.isRegularFile(target, LinkOption.NOFOLLOW_LINKS) &&
+      !Files.isSymbolicLink(target) &&
+      Files.size(target) == expected.length &&
+      MessageDigest.isEqual(Files.readAllBytes(target), expected)
+  }
+
+  private def forceDirectory(directory: Path): Unit = {
+    val channel = FileChannel.open(directory, StandardOpenOption.READ)
+    try {
+      channel.force(true)
+    } finally {
+      channel.close()
+    }
+  }
+
+  private def boundedReferencePaths(index: Path): Vector[Path] = {
     val stream = Files.list(index)
     try {
       val paths = stream.iterator().asScala
@@ -745,7 +773,7 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
       if (paths.size > MaxCandidateReferences) {
         throw new IOException("manifest candidate namespace exceeds configured bound")
       }
-      paths.map(readReference)
+      paths
     } finally {
       stream.close()
     }
@@ -753,7 +781,7 @@ private[spark] final class ShuffleRecoveryManifestStore(root: Path) extends Logg
 
   private def readReference(path: Path): IndexReference = {
     if (!Files.isRegularFile(path, LinkOption.NOFOLLOW_LINKS) ||
-        Files.size(path) > MaxReferenceBytes) {
+        Files.isSymbolicLink(path) || Files.size(path) > MaxReferenceBytes) {
       throw new IOException("invalid manifest index reference")
     }
     decodeReference(Files.readAllBytes(path))
