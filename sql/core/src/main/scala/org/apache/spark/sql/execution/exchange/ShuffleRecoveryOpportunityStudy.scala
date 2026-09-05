@@ -153,12 +153,17 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
     require(installed, "study must be installed before taking a snapshot")
     spark.sparkContext.listenerBus.waitUntilEmpty()
     val stages = runtimeListener.snapshot()
+    val stagesByExecution = stages.groupBy(_.executionId)
     val (executions, failures, analyzerFailures) = synchronized {
       (completedExecutions.toVector, failedExecutions.toVector, analysisFailures.toVector)
     }
     val weighted = executions.flatMap { execution =>
+      val executionStages = stagesByExecution.getOrElse(execution.executionId, Nil)
       execution.byRule.flatMap { case (_, observations) =>
-        ShuffleRecoveryRuntimeCorrelator.correlate(observations, execution.runtimeKeys, stages)
+        ShuffleRecoveryRuntimeCorrelator.correlate(
+          observations,
+          execution.runtimeKeys,
+          executionStages)
       }
     }
     val snapshot = ShuffleRecoveryOpportunityStudySnapshot(
