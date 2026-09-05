@@ -46,7 +46,8 @@ private[sql] case class ShuffleRecoveryStageRuntime(
     accumulatorIds: Set[Long],
     completionOrder: Long,
     complete: Boolean,
-    invalidReason: Option[String]) {
+    invalidReason: Option[String],
+    rddScopeIds: Set[String] = Set.empty) {
 
   require(expectedMapTasks >= 0, "expected map task count must be non-negative")
   require(successfulMapTaskWinners >= 0, "successful winner count must be non-negative")
@@ -81,6 +82,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
   private val submittedAttempts = mutable.HashMap.empty[(Int, Int), Long]
   private val winners = mutable.HashMap.empty[Int, Winner]
   private val accumulatorIds = mutable.HashSet.empty[Long]
+  private val rddScopeIds = mutable.HashSet.empty[String]
   private var invalidReason: Option[String] = None
 
   def startAttempt(stageAttemptId: Int): Unit = {
@@ -107,6 +109,10 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
 
   def recordAccumulatorIds(ids: Iterable[Long]): Unit = synchronized {
     accumulatorIds ++= ids
+  }
+
+  def recordRddScopeIds(ids: Iterable[String]): Unit = synchronized {
+    rddScopeIds ++= ids.filter(_.nonEmpty)
   }
 
   def recordSuccessfulTask(
@@ -197,7 +203,8 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       accumulatorIds.toSet,
       completionOrder,
       complete = finalInvalid.isEmpty,
-      finalInvalid)
+      finalInvalid,
+      rddScopeIds.toSet)
   }
 
   private def checkedTotals(): Either[String, (Long, Long)] = {
@@ -252,6 +259,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
       if (accumulator.expectedMapTasks != totalMapTasks) {
         accumulator.invalidate(MapperCountChangedAcrossAttempts)
       }
+      accumulator.recordRddScopeIds(stageRddScopeIds(info.rddInfos))
       val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
       attemptCounter = Math.addExact(attemptCounter, 1L)
       attemptToStage.put(attemptKey, stageKey)
@@ -282,6 +290,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
     val info = event.stageInfo
     val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
     attemptToStage.remove(attemptKey).flatMap(activeStages.get).foreach { accumulator =>
+      accumulator.recordRddScopeIds(stageRddScopeIds(info.rddInfos))
       if (info.failureReason.isEmpty) {
         val stageKey = StageKey(accumulator.executionId, accumulator.shuffleId)
         completed.get(stageKey) match {
@@ -290,7 +299,9 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
             accumulator.recordAccumulatorIds(additionalIds)
             completed.update(
               stageKey,
-              runtime.copy(accumulatorIds = runtime.accumulatorIds ++ additionalIds))
+              runtime.copy(
+                accumulatorIds = runtime.accumulatorIds ++ additionalIds,
+                rddScopeIds = runtime.rddScopeIds ++ stageRddScopeIds(info.rddInfos)))
           case _ =>
             completionCounter = Math.addExact(completionCounter, 1L)
             completed.update(
@@ -331,6 +342,12 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
     attemptToStage.filterInPlace { case (_, stageKey) =>
       stageKey.executionId != executionId
     }
+  }
+
+  private def stageRddScopeIds(rddInfos: Seq[org.apache.spark.storage.RDDInfo]): Set[String] = {
+    rddInfos.iterator.flatMap { rddInfo =>
+      rddInfo.scope.iterator.flatMap(_.getAllScopes.iterator.map(_.id))
+    }.filter(_.nonEmpty).toSet
   }
 
   private def executionIdFrom(properties: Properties): Option[Long] = {
