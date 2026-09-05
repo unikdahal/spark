@@ -24,13 +24,13 @@ on:
   workflow_dispatch:
     inputs:
       opportunity-corpus-mode:
-        description: Opportunity evidence corpus size
+        description: Opportunity evidence corpus tier
         required: true
         default: smoke
         type: choice
         options:
           - smoke
-          - larger
+          - evidence
 
 permissions:
   contents: read
@@ -209,10 +209,15 @@ jobs:
 
           raw="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.jsonl"
           rendered="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.md"
-          if [[ ! -s "${raw}" || ! -s "${rendered}" ]]; then
-            echo "Weighted opportunity corpus produced empty raw/report evidence." >&2
-            exit 1
-          fi
+          correlation="${OPPORTUNITY_DIR}/correlation-${OPPORTUNITY_CORPUS_MODE}.md"
+          reconciliation="${OPPORTUNITY_DIR}/reconciliation-${OPPORTUNITY_CORPUS_MODE}.tsv"
+          sensitivity="${OPPORTUNITY_DIR}/sensitivity-${OPPORTUNITY_CORPUS_MODE}.md"
+          for evidence in "${raw}" "${rendered}" "${correlation}" "${reconciliation}" "${sensitivity}"; do
+            if [[ ! -s "${evidence}" ]]; then
+              echo "Weighted opportunity corpus produced empty evidence: ${evidence}" >&2
+              exit 1
+            fi
+          done
           grep -q '"schemaVersion":1' "${raw}"
           grep -q '"disposition":"WEIGHTED"' "${raw}"
           grep -q 'Gate result:' "${rendered}"
@@ -221,12 +226,17 @@ jobs:
           grep -q 'Unweighted / excluded accounting' "${rendered}"
           grep -q 'TPC-DS' "${rendered}"
           grep -q 'TPC-H' "${rendered}"
+          grep -q 'Frozen minimum completed-task-time coverage: 95.0%' "${correlation}"
+          grep -q $'executionId\texchangeOrdinal\texchangePath' "${reconciliation}"
+          grep -q 'sample-quality and sensitivity' "${sensitivity}"
 
           {
             echo "### Phase 0-A weighted opportunity evidence"
             echo "Corpus mode: \`${OPPORTUNITY_CORPUS_MODE}\`"
             echo
             cat "${rendered}"
+            echo
+            cat "${correlation}"
           } >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload Phase 0-A evidence and focused test results
@@ -234,7 +244,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: shuffle-recovery-phase0-opportunity-${{ env.OPPORTUNITY_CORPUS_MODE }}-${{ github.run_id }}
-          if-no-files-found: error
+          if-no-files-found: warn
           path: |
             sql/core/target/shuffle-recovery-phase0/sql-test-compile.log
             sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl
