@@ -14,16 +14,18 @@ Executor run time is intentionally a coarse work proxy, not CPU time. It can inc
 
 ## Physical-work winner rule
 
-For one shuffle-map stage:
+For one physical shuffle:
 
-1. The coverage denominator is the stage RDD's total partition count, not `StageInfo.numTasks`, because a retry may submit only a subset of maps.
-2. A successful task is keyed by the actual RDD/map `partitionId`; the historical task-set index fallback is used only when `partitionId` is unavailable.
-3. Within one stage attempt, at most one successful result for a map partition contributes. This keeps speculative duplicates from double charging the same physical map output.
-4. A successful result from a later stage attempt replaces the earlier candidate for that map partition. Successful outputs from an earlier attempt remain represented when Spark's determinate retry does not recompute them.
-5. Failed task work is not reusable successful work. A failed stage attempt contributes only map winners that survive into the eventual completed shuffle under the rule above.
-6. A successful stage without complete map-partition winner coverage is `UNWEIGHTED`, never partially weighted.
-7. A repeated logical reference to the same correlated physical stage is `EXCLUDED/REUSED_PHYSICAL_WORK` after the first physical count.
-8. Missing or ambiguous exchange-to-stage correlation is `UNWEIGHTED` with a stable reason.
+1. Retry accounting is keyed by `(SQL execution ID, shuffle ID)`, not stage ID. Spark can recreate a finished `ShuffleMapStage` after output loss with a new stage ID while retaining the same shuffle ID.
+2. The coverage denominator is the stage RDD's total partition count, not `StageInfo.numTasks`, because a retry may submit only a subset of maps.
+3. A successful task is keyed by the actual RDD/map `partitionId`; the historical task-set index fallback is used only when `partitionId` is unavailable.
+4. Stage incarnations/attempts are ordered by their `SparkListenerStageSubmitted` observation order. A successful result from a later submitted incarnation/attempt replaces the earlier candidate for that map partition. Successful outputs from an earlier attempt remain represented when Spark's determinate retry does not recompute them.
+5. Within one stage incarnation/attempt, at most one successful result for a map partition contributes; the latest observed successful completion replaces an earlier duplicate. This keeps speculative duplicates from double charging the same logical map output.
+6. A zero-task skipped resubmission of an already completed physical shuffle does not move its completion order or alter its winner weights. It may contribute accumulator IDs needed for correlation.
+7. Failed task work is not reusable successful work. A failed stage attempt contributes only map winners that survive into the eventual completed shuffle under the rule above.
+8. A successful stage without complete map-partition winner coverage is `UNWEIGHTED`, never partially weighted.
+9. A repeated logical reference to the same correlated physical shuffle is `EXCLUDED/REUSED_PHYSICAL_WORK` after the first physical count.
+10. Missing or ambiguous exchange-to-stage correlation is `UNWEIGHTED` with a stable reason.
 
 ## Correlation rule
 
