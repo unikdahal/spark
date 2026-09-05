@@ -149,10 +149,10 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityAnalyzerSuite"
 
-      - name: Run weighted runtime and correlation suites
+      - name: Run weighted runtime, correlation, and evidence suites
         run: |
           ./build/sbt -Phadoop-3 -Phive \
-            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeCorrelationCoverageSuite"
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeCorrelationCoverageSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityEvidenceSuite"
 
       - name: Run adaptive partition-rule regression suite
         run: |
@@ -167,6 +167,36 @@ jobs:
         run: |
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityCorpusSuite"
+
+      - name: Record opportunity reproduction metadata
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OPPORTUNITY_DIR}"
+          metadata="${OPPORTUNITY_DIR}/reproduction-${OPPORTUNITY_CORPUS_MODE}.txt"
+          {
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            echo "workflow_run_attempt=${GITHUB_RUN_ATTEMPT}"
+            echo "workflow_event=${GITHUB_EVENT_NAME}"
+            echo "corpus_mode=${OPPORTUNITY_CORPUS_MODE}"
+            echo "head_sha=$(git rev-parse HEAD)"
+            echo "frozen_baseline=2a7cfea06ba135cf0ddc62902eb0daf5a835c672"
+            echo "java_version=17"
+            echo "scala_version=2.13.18"
+            echo "spark_shuffle_partitions=4"
+            echo "spark_auto_broadcast_join_threshold=-1"
+            echo "spark_dynamic_partition_pruning_enabled=true"
+            if [[ "${OPPORTUNITY_CORPUS_MODE}" == "evidence" ]]; then
+              echo "generated_rows_per_table=32"
+              echo "failure_distribution=equal-four-points-v2"
+              echo "correlation_gate_basis_points=9500"
+              echo "value_gate_basis_points=2000"
+            else
+              echo "generated_rows_per_table=2"
+              echo "failure_distribution=smoke-regression"
+            fi
+          } > "${metadata}"
 
       - name: Run listener-manager regression suite
         run: >-
@@ -185,6 +215,8 @@ jobs:
             -name '*ShuffleRecoveryRuntimeWeightsSuite*.xml' -print -quit)"
           correlation_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryRuntimeCorrelationCoverageSuite*.xml' -print -quit)"
+          evidence_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryOpportunityEvidenceSuite*.xml' -print -quit)"
           corpus_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryOpportunityCorpusSuite*.xml' -print -quit)"
           adaptive_report="$(find sql -type f -path '*/test-reports/*' \
@@ -194,6 +226,7 @@ jobs:
             "${study_report}" \
             "${retry_report}" \
             "${correlation_report}" \
+            "${evidence_report}" \
             "${corpus_report}" \
             "${adaptive_report}"; do
             if [[ -z "${report}" ]]; then
@@ -216,19 +249,23 @@ jobs:
           raw="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.jsonl"
           rendered="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.md"
           reconciliation="${OPPORTUNITY_DIR}/correlation-reconciliation-${OPPORTUNITY_CORPUS_MODE}.jsonl"
-          if [[ ! -s "${raw}" || ! -s "${rendered}" || ! -s "${reconciliation}" ]]; then
-            echo "Opportunity corpus produced empty raw/report/reconciliation evidence." >&2
+          reproduction="${OPPORTUNITY_DIR}/reproduction-${OPPORTUNITY_CORPUS_MODE}.txt"
+          if [[ ! -s "${raw}" || ! -s "${rendered}" || ! -s "${reconciliation}" || \
+              ! -s "${reproduction}" ]]; then
+            echo "Opportunity corpus produced incomplete evidence artifacts." >&2
             exit 1
           fi
           grep -q '"schemaVersion":1' "${raw}"
           grep -q '"disposition":"WEIGHTED"' "${raw}"
           grep -q '"sqlExecutionId":' "${reconciliation}"
           grep -q '"acceptedWinnerCount":' "${reconciliation}"
+          grep -q '"observedSuccessfulMapTaskCompletions":' "${reconciliation}"
           grep -q 'Gate result:' "${rendered}"
           grep -q 'Scope curve and correlation coverage' "${rendered}"
           grep -q 'Failure-point opportunity' "${rendered}"
           grep -q 'Unweighted / excluded accounting' "${rendered}"
           grep -q 'Correlation quality gate' "${rendered}"
+          grep -q 'Expanded failure-point opportunity and final value gate' "${rendered}"
           grep -q 'Sample quality and sensitivity' "${rendered}"
           grep -q 'TPC-DS' "${rendered}"
           grep -q 'TPC-H' "${rendered}"
@@ -241,7 +278,7 @@ jobs:
               exit 1
             fi
             grep -q -- '- Result: \*\*PASS\*\*' "${rendered}"
-            grep -Eq 'Gate result: \*\*(PASS|FAIL)\*\*' "${rendered}"
+            grep -Eq 'Final value gate: \*\*(PASS|FAIL)\*\*' "${rendered}"
           fi
 
           {
@@ -265,6 +302,7 @@ jobs:
             **/target/test-reports/*ShuffleRecoveryOpportunityStudySuite*.xml
             **/target/test-reports/*ShuffleRecoveryRuntimeWeightsSuite*.xml
             **/target/test-reports/*ShuffleRecoveryRuntimeCorrelationCoverageSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryOpportunityEvidenceSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityCorpusSuite*.xml
             **/target/test-reports/*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
