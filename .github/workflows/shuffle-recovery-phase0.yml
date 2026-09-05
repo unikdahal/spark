@@ -147,7 +147,7 @@ jobs:
       - name: Run weighted runtime, correlation, and report suites
         run: |
           ./build/sbt -Phadoop-3 -Phive \
-            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeCorrelationSuite"
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeCorrelationSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryFailureDistributionSuite"
 
       - name: Run adaptive partition-rule regression suite
         run: |
@@ -179,6 +179,8 @@ jobs:
             -name '*ShuffleRecoveryRuntimeWeightsSuite*.xml' -print -quit)"
           correlation_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryRuntimeCorrelationSuite*.xml' -print -quit)"
+          distribution_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryFailureDistributionSuite*.xml' -print -quit)"
           corpus_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryOpportunityCorpusSuite*.xml' -print -quit)"
           adaptive_report="$(find sql -type f -path '*/test-reports/*' \
@@ -188,6 +190,7 @@ jobs:
             "${study_report}" \
             "${retry_report}" \
             "${correlation_report}" \
+            "${distribution_report}" \
             "${corpus_report}" \
             "${adaptive_report}"; do
             if [[ -z "${report}" ]]; then
@@ -228,7 +231,34 @@ jobs:
           grep -q 'TPC-H' "${rendered}"
           grep -q 'Frozen minimum completed-task-time coverage: 95.0%' "${correlation}"
           grep -q $'executionId\texchangeOrdinal\texchangePath' "${reconciliation}"
+          grep -q $'observedSuccessfulMapTaskCompletions\tacceptedMapWinners' "${reconciliation}"
           grep -q 'sample-quality and sensitivity' "${sensitivity}"
+
+          if [[ "${OPPORTUNITY_CORPUS_MODE}" == "evidence" ]]; then
+            for name in opportunity correlation reconciliation sensitivity; do
+              case "${name}" in
+                opportunity) suffix="md" ;;
+                correlation) suffix="md" ;;
+                reconciliation) suffix="tsv" ;;
+                sensitivity) suffix="md" ;;
+              esac
+              supplemental="${OPPORTUNITY_DIR}/${name}-synthetic-evidence.${suffix}"
+              if [[ ! -s "${supplemental}" ]]; then
+                echo "Missing supplemental synthetic evidence: ${supplemental}" >&2
+                exit 1
+              fi
+            done
+            supplemental_raw="${OPPORTUNITY_DIR}/opportunity-synthetic-evidence.jsonl"
+            if [[ ! -s "${supplemental_raw}" ]]; then
+              echo "Missing supplemental synthetic raw evidence." >&2
+              exit 1
+            fi
+            grep -q 'SYNTHETIC' "${OPPORTUNITY_DIR}/opportunity-synthetic-evidence.md"
+            if grep -q '| SYNTHETIC |' "${rendered}"; then
+              echo "Synthetic workloads leaked into benchmark headline evidence." >&2
+              exit 1
+            fi
+          fi
 
           {
             echo "### Phase 0-A weighted opportunity evidence"
@@ -253,6 +283,7 @@ jobs:
             **/target/test-reports/*ShuffleRecoveryOpportunityStudySuite*.xml
             **/target/test-reports/*ShuffleRecoveryRuntimeWeightsSuite*.xml
             **/target/test-reports/*ShuffleRecoveryRuntimeCorrelationSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryFailureDistributionSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityCorpusSuite*.xml
             **/target/test-reports/*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
