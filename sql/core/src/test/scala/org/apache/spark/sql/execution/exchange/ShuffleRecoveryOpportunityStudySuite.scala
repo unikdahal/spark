@@ -299,6 +299,17 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     }
   }
 
+  test("value gate rejects altered semantics under the frozen name and version") {
+    val altered = gateRule.copy(
+      rules = gateRule.rules.copy(allowPythonOrArrow = true))
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityReportBuilder.build(
+        snapshot(Seq(weighted())),
+        Seq(altered),
+        corpus())
+    }
+  }
+
   test("report generation is deterministic for input ordering") {
     val records = Seq(
       weighted(observation(ordinal = 0L), stageId = 10, completionOrder = 1L),
