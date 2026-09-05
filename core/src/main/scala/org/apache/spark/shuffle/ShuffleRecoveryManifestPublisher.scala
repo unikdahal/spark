@@ -87,7 +87,8 @@ private[shuffle] final class FilesystemShuffleRecoveryPublicationBackend(
   override def publish(publication: ShuffleRecoveryPublication): Unit = {
     validatePublication(publication)
     if (publication.reducerCount != config.reducerCount) {
-      throw new IOException("publication reducer count disagrees with configured feasibility identity")
+      throw new IOException(
+        "publication reducer count disagrees with configured feasibility identity")
     }
     if (config.targetShuffleId.exists(_ != publication.shuffleId)) {
       throw new IOException("publication does not belong to the configured target shuffle")
