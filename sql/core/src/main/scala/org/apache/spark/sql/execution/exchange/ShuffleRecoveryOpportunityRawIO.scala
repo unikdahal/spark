@@ -246,6 +246,7 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
       dispositions.contains(record.disposition),
       s"invalid accounting disposition ${record.disposition}")
 
+    nonNegative(record.partitionCount, "partition count")
     nonNegative(record.stageId, "stage id")
     nonNegative(record.stageAttemptId, "stage attempt id")
     nonNegative(record.shuffleId, "shuffle id")
