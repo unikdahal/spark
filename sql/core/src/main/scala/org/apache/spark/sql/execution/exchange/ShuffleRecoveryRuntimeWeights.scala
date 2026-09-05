@@ -26,10 +26,12 @@ import ShuffleRecoveryAccountingReason._
 import org.apache.spark.Success
 import org.apache.spark.scheduler.{
   SparkListener,
+  SparkListenerEvent,
   SparkListenerStageCompleted,
   SparkListenerStageSubmitted,
   SparkListenerTaskEnd}
 import org.apache.spark.sql.execution.SQLExecution
+import org.apache.spark.sql.execution.ui.SparkListenerSQLExecutionEnd
 
 /** Runtime weight for the map outputs that constitute one completed physical shuffle. */
 private[sql] case class ShuffleRecoveryStageRuntime(
@@ -56,9 +58,12 @@ private[sql] case class ShuffleRecoveryStageRuntime(
  * Accumulates one successful output candidate per logical map partition across stage retries.
  *
  * `StageInfo.numTasks` can be only the partitions submitted for one retry, so total RDD partition
- * count is supplied separately as the coverage denominator. A later attempt replaces an earlier
- * candidate for the same map partition. Within one attempt, the latest successful completion
- * replaces an earlier duplicate, matching MapOutputTracker's map-output registration semantics.
+ * count is supplied separately as the coverage denominator. Spark may recreate a previously
+ * finished shuffle-map stage after output loss, so an attempt is identified by both stage ID and
+ * attempt ID and ordered by listener submission order. A later submitted attempt replaces an
+ * earlier candidate for the same map partition. Within one attempt, the latest successful
+ * completion replaces an earlier duplicate, matching MapOutputTracker's map-output registration
+ * semantics.
  */
 private[exchange] final class ShuffleRecoveryStageAccumulator(
     val executionId: Long,
@@ -67,22 +72,30 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
     val expectedMapTasks: Int) {
 
   private case class Winner(
-      stageAttemptId: Int,
+      attemptOrder: Long,
       bytes: Long,
       executorRunTimeMs: Long)
 
   require(expectedMapTasks >= 0, "expected map task count must be non-negative")
 
-  private val submittedAttempts = mutable.HashSet.empty[Int]
+  private val submittedAttempts = mutable.HashMap.empty[(Int, Int), Long]
   private val winners = mutable.HashMap.empty[Int, Winner]
   private val accumulatorIds = mutable.HashSet.empty[Long]
   private var invalidReason: Option[String] = None
 
-  def startAttempt(stageAttemptId: Int): Unit = synchronized {
+  def startAttempt(stageAttemptId: Int): Unit = {
+    startAttempt(stageId, stageAttemptId, stageAttemptId.toLong)
+  }
+
+  def startAttempt(
+      currentStageId: Int,
+      stageAttemptId: Int,
+      attemptOrder: Long): Unit = synchronized {
     if (stageAttemptId < 0) {
       invalidate(NegativeStageAttempt)
     } else {
-      submittedAttempts += stageAttemptId
+      require(attemptOrder >= 0L, "attempt order must be non-negative")
+      submittedAttempts.put((currentStageId, stageAttemptId), attemptOrder)
     }
   }
 
@@ -100,22 +113,37 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       stageAttemptId: Int,
       mapPartitionId: Int,
       shuffleWriteBytes: Long,
+      executorRunTimeMs: Long): Unit = {
+    recordSuccessfulTask(
+      stageId,
+      stageAttemptId,
+      mapPartitionId,
+      shuffleWriteBytes,
+      executorRunTimeMs)
+  }
+
+  def recordSuccessfulTask(
+      currentStageId: Int,
+      stageAttemptId: Int,
+      mapPartitionId: Int,
+      shuffleWriteBytes: Long,
       executorRunTimeMs: Long): Unit = synchronized {
     if (invalidReason.isEmpty) {
-      if (!submittedAttempts.contains(stageAttemptId)) {
-        invalidate(TaskForUnknownStageAttempt)
-      } else if (mapPartitionId < 0 || mapPartitionId >= expectedMapTasks) {
-        invalidate(MapPartitionOutOfRange)
-      } else if (shuffleWriteBytes < 0L || executorRunTimeMs < 0L) {
-        invalidate(NegativeRuntimeMetric)
-      } else {
-        winners.get(mapPartitionId) match {
-          case Some(current) if current.stageAttemptId > stageAttemptId =>
-          case _ =>
-            winners.update(
-              mapPartitionId,
-              Winner(stageAttemptId, shuffleWriteBytes, executorRunTimeMs))
-        }
+      submittedAttempts.get((currentStageId, stageAttemptId)) match {
+        case None =>
+          invalidate(TaskForUnknownStageAttempt)
+        case Some(attemptOrder) if mapPartitionId < 0 || mapPartitionId >= expectedMapTasks =>
+          invalidate(MapPartitionOutOfRange)
+        case Some(attemptOrder) if shuffleWriteBytes < 0L || executorRunTimeMs < 0L =>
+          invalidate(NegativeRuntimeMetric)
+        case Some(attemptOrder) =>
+          winners.get(mapPartitionId) match {
+            case Some(current) if current.attemptOrder > attemptOrder =>
+            case _ =>
+              winners.update(
+                mapPartitionId,
+                Winner(attemptOrder, shuffleWriteBytes, executorRunTimeMs))
+          }
       }
     }
   }
@@ -125,11 +153,26 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       successfulStageAttemptId: Int,
       finalAccumulatorIds: Iterable[Long],
       completionOrder: Long): ShuffleRecoveryStageRuntime = synchronized {
-    accumulatorIds ++= finalAccumulatorIds
-    finish(successfulStageAttemptId, completionOrder)
+    finish(stageId, successfulStageAttemptId, finalAccumulatorIds, completionOrder)
   }
 
   def finish(
+      successfulStageId: Int,
+      successfulStageAttemptId: Int,
+      finalAccumulatorIds: Iterable[Long],
+      completionOrder: Long): ShuffleRecoveryStageRuntime = synchronized {
+    accumulatorIds ++= finalAccumulatorIds
+    finish(successfulStageId, successfulStageAttemptId, completionOrder)
+  }
+
+  def finish(
+      successfulStageAttemptId: Int,
+      completionOrder: Long): ShuffleRecoveryStageRuntime = synchronized {
+    finish(stageId, successfulStageAttemptId, completionOrder)
+  }
+
+  def finish(
+      successfulStageId: Int,
       successfulStageAttemptId: Int,
       completionOrder: Long): ShuffleRecoveryStageRuntime = synchronized {
     val totals = if (invalidReason.isEmpty) {
@@ -144,7 +187,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
     val (bytes, runTime) = totals.toOption.getOrElse((0L, 0L))
     ShuffleRecoveryStageRuntime(
       executionId,
-      stageId,
+      successfulStageId,
       successfulStageAttemptId,
       shuffleId,
       expectedMapTasks,
@@ -179,14 +222,15 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
  * than query failures wherever a stable accounting bucket can be preserved.
  */
 private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListener {
-  private case class StageKey(executionId: Long, stageId: Int, shuffleId: Int)
+  private case class StageKey(executionId: Long, shuffleId: Int)
   private case class AttemptKey(stageId: Int, stageAttemptId: Int)
 
   private val activeStages =
     mutable.HashMap.empty[StageKey, ShuffleRecoveryStageAccumulator]
   private val attemptToStage = mutable.HashMap.empty[AttemptKey, StageKey]
-  private val completed = mutable.ArrayBuffer.empty[ShuffleRecoveryStageRuntime]
+  private val completed = mutable.HashMap.empty[StageKey, ShuffleRecoveryStageRuntime]
   private var completionCounter = 0L
+  private var attemptCounter = 0L
 
   override def onStageSubmitted(event: SparkListenerStageSubmitted): Unit = synchronized {
     val info = event.stageInfo
@@ -197,7 +241,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
       val totalMapTasks = info.rddInfos.headOption
         .map(_.numPartitions)
         .getOrElse(info.numTasks)
-      val stageKey = StageKey(executionId, info.stageId, shuffleId)
+      val stageKey = StageKey(executionId, shuffleId)
       val accumulator = activeStages.getOrElseUpdate(
         stageKey,
         new ShuffleRecoveryStageAccumulator(
@@ -209,8 +253,9 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
         accumulator.invalidate(MapperCountChangedAcrossAttempts)
       }
       val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
+      attemptCounter = Math.addExact(attemptCounter, 1L)
       attemptToStage.put(attemptKey, stageKey)
-      accumulator.startAttempt(info.attemptNumber())
+      accumulator.startAttempt(info.stageId, info.attemptNumber(), attemptCounter)
     }
   }
 
@@ -224,6 +269,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
           event.taskInfo.index
         }
         accumulator.recordSuccessfulTask(
+          event.stageId,
           event.stageAttemptId,
           partitionId,
           event.taskMetrics.shuffleWriteMetrics.bytesWritten,
@@ -238,29 +284,43 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
     attemptToStage.remove(attemptKey).flatMap(activeStages.get).foreach { accumulator =>
       if (info.failureReason.isEmpty) {
         completionCounter = Math.addExact(completionCounter, 1L)
-        completed += accumulator.finish(
-          info.attemptNumber(),
-          info.accumulables.keys,
-          completionCounter)
-        val stageKey = StageKey(
-          accumulator.executionId,
-          accumulator.stageId,
-          accumulator.shuffleId)
-        activeStages.remove(stageKey)
-        attemptToStage.filterInPlace((_, key) => key != stageKey)
+        val stageKey = StageKey(accumulator.executionId, accumulator.shuffleId)
+        completed.update(
+          stageKey,
+          accumulator.finish(
+            info.stageId,
+            info.attemptNumber(),
+            info.accumulables.keys,
+            completionCounter))
       } else {
         accumulator.recordAccumulatorIds(info.accumulables.keys)
       }
     }
   }
 
+  override def onOtherEvent(event: SparkListenerEvent): Unit = event match {
+    case sqlEnd: SparkListenerSQLExecutionEnd =>
+      releaseExecution(sqlEnd.executionId)
+    case _ =>
+  }
+
   def snapshot(): Seq[ShuffleRecoveryStageRuntime] = synchronized {
-    completed.toVector.sortBy { runtime =>
+    completed.valuesIterator.toVector.sortBy { runtime =>
       (
         runtime.executionId,
         runtime.completionOrder,
         runtime.stageId,
         runtime.stageAttemptId)
+    }
+  }
+
+  private def releaseExecution(executionId: Long): Unit = synchronized {
+    activeStages.keysIterator
+      .filter(_.executionId == executionId)
+      .toVector
+      .foreach(activeStages.remove)
+    attemptToStage.filterInPlace { case (_, stageKey) =>
+      stageKey.executionId != executionId
     }
   }
 
