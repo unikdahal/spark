@@ -234,7 +234,7 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
   private def deterministicValue(rowId: Column, dataType: DataType): Column = dataType match {
     case ByteType | ShortType | IntegerType | LongType | FloatType | DoubleType | _: DecimalType =>
       ((rowId % 3) + 1).cast(dataType)
-    case StringType => concat(lit("value-"), (rowId % 3).cast(StringType))
+    case StringType => ((rowId % 3) + 1).cast(StringType)
     case DateType => date_add(lit("2000-01-01").cast(DateType), (rowId % 3).cast(IntegerType))
     case TimestampType => lit("2000-01-01 00:00:00").cast(TimestampType)
     case BooleanType => (rowId % 2 === 0)
