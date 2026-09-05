@@ -139,11 +139,12 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
     assert(combined.records.exists(_.disposition == ShuffleRecoveryWeightDisposition.Weighted),
       "TPC corpus produced no correlated physical shuffle work")
 
+    val corpusQueries = cases.map(c => ShuffleRecoveryCorpusQuery(c.family, c.displayName, c.aqe))
     val corpus = ShuffleRecoveryCorpusDefinition(
       name = s"spark-in-tree-tpc-$mode-v2",
       scale = s"$rowCount deterministic generated rows per table",
       baselineSha = ShuffleRecoveryOpportunityReportBuilder.FrozenBaselineSha,
-      queries = cases.map(c => ShuffleRecoveryCorpusQuery(c.family, c.displayName, c.aqe)),
+      queries = corpusQueries,
       sparkConfigs = Seq(
         SQLConf.SHUFFLE_PARTITIONS.key -> "4",
         SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "-1",
@@ -161,6 +162,10 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       record.classification.ruleSetName == corpus.gateRuleSetName &&
         record.classification.ruleSetVersion == corpus.gateRuleSetVersion
     }
+    val queryByExecution = combined.completedExecutionIds.sorted.zip(corpusQueries).toMap
+    assert(queryByExecution.size === cases.size, "every corpus query must have one SQL execution ID")
+    val evidence = ShuffleRecoveryOpportunityEvidence.build(combined, gateRecords, queryByExecution)
+
     val hasUnweightedGateEvidence = gateRecords.exists {
       _.disposition == ShuffleRecoveryWeightDisposition.Unweighted
     }
@@ -169,25 +174,41 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
         hasUnweightedGateEvidence ||
         report.valueGate.completedExecutorRunTimeMs == 0L,
       "TPC corpus value gate may be N/A only for unweighted evidence or zero task time")
-    val rawLines = combined.deterministicJsonLines(ShuffleRecoveryStudyRuleSets.all)
-    assert(rawLines.nonEmpty)
-    ShuffleRecoveryOpportunityRawIO.parseLines(rawLines)
-    val rendered = report.toMarkdown
-    val rebuilt = ShuffleRecoveryOpportunityReportBuilder.build(
-      combined, ShuffleRecoveryStudyRuleSets.all, corpus).toMarkdown
-    assert(rendered === rebuilt)
-    assert(rendered.contains("## Reproduction"))
-    assert(rendered.contains(s"SPARK_SHUFFLE_RECOVERY_CORPUS_MODE=$mode"))
-    assert(rendered.contains("not benchmark-scale performance estimates"))
-
     if (mode == "evidence") {
       assert(cases.size >= 200, "manual evidence corpus must remain broad")
       assert(cases.count(_.family == "TPC-H") === 44, "TPC-H matrix must remain complete")
       assert(cases.exists(c => c.aqe) && cases.exists(c => !c.aqe),
         "manual evidence corpus must retain AQE on/off coverage")
+      assert(
+        evidence.correlationGatePass.contains(true),
+        "manual evidence must correlate at least 95% of completed shuffle-map task time")
+      assert(
+        evidence.correlation.correlatedExchangeCount >= 300,
+        "manual evidence coverage target requires at least 300 correlated materialized exchanges")
+      assert(
+        report.valueGate.result.nonEmpty,
+        "manual evidence must resolve the preregistered value gate to PASS or FAIL")
     }
 
-    writeArtifacts(mode, rawLines, rendered)
+    val rawLines = combined.deterministicJsonLines(ShuffleRecoveryStudyRuleSets.all)
+    assert(rawLines.nonEmpty)
+    ShuffleRecoveryOpportunityRawIO.parseLines(rawLines)
+    val reconciliation = ShuffleRecoveryOpportunityEvidence.reconciliationJsonLines(combined, gateRecords)
+    assert(reconciliation.size === gateRecords.size)
+    val rendered = report.toMarkdown + "\n" + evidence.toMarkdown
+    val rebuiltEvidence = ShuffleRecoveryOpportunityEvidence.build(
+      combined, gateRecords, queryByExecution)
+    val rebuilt = ShuffleRecoveryOpportunityReportBuilder.build(
+      combined, ShuffleRecoveryStudyRuleSets.all, corpus).toMarkdown + "\n" +
+      rebuiltEvidence.toMarkdown
+    assert(rendered === rebuilt)
+    assert(rendered.contains("## Reproduction"))
+    assert(rendered.contains(s"SPARK_SHUFFLE_RECOVERY_CORPUS_MODE=$mode"))
+    assert(rendered.contains("not benchmark-scale performance estimates"))
+    assert(rendered.contains("## Correlation quality gate"))
+    assert(rendered.contains("## Sample quality and sensitivity"))
+
+    writeArtifacts(mode, rawLines, reconciliation, rendered)
   }
 
   private def reproductionCommand(mode: String): String = {
@@ -331,12 +352,19 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
     element_at(array(values.map(lit): _*), (rowId % values.size + 1).cast(IntegerType))
   }
 
-  private def writeArtifacts(mode: String, rawLines: Seq[String], report: String): Unit = {
+  private def writeArtifacts(
+      mode: String,
+      rawLines: Seq[String],
+      reconciliation: Seq[String],
+      report: String): Unit = {
     val root = Paths.get(sys.env.getOrElse(
       "SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_DIR",
       "target/shuffle-recovery-phase0/opportunity"))
     Files.createDirectories(root)
     write(root.resolve(s"opportunity-$mode.jsonl"), rawLines.mkString("\n") + "\n")
+    write(
+      root.resolve(s"correlation-reconciliation-$mode.jsonl"),
+      reconciliation.mkString("\n") + "\n")
     write(root.resolve(s"opportunity-$mode.md"), report)
   }
 
