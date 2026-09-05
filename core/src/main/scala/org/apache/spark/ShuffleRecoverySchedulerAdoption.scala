@@ -120,7 +120,8 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
   }
 
   /**
-   * Converts a validated provider binding into fully Spark-owned scheduler input off the event loop.
+   * Converts a validated provider binding into fully Spark-owned scheduler input off the
+   * event loop.
    *
    * The exact reducer lengths are read here, not during scheduler installation. This deliberately
    * materializes O(M x R) runtime size metadata for the Phase 0 reference path; it is a correctness
@@ -253,7 +254,9 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
     }
   }
 
-  /** Invalidates all local recovery decisions and releases aliases without touching durable data. */
+  /**
+   * Invalidates all local recovery decisions and releases aliases without touching durable data.
+   */
   def close(): Unit = {
     val managers = new java.util.HashSet[ShuffleRecoveryReservationManager]()
     val pendingIterator = pending.entrySet().iterator()
