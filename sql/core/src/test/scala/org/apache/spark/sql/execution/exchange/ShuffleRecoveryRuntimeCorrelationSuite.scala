@@ -107,6 +107,24 @@ class ShuffleRecoveryRuntimeCorrelationSuite extends SharedSparkSession {
       ShuffleRecoveryAccountingReason.AmbiguousRuntimeCorrelation))
   }
 
+  test("ambiguous SQL metric evidence does not override a unique RDD scope identity") {
+    val key = ShuffleRecoveryExchangeRuntimeKey(
+      exchangeOrdinal = 0L,
+      exchangePath = "root",
+      shuffleWriteMetricIds = Set(7L, 8L),
+      rddScopeId = Some("spark_plan_42"))
+    val result = ShuffleRecoveryRuntimeCorrelator.correlate(
+      Seq(observation()),
+      Seq(key),
+      Seq(
+        stage(shuffleId = 3, scopeId = "spark_plan_42"),
+        stage(shuffleId = 4, scopeId = "other-4", accumulatorIds = Set(7L)),
+        stage(shuffleId = 5, scopeId = "other-5", accumulatorIds = Set(8L)))).head
+
+    assert(result.disposition === Weighted)
+    assert(result.shuffleId.contains(3))
+  }
+
   test("real zero-output shuffle is correlated without forcing a metric update") {
     withSQLConf(
       SQLConf.ADAPTIVE_EXECUTION_ENABLED.key -> "false",
