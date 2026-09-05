@@ -114,15 +114,19 @@ class ReferenceShuffleProviderSuite extends SparkFunSuite {
       out.close()
       assert(partition.getNumBytesWritten() == 64L * 1024L * 1024L)
 
-      val checksum = Array(crc32Repeated(chunk, 64))
-      val message = writer.commitAllPartitions(checksum)
+      val expectedChecksum = crc32Repeated(chunk, 64)
+      val message = writer.commitAllPartitions(Array(expectedChecksum))
       val descriptor = descriptorOf(message)
       provider.commitWinner(0, descriptor)
       val resolved = provider.openMap(0)
       val metadata = resolved.blockMetadata(0)
       assert(metadata.length == 64L * 1024L * 1024L)
       assert(!metadata.isEmpty)
-      assert(resolved.getBlockData(0).exists(_.size() == metadata.length))
+      assert(metadata.checksum.contains(expectedChecksum))
+
+      val (fetchedBytes, fetchedChecksum) = readBlockDigest(resolved, 0)
+      assert(fetchedBytes == metadata.length)
+      assert(fetchedChecksum == expectedChecksum)
     }
   }
 
@@ -427,6 +431,31 @@ class ReferenceShuffleProviderSuite extends SparkFunSuite {
     val in = buffer.createInputStream()
     try {
       in.readAllBytes()
+    } finally {
+      in.close()
+    }
+  }
+
+  private def readBlockDigest(
+      resolved: ReferenceShuffleResolvedMap,
+      reduceId: Int): (Long, Long) = {
+    val buffer = resolved.getBlockData(reduceId).getOrElse {
+      fail(s"expected non-empty block $reduceId")
+    }
+    val in = buffer.createInputStream()
+    val crc = new CRC32()
+    val chunk = new Array[Byte](64 * 1024)
+    var total = 0L
+    try {
+      var read = in.read(chunk)
+      while (read >= 0) {
+        if (read > 0) {
+          crc.update(chunk, 0, read)
+          total = Math.addExact(total, read.toLong)
+        }
+        read = in.read(chunk)
+      }
+      (total, crc.getValue)
     } finally {
       in.close()
     }
