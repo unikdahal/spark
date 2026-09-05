@@ -152,7 +152,9 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
           ShuffleRecoveryOpportunityStudy.this.synchronized {
             analysisFailures += ((qe.id, error.getClass.getName))
           }
-          logWarning("Shuffle recovery opportunity study analysis failed; query is unaffected.", error)
+          logWarning(
+            "Shuffle recovery opportunity study analysis failed; query is unaffected.",
+            error)
       }
     }
 

@@ -21,6 +21,8 @@ import java.util.Properties
 
 import scala.collection.mutable
 
+import ShuffleRecoveryAccountingReason._
+
 import org.apache.spark.Success
 import org.apache.spark.scheduler.{
   SparkListener,
@@ -28,8 +30,6 @@ import org.apache.spark.scheduler.{
   SparkListenerStageSubmitted,
   SparkListenerTaskEnd}
 import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
-
-import ShuffleRecoveryAccountingReason._
 
 /** Runtime weight for the map outputs that constitute one completed physical shuffle. */
 private[sql] case class ShuffleRecoveryStageRuntime(
