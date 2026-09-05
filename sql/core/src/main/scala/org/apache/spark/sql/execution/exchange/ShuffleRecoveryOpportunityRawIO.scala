@@ -27,12 +27,30 @@ private[sql] case class ShuffleRecoveryRawOpportunityRecord(
     executionId: String,
     exchangeOrdinal: Long,
     exchangePath: String,
+    childOperatorClass: String,
+    partitioningClass: String,
+    partitionCount: Option[Int],
     ruleSetName: String,
     ruleSetVersion: Int,
     eligible: Boolean,
     immediateMissReason: Option[String],
     rootMissReason: Option[String],
     sourceTokenAvailability: String,
+    lineageDeterminism: String,
+    dppPresent: Boolean,
+    runtimeFilterPresent: Boolean,
+    subqueryPresent: Boolean,
+    windowPresent: Boolean,
+    expandPresent: Boolean,
+    cacheScanPresent: Boolean,
+    adaptivePartitionSpecsPresent: Boolean,
+    pythonOrArrowPresent: Boolean,
+    reusedExchange: Boolean,
+    adaptivePlan: Boolean,
+    pipelinedShuffle: Boolean,
+    pushBasedShuffleEnabled: Boolean,
+    mergedShuffleEnabled: Boolean,
+    incompatibleRuntimeFlags: Seq[String],
     disposition: String,
     accountingReason: Option[String],
     stageId: Option[Int],
@@ -51,6 +69,7 @@ private[sql] case class ShuffleRecoveryRawOpportunityRecord(
  * alter a denominator or become a permissive compatibility path.
  */
 private[sql] object ShuffleRecoveryOpportunityRawIO {
+  import ShuffleRecoveryLineageDeterminism._
   import ShuffleRecoveryMissReason._
   import ShuffleRecoverySourceTokenAvailability._
 
@@ -63,12 +82,30 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     "executionId",
     "exchangeOrdinal",
     "exchangePath",
+    "childOperatorClass",
+    "partitioningClass",
+    "partitionCount",
     "ruleSetName",
     "ruleSetVersion",
     "eligible",
     "immediateMissReason",
     "rootMissReason",
     "sourceTokenAvailability",
+    "lineageDeterminism",
+    "dppPresent",
+    "runtimeFilterPresent",
+    "subqueryPresent",
+    "windowPresent",
+    "expandPresent",
+    "cacheScanPresent",
+    "adaptivePartitionSpecsPresent",
+    "pythonOrArrowPresent",
+    "reusedExchange",
+    "adaptivePlan",
+    "pipelinedShuffle",
+    "pushBasedShuffleEnabled",
+    "mergedShuffleEnabled",
+    "incompatibleRuntimeFlags",
     "disposition",
     "accountingReason",
     "stageId",
@@ -83,6 +120,11 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     Exact.code,
     PrototypeSpecialCased.code,
     Unavailable.code)
+  private val lineageCodes = Set(
+    Determinate.code,
+    Unknown.code,
+    Unordered.code,
+    Indeterminate.code)
   private val missReasonCodes = Set(
     NonDeterministic.code,
     DeterminismUnproven.code,
@@ -129,12 +171,30 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
       requiredText(node, "executionId"),
       requiredLong(node, "exchangeOrdinal"),
       requiredText(node, "exchangePath"),
+      requiredText(node, "childOperatorClass"),
+      requiredText(node, "partitioningClass"),
+      optionalInt(node, "partitionCount"),
       requiredText(node, "ruleSetName"),
       requiredInt(node, "ruleSetVersion"),
       requiredBoolean(node, "eligible"),
       optionalText(node, "immediateMissReason"),
       optionalText(node, "rootMissReason"),
       requiredText(node, "sourceTokenAvailability"),
+      requiredText(node, "lineageDeterminism"),
+      requiredBoolean(node, "dppPresent"),
+      requiredBoolean(node, "runtimeFilterPresent"),
+      requiredBoolean(node, "subqueryPresent"),
+      requiredBoolean(node, "windowPresent"),
+      requiredBoolean(node, "expandPresent"),
+      requiredBoolean(node, "cacheScanPresent"),
+      requiredBoolean(node, "adaptivePartitionSpecsPresent"),
+      requiredBoolean(node, "pythonOrArrowPresent"),
+      requiredBoolean(node, "reusedExchange"),
+      requiredBoolean(node, "adaptivePlan"),
+      requiredBoolean(node, "pipelinedShuffle"),
+      requiredBoolean(node, "pushBasedShuffleEnabled"),
+      requiredBoolean(node, "mergedShuffleEnabled"),
+      requiredTextArray(node, "incompatibleRuntimeFlags"),
       requiredText(node, "disposition"),
       optionalText(node, "accountingReason"),
       optionalInt(node, "stageId"),
@@ -168,11 +228,19 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     require(record.executionId.matches("query-[0-9]{20}"), "invalid execution id")
     require(record.exchangeOrdinal >= 0L, "exchange ordinal must be non-negative")
     require(record.exchangePath.nonEmpty, "exchange path must be non-empty")
+    require(record.childOperatorClass.nonEmpty, "child operator class must be non-empty")
+    require(record.partitioningClass.nonEmpty, "partitioning class must be non-empty")
     require(record.ruleSetName.nonEmpty, "rule-set name must be non-empty")
     require(record.ruleSetVersion > 0, "rule-set version must be positive")
     require(
       sourceTokenCodes.contains(record.sourceTokenAvailability),
       s"invalid source-token category ${record.sourceTokenAvailability}")
+    require(
+      lineageCodes.contains(record.lineageDeterminism),
+      s"invalid lineage determinism ${record.lineageDeterminism}")
+    require(
+      record.incompatibleRuntimeFlags == record.incompatibleRuntimeFlags.distinct.sorted,
+      "incompatible runtime flags must be unique and sorted")
     require(
       dispositions.contains(record.disposition),
       s"invalid accounting disposition ${record.disposition}")
@@ -228,6 +296,10 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
     require(
       record.accountingReason.nonEmpty,
       s"${record.disposition} record must carry a stable accounting reason")
+    val accountingReason = record.accountingReason.get
+    require(
+      ShuffleRecoveryAccountingReason.All.contains(accountingReason),
+      s"invalid accounting reason $accountingReason")
     val runtimeFields = Seq(
       record.stageId,
       record.stageAttemptId,
@@ -259,6 +331,17 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
       value != null && value.isTextual && value.textValue().nonEmpty,
       s"$field must be a non-empty string")
     value.textValue()
+  }
+
+  private def requiredTextArray(node: JsonNode, field: String): Seq[String] = {
+    val value = node.get(field)
+    require(value != null && value.isArray, s"$field must be an array")
+    value.elements().asScala.map { item =>
+      require(
+        item.isTextual && item.textValue().nonEmpty,
+        s"$field entries must be non-empty strings")
+      item.textValue()
+    }.toVector
   }
 
   private def requiredBoolean(node: JsonNode, field: String): Boolean = {

@@ -117,7 +117,8 @@ private[sql] case class ShuffleRecoveryCorpusDefinition(
     failureDistributionVersion: String,
     gateRuleSetName: String,
     gateRuleSetVersion: Int,
-    gateThresholdBasisPoints: Long) {
+    gateThresholdBasisPoints: Long,
+    reproductionCommands: Seq[String] = Nil) {
 
   require(name.nonEmpty, "corpus name must be non-empty")
   require(scale.nonEmpty, "corpus scale must be non-empty")
@@ -129,6 +130,12 @@ private[sql] case class ShuffleRecoveryCorpusDefinition(
   require(
     gateThresholdBasisPoints >= 0L && gateThresholdBasisPoints <= 10000L,
     "gate threshold must be between 0 and 10000 basis points")
+  require(
+    reproductionCommands.forall(_.trim.nonEmpty),
+    "reproduction commands must be non-empty")
+  require(
+    reproductionCommands.distinct.size == reproductionCommands.size,
+    "reproduction commands must be unique")
 }
 
 private[sql] case class ShuffleRecoveryOpportunityReport(
@@ -159,6 +166,7 @@ private[sql] case class ShuffleRecoveryOpportunityReport(
     line(out, s"- Gate result: **${valueGate.renderedResult}** (${gateRatio.render})")
     line(out, "")
     appendCorpus(out)
+    appendReproduction(out)
     appendScopeCurve(out)
     appendFailurePoints(out)
     appendMissReasons(out)
@@ -189,6 +197,22 @@ private[sql] case class ShuffleRecoveryOpportunityReport(
       line(out, s"- `$key=$value`")
     }
     line(out, "")
+  }
+
+  private def appendReproduction(out: StringBuilder): Unit = {
+    line(out, "## Reproduction")
+    line(out, "")
+    if (corpus.reproductionCommands.isEmpty) {
+      line(out, "No reproduction command was declared for this synthetic unit report.")
+      line(out, "")
+    } else {
+      corpus.reproductionCommands.foreach { command =>
+        line(out, "```bash")
+        command.linesIterator.foreach(line(out, _))
+        line(out, "```")
+        line(out, "")
+      }
+    }
   }
 
   private def appendScopeCurve(out: StringBuilder): Unit = {
@@ -313,6 +337,11 @@ private[sql] case class ShuffleRecoveryOpportunityReport(
   private def appendLimitations(out: StringBuilder): Unit = {
     line(out, "## Measurement semantics and limitations")
     line(out, "")
+    line(
+      out,
+      s"- Corpus scale is `${corpus.scale}` and uses deterministic synthetic rows for " +
+        "reproducibility. Task-time ratios include startup/scheduling noise and are feasibility " +
+        "evidence, not benchmark-scale performance estimates.")
     line(
       out,
       "- Runtime weight is successful shuffle-map task executor run time in milliseconds, " +

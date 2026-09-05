@@ -223,6 +223,8 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     val parsed = ShuffleRecoveryOpportunityRawIO.parseLine(json)
     assert(parsed.schemaVersion === ShuffleRecoveryOpportunityRawIO.SchemaVersion)
     assert(parsed.disposition === "WEIGHTED")
+    assert(parsed.childOperatorClass === "org.apache.spark.sql.execution.RangeExec")
+    assert(parsed.lineageDeterminism === Determinate.code)
 
     intercept[IllegalArgumentException] {
       ShuffleRecoveryOpportunityRawIO.parseLine(json.dropRight(1))
@@ -250,6 +252,10 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     intercept[IllegalArgumentException] {
       ShuffleRecoveryOpportunityRawIO.parseLine(
         unweighted.replace("\"stageId\":null", "\"stageId\":1"))
+    }
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
+        unweighted.replace("NO_RUNTIME_CORRELATION", "UNKNOWN_ACCOUNTING_REASON"))
     }
 
     val ineligible = weighted(observation(eligible = false)).toJson

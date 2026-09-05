@@ -104,6 +104,34 @@ private[sql] object ShuffleRecoveryWeightDisposition {
   }
 }
 
+/** Stable machine-readable reasons for non-weighted runtime accounting. */
+private[sql] object ShuffleRecoveryAccountingReason {
+  val NegativeStageAttempt = "NEGATIVE_STAGE_ATTEMPT"
+  val TaskForUnknownStageAttempt = "TASK_FOR_UNKNOWN_STAGE_ATTEMPT"
+  val MapPartitionOutOfRange = "MAP_PARTITION_OUT_OF_RANGE"
+  val NegativeRuntimeMetric = "NEGATIVE_RUNTIME_METRIC"
+  val MapperCountChangedAcrossAttempts = "MAPPER_COUNT_CHANGED_ACROSS_ATTEMPTS"
+  val RuntimeMetricOverflow = "RUNTIME_METRIC_OVERFLOW"
+  val IncompleteMapWinnerCoverage = "INCOMPLETE_MAP_WINNER_COVERAGE"
+  val ReusedPhysicalWork = "REUSED_PHYSICAL_WORK"
+  val MissingWriteMetricKey = "MISSING_WRITE_METRIC_KEY"
+  val NoRuntimeCorrelation = "NO_RUNTIME_CORRELATION"
+  val AmbiguousRuntimeCorrelation = "AMBIGUOUS_RUNTIME_CORRELATION"
+
+  val All: Set[String] = Set(
+    NegativeStageAttempt,
+    TaskForUnknownStageAttempt,
+    MapPartitionOutOfRange,
+    NegativeRuntimeMetric,
+    MapperCountChangedAcrossAttempts,
+    RuntimeMetricOverflow,
+    IncompleteMapWinnerCoverage,
+    ReusedPhysicalWork,
+    MissingWriteMetricKey,
+    NoRuntimeCorrelation,
+    AmbiguousRuntimeCorrelation)
+}
+
 private[sql] case class ShuffleRecoveryWeightedObservation(
     classification: ShuffleRecoveryExchangeObservation,
     disposition: ShuffleRecoveryWeightDisposition,
@@ -123,12 +151,30 @@ private[sql] case class ShuffleRecoveryWeightedObservation(
       "executionId" -> quote(c.executionId),
       "exchangeOrdinal" -> c.exchangeOrdinal.toString,
       "exchangePath" -> quote(c.exchangePath),
+      "childOperatorClass" -> quote(c.childOperatorClass),
+      "partitioningClass" -> quote(c.partitioningClass),
+      "partitionCount" -> int(c.partitionCount),
       "ruleSetName" -> quote(c.ruleSetName),
       "ruleSetVersion" -> c.ruleSetVersion.toString,
       "eligible" -> c.eligible.toString,
       "immediateMissReason" -> optionalReason(c.immediateMissReason),
       "rootMissReason" -> optionalReason(c.rootMissReason),
       "sourceTokenAvailability" -> quote(c.sourceTokenAvailability.code),
+      "lineageDeterminism" -> quote(c.lineageDeterminism.code),
+      "dppPresent" -> c.flags.dynamicPruning.toString,
+      "runtimeFilterPresent" -> c.flags.runtimeFilter.toString,
+      "subqueryPresent" -> c.flags.subquery.toString,
+      "windowPresent" -> c.flags.window.toString,
+      "expandPresent" -> c.flags.expand.toString,
+      "cacheScanPresent" -> c.flags.cacheScan.toString,
+      "adaptivePartitionSpecsPresent" -> c.flags.adaptivePartitionSpecs.toString,
+      "pythonOrArrowPresent" -> c.flags.pythonOrArrow.toString,
+      "reusedExchange" -> c.flags.reusedExchange.toString,
+      "adaptivePlan" -> c.flags.adaptivePlan.toString,
+      "pipelinedShuffle" -> c.pipelinedShuffle.toString,
+      "pushBasedShuffleEnabled" -> c.pushBasedShuffleEnabled.toString,
+      "mergedShuffleEnabled" -> c.mergedShuffleEnabled.toString,
+      "incompatibleRuntimeFlags" -> stringArray(c.incompatibleRuntimeFlags),
       "disposition" -> quote(disposition.code),
       "accountingReason" -> optionalString(accountingReason),
       "stageId" -> int(stageId),
@@ -150,6 +196,10 @@ private[sql] case class ShuffleRecoveryWeightedObservation(
 
   private def optionalString(value: Option[String]): String = {
     value.map(quote).getOrElse("null")
+  }
+
+  private def stringArray(values: Seq[String]): String = {
+    values.distinct.sorted.iterator.map(quote).mkString("[", ",", "]")
   }
 
   private def int(value: Option[Int]): String = {
@@ -178,6 +228,7 @@ private[sql] case class ShuffleRecoveryWeightedObservation(
 }
 
 private[sql] object ShuffleRecoveryRuntimeCorrelator {
+  import ShuffleRecoveryAccountingReason._
   import ShuffleRecoveryWeightDisposition._
 
   def correlate(
@@ -215,7 +266,7 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
       case Seq(stage) if !stage.complete =>
         unweighted(
           observation,
-          stage.invalidReason.getOrElse("INCOMPLETE_MAP_WINNER_COVERAGE"))
+          stage.invalidReason.getOrElse(IncompleteMapWinnerCoverage))
       case Seq(stage) =>
         val physicalKey = (
           stage.executionId,
@@ -223,7 +274,7 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
           stage.stageAttemptId,
           stage.shuffleId)
         if (!seen.add(physicalKey)) {
-          excluded(observation, "REUSED_PHYSICAL_WORK")
+          excluded(observation, ReusedPhysicalWork)
         } else {
           ShuffleRecoveryWeightedObservation(
             observation,
@@ -239,13 +290,13 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
         }
       case Seq() =>
         val reason = if (key.shuffleWriteMetricIds.isEmpty) {
-          "MISSING_WRITE_METRIC_KEY"
+          MissingWriteMetricKey
         } else {
-          "NO_RUNTIME_CORRELATION"
+          NoRuntimeCorrelation
         }
         unweighted(observation, reason)
       case _ =>
-        unweighted(observation, "AMBIGUOUS_RUNTIME_CORRELATION")
+        unweighted(observation, AmbiguousRuntimeCorrelation)
     }
   }
 

@@ -127,15 +127,33 @@ class ShuffleRecoveryOpportunityCorpusSuite extends SharedSparkSession with TPCD
       failureDistributionVersion = ShuffleRecoveryOpportunityReportBuilder.FailureDistributionVersion,
       gateRuleSetName = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules.name,
       gateRuleSetVersion = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules.version,
-      gateThresholdBasisPoints = ShuffleRecoveryOpportunityReportBuilder.GateThresholdBasisPoints)
+      gateThresholdBasisPoints = ShuffleRecoveryOpportunityReportBuilder.GateThresholdBasisPoints,
+      reproductionCommands = Seq(reproductionCommand(mode)))
     val report = ShuffleRecoveryOpportunityReportBuilder.build(
       combined, ShuffleRecoveryStudyRuleSets.all, corpus)
     val rawLines = combined.deterministicJsonLines(ShuffleRecoveryStudyRuleSets.all)
     assert(rawLines.nonEmpty)
     ShuffleRecoveryOpportunityRawIO.parseLines(rawLines)
-    assert(report.toMarkdown === report.toMarkdown)
+    val rendered = report.toMarkdown
+    val rebuilt = ShuffleRecoveryOpportunityReportBuilder.build(
+      combined, ShuffleRecoveryStudyRuleSets.all, corpus).toMarkdown
+    assert(rendered === rebuilt)
+    assert(rendered.contains("## Reproduction"))
+    assert(rendered.contains(s"SPARK_SHUFFLE_RECOVERY_CORPUS_MODE=$mode"))
+    assert(rendered.contains("not benchmark-scale performance estimates"))
 
-    writeArtifacts(mode, rawLines, report.toMarkdown)
+    writeArtifacts(mode, rawLines, rendered)
+  }
+
+  private def reproductionCommand(mode: String): String = {
+    Seq(
+      s"SPARK_SHUFFLE_RECOVERY_CORPUS_MODE=$mode \\",
+      "SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_DIR=\"$PWD/sql/core/target/" +
+        "shuffle-recovery-phase0/opportunity\" \\",
+      "./build/sbt -Phadoop-3 -Phive \\",
+      "  \"sql/testOnly " +
+        "org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityCorpusSuite\"")
+      .mkString("\n")
   }
 
   private def runCases(cases: Seq[CorpusCase]): ShuffleRecoveryOpportunityStudySnapshot = {

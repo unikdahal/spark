@@ -29,6 +29,8 @@ import org.apache.spark.scheduler.{
   SparkListenerTaskEnd}
 import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
 
+import ShuffleRecoveryAccountingReason._
+
 /** Runtime weight for the map outputs that constitute one completed physical shuffle. */
 private[sql] case class ShuffleRecoveryStageRuntime(
     executionId: Long,
@@ -77,7 +79,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
 
   def startAttempt(stageAttemptId: Int): Unit = synchronized {
     if (stageAttemptId < 0) {
-      invalidate("NEGATIVE_STAGE_ATTEMPT")
+      invalidate(NegativeStageAttempt)
     } else {
       submittedAttempts += stageAttemptId
     }
@@ -100,11 +102,11 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       executorRunTimeMs: Long): Unit = synchronized {
     if (invalidReason.isEmpty) {
       if (!submittedAttempts.contains(stageAttemptId)) {
-        invalidate("TASK_FOR_UNKNOWN_STAGE_ATTEMPT")
+        invalidate(TaskForUnknownStageAttempt)
       } else if (mapPartitionId < 0 || mapPartitionId >= expectedMapTasks) {
-        invalidate("MAP_PARTITION_OUT_OF_RANGE")
+        invalidate(MapPartitionOutOfRange)
       } else if (shuffleWriteBytes < 0L || executorRunTimeMs < 0L) {
-        invalidate("NEGATIVE_RUNTIME_METRIC")
+        invalidate(NegativeRuntimeMetric)
       } else {
         winners.get(mapPartitionId) match {
           case Some(current) if current.stageAttemptId > stageAttemptId =>
@@ -137,7 +139,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
     }
     val coverageComplete = winners.size == expectedMapTasks
     val finalInvalid = totals.left.toOption.orElse {
-      if (coverageComplete) None else Some("INCOMPLETE_MAP_WINNER_COVERAGE")
+      if (coverageComplete) None else Some(IncompleteMapWinnerCoverage)
     }
     val (bytes, runTime) = totals.toOption.getOrElse((0L, 0L))
     ShuffleRecoveryStageRuntime(
@@ -164,7 +166,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
             Math.addExact(runTime, winner.executorRunTimeMs))
       })
     } catch {
-      case _: ArithmeticException => Left("RUNTIME_METRIC_OVERFLOW")
+      case _: ArithmeticException => Left(RuntimeMetricOverflow)
     }
   }
 }
@@ -204,7 +206,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
           shuffleId,
           totalMapTasks))
       if (accumulator.expectedMapTasks != totalMapTasks) {
-        accumulator.invalidate("MAPPER_COUNT_CHANGED_ACROSS_ATTEMPTS")
+        accumulator.invalidate(MapperCountChangedAcrossAttempts)
       }
       val attemptKey = AttemptKey(info.stageId, info.attemptNumber())
       attemptToStage.put(attemptKey, stageKey)
