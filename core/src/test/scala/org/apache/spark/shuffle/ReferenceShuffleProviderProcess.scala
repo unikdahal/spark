@@ -35,6 +35,10 @@ private[spark] object ReferenceShuffleProviderProcess {
   private val Group = "cross-jvm-group"
   private val Generation = 1L
   private val ProofIncarnation = "proof"
+  private val LargeIncarnation = "proof-large"
+  private val LargeChunkBytes = 1024 * 1024
+  private val LargeChunkCount = 64
+  private val LargeBytes = Math.multiplyExact(LargeChunkBytes.toLong, LargeChunkCount.toLong)
 
   def main(args: Array[String]): Unit = {
     require(args.length >= 2, "usage: <write|read> <root> [report]")
@@ -57,6 +61,7 @@ private[spark] object ReferenceShuffleProviderProcess {
     commitMap(proof, 1, 1002L, 1024, Map.empty[Int, Array[Byte]])
     require(directoryIsEmpty(proof.attemptsPath), "attempt files remained after winner commit")
 
+    writeLargeBlock(root)
     writeEmptyShape(root, "shape-m0", maps = 0, reducers = 1, taskBase = 1500L)
     writeEmptyShape(root, "shape-r1", maps = 1, reducers = 1, taskBase = 2000L)
     writeEmptyShape(root, "shape-r128", maps = 4, reducers = 128, taskBase = 3000L)
@@ -87,6 +92,18 @@ private[spark] object ReferenceShuffleProviderProcess {
     require(zeroTotal.dataLength == 0L)
     require((0 until zeroTotal.numReducers).forall(id => zeroTotal.getBlockData(id).isEmpty))
 
+    val large = provider(root, LargeIncarnation).openMap(0)
+    val largeMetadata = large.blockMetadata(0)
+    require(largeMetadata.length == LargeBytes)
+    require(!largeMetadata.isEmpty)
+    val expectedLargeChecksum = crc32Repeated(
+      Array.fill[Byte](LargeChunkBytes)(5),
+      LargeChunkCount)
+    require(largeMetadata.checksum.contains(expectedLargeChecksum))
+    val (largeFetchedBytes, largeFetchedChecksum) = readBlockDigest(large, 0)
+    require(largeFetchedBytes == LargeBytes)
+    require(largeFetchedChecksum == expectedLargeChecksum)
+
     val shapes = Seq(
       measureShape(root, "shape-m0", maps = 0, reducers = 1),
       measureShape(root, "shape-r1", maps = 1, reducers = 1),
@@ -103,6 +120,26 @@ private[spark] object ReferenceShuffleProviderProcess {
     proof.cleanupGroup()
     require(directoryIsEmpty(root), "explicit group cleanup left durable artifacts")
     println("REFERENCE_SHUFFLE_READ_OK")
+  }
+
+  private def writeLargeBlock(root: Path): Unit = {
+    val store = provider(root, LargeIncarnation)
+    val writer = store.createMapOutputWriter(1200L, 1)
+    val partition = writer.getPartitionWriter(0)
+    val out = partition.openStream()
+    val chunk = Array.fill[Byte](LargeChunkBytes)(5)
+    try {
+      var written = 0
+      while (written < LargeChunkCount) {
+        out.write(chunk)
+        written += 1
+      }
+    } finally {
+      out.close()
+    }
+    require(partition.getNumBytesWritten() == LargeBytes)
+    val checksum = crc32Repeated(chunk, LargeChunkCount)
+    store.commitWinner(0, descriptorOf(writer.commitAllPartitions(Array(checksum))))
   }
 
   private def writeEmptyShape(
@@ -183,6 +220,7 @@ private[spark] object ReferenceShuffleProviderProcess {
        |offset delta. No positive synthetic size or fabricated zero is used.
        |
        |The cross-JVM sparse proof used a 1024-reducer map whose index was $proofIndexBytes bytes.
+       |The same fresh-process proof fetched and checksummed a $LargeBytes-byte large block.
        |
        || Maps (M) | Reducers (R) | Total index bytes | Bytes read per map open |
        || ---: | ---: | ---: | ---: |
@@ -192,7 +230,7 @@ private[spark] object ReferenceShuffleProviderProcess {
        |
        |A first JVM wrote and authoritatively selected immutable winners, then exited. A second
        |independent JVM reopened the same root, skipped genuine empty reducers, read the one-byte,
-       |skewed, and sparse non-empty blocks from exact physical ranges, verified a zero-total map,
+       |sparse, skewed, and 64 MiB blocks from exact physical ranges, verified a zero-total map,
        |opened wide indexes, and finally performed explicit idempotent group cleanup.
        |
        |## Limitations
@@ -239,6 +277,31 @@ private[spark] object ReferenceShuffleProviderProcess {
     }
   }
 
+  private def readBlockDigest(
+      map: ReferenceShuffleResolvedMap,
+      reduceId: Int): (Long, Long) = {
+    val buffer = map.getBlockData(reduceId).getOrElse {
+      throw new IllegalStateException(s"expected non-empty reducer $reduceId")
+    }
+    val in = buffer.createInputStream()
+    val crc = new CRC32()
+    val chunk = new Array[Byte](64 * 1024)
+    var total = 0L
+    try {
+      var read = in.read(chunk)
+      while (read >= 0) {
+        if (read > 0) {
+          crc.update(chunk, 0, read)
+          total = Math.addExact(total, read.toLong)
+        }
+        read = in.read(chunk)
+      }
+      (total, crc.getValue)
+    } finally {
+      in.close()
+    }
+  }
+
   private def provider(root: Path, incarnation: String): ReferenceShuffleProvider = {
     ReferenceShuffleProvider.open(
       root,
@@ -251,6 +314,16 @@ private[spark] object ReferenceShuffleProviderProcess {
   private def crc32(bytes: Array[Byte]): Long = {
     val crc = new CRC32()
     crc.update(bytes)
+    crc.getValue
+  }
+
+  private def crc32Repeated(bytes: Array[Byte], repetitions: Int): Long = {
+    val crc = new CRC32()
+    var i = 0
+    while (i < repetitions) {
+      crc.update(bytes)
+      i += 1
+    }
     crc.getValue
   }
 
