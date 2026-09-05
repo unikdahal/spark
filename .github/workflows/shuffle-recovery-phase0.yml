@@ -22,6 +22,15 @@ on:
     branches:
       - spip/shuffle-recovery-phase0
   workflow_dispatch:
+    inputs:
+      opportunity-corpus-mode:
+        description: Opportunity evidence corpus size
+        required: true
+        default: smoke
+        type: choice
+        options:
+          - smoke
+          - larger
 
 permissions:
   contents: read
@@ -32,9 +41,12 @@ concurrency:
 
 jobs:
   opportunity-analyzer:
-    name: Opportunity analyzer (SQL, JDK 17)
+    name: Opportunity analyzer and weighted gate (SQL, JDK 17)
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      OPPORTUNITY_CORPUS_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.opportunity-corpus-mode || 'smoke' }}
+      OPPORTUNITY_DIR: ${{ github.workspace }}/sql/core/target/shuffle-recovery-phase0/opportunity
 
     steps:
       - name: Checkout pull request head
@@ -132,55 +144,102 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityAnalyzerSuite"
 
+      - name: Run weighted runtime and report suites
+        run: |
+          ./build/sbt -Phadoop-3 -Phive \
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite"
+
       - name: Run adaptive partition-rule regression suite
         run: |
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryAdaptivePartitionRulesSuite"
+
+      - name: Run AQE-on/off TPC opportunity corpus
+        env:
+          SPARK_SHUFFLE_RECOVERY_CORPUS_MODE: ${{ env.OPPORTUNITY_CORPUS_MODE }}
+          SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_DIR: ${{ env.OPPORTUNITY_DIR }}
+        run: |
+          ./build/sbt -Phadoop-3 -Phive \
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityCorpusSuite"
 
       - name: Run listener-manager regression suite
         run: >-
           ./build/sbt -Phadoop-3 -Phive
           "sql/testOnly org.apache.spark.sql.util.ExecutionListenerManagerSuite"
 
-      - name: Validate focused test discovery and analyzer evidence
+      - name: Validate focused test discovery and evidence accounting
         shell: bash
         run: |
           set -euo pipefail
-          report="$(find sql -type f -path '*/test-reports/*' \
+          analyzer_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryOpportunityAnalyzerSuite*.xml' -print -quit)"
-          if [[ -z "${report}" ]]; then
-            echo "Focused opportunity analyzer suite produced no test report." >&2
-            exit 1
-          fi
-
+          study_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryOpportunityStudySuite*.xml' -print -quit)"
+          retry_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryRuntimeWeightsSuite*.xml' -print -quit)"
+          corpus_report="$(find sql -type f -path '*/test-reports/*' \
+            -name '*ShuffleRecoveryOpportunityCorpusSuite*.xml' -print -quit)"
           adaptive_report="$(find sql -type f -path '*/test-reports/*' \
             -name '*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml' -print -quit)"
-          if [[ -z "${adaptive_report}" ]]; then
-            echo "Adaptive partition-rule suite produced no test report." >&2
-            exit 1
-          fi
+          for report in \
+            "${analyzer_report}" \
+            "${study_report}" \
+            "${retry_report}" \
+            "${corpus_report}" \
+            "${adaptive_report}"; do
+            if [[ -z "${report}" ]]; then
+              echo "A focused Phase 0-A suite produced no test report." >&2
+              exit 1
+            fi
+          done
 
-          evidence="sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl"
-          if [[ ! -s "${evidence}" ]]; then
+          analyzer_evidence="sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl"
+          if [[ ! -s "${analyzer_evidence}" ]]; then
             echo "Opportunity analyzer produced no evidence records." >&2
             exit 1
           fi
-          grep -q '"executionId":"aqe-off"' "${evidence}"
-          grep -q '"executionId":"aqe-on"' "${evidence}"
-          grep -q '"exchangeOrdinal":' "${evidence}"
-          grep -q '"lineageDeterminism":' "${evidence}"
-          grep -q '"eligible":' "${evidence}"
+          grep -q '"executionId":"aqe-off"' "${analyzer_evidence}"
+          grep -q '"executionId":"aqe-on"' "${analyzer_evidence}"
+          grep -q '"exchangeOrdinal":' "${analyzer_evidence}"
+          grep -q '"lineageDeterminism":' "${analyzer_evidence}"
+          grep -q '"eligible":' "${analyzer_evidence}"
 
-      - name: Upload analyzer evidence and focused test results
+          raw="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.jsonl"
+          rendered="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.md"
+          if [[ ! -s "${raw}" || ! -s "${rendered}" ]]; then
+            echo "Weighted opportunity corpus produced empty raw/report evidence." >&2
+            exit 1
+          fi
+          grep -q '"schemaVersion":1' "${raw}"
+          grep -q '"disposition":"WEIGHTED"' "${raw}"
+          grep -q 'Gate result:' "${rendered}"
+          grep -q 'Scope curve and correlation coverage' "${rendered}"
+          grep -q 'Failure-point opportunity' "${rendered}"
+          grep -q 'Unweighted / excluded accounting' "${rendered}"
+          grep -q 'TPC-DS' "${rendered}"
+          grep -q 'TPC-H' "${rendered}"
+
+          {
+            echo "### Phase 0-A weighted opportunity evidence"
+            echo "Corpus mode: \`${OPPORTUNITY_CORPUS_MODE}\`"
+            echo
+            cat "${rendered}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload Phase 0-A evidence and focused test results
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: shuffle-recovery-phase0-opportunity-analyzer-${{ github.run_id }}
+          name: shuffle-recovery-phase0-opportunity-${{ env.OPPORTUNITY_CORPUS_MODE }}-${{ github.run_id }}
           if-no-files-found: error
           path: |
             sql/core/target/shuffle-recovery-phase0/sql-test-compile.log
             sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl
+            sql/core/target/shuffle-recovery-phase0/opportunity/**
             **/target/test-reports/*ShuffleRecoveryOpportunityAnalyzerSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryOpportunityStudySuite*.xml
+            **/target/test-reports/*ShuffleRecoveryRuntimeWeightsSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryOpportunityCorpusSuite*.xml
             **/target/test-reports/*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
             **/target/*.log
