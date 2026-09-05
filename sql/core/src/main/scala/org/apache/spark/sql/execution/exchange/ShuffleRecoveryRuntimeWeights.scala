@@ -29,7 +29,7 @@ import org.apache.spark.scheduler.{
   SparkListenerStageCompleted,
   SparkListenerStageSubmitted,
   SparkListenerTaskEnd}
-import org.apache.spark.sql.execution.{SparkPlan, SQLExecution}
+import org.apache.spark.sql.execution.SQLExecution
 
 /** Runtime weight for the map outputs that constitute one completed physical shuffle. */
 private[sql] case class ShuffleRecoveryStageRuntime(
