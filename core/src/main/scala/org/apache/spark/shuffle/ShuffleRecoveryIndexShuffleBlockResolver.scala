@@ -79,6 +79,13 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
   private[spark] def isRecovered(targetShuffleId: Int): Boolean =
     recoveredBindings.containsKey(targetShuffleId)
 
+  private[spark] def openBoundMapForPreparation(
+      provider: ReferenceShuffleRecoveryClaimProvider,
+      binding: ShuffleRecoveryBinding,
+      mapIndex: Int): ReferenceShuffleResolvedMap = {
+    provider.openBoundMap(binding, mapIndex)
+  }
+
   override def getBlockData(
       blockId: BlockId,
       dirs: Option[Array[String]]): ManagedBuffer = {
