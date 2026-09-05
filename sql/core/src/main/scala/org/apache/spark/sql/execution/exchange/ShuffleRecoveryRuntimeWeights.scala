@@ -95,7 +95,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       invalidate(NegativeStageAttempt)
     } else {
       require(attemptOrder >= 0L, "attempt order must be non-negative")
-      submittedAttempts.put((currentStageId, stageAttemptId), attemptOrder)
+      submittedAttempts.getOrElseUpdate((currentStageId, stageAttemptId), attemptOrder)
     }
   }
 
