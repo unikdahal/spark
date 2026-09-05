@@ -154,9 +154,10 @@ jobs:
           mkdir -p "$(dirname "${report}")"
 
           ./build/sbt -Phadoop-3 \
-            "set core / Test / run / fork := true" \
-            "core/Test/runMain org.apache.spark.shuffle.ReferenceShuffleProviderProcess write ${proof_root}" \
-            "core/Test/runMain org.apache.spark.shuffle.ReferenceShuffleProviderProcess read ${proof_root} ${report}"
+            "project core" \
+            "set Test / run / fork := true" \
+            "Test/runMain org.apache.spark.shuffle.ReferenceShuffleProviderProcess write ${proof_root}" \
+            "Test/runMain org.apache.spark.shuffle.ReferenceShuffleProviderProcess read ${proof_root} ${report}"
 
           grep -q 'Selected Spark extension points' "${report}"
           grep -q '40 + 16R' "${report}"
