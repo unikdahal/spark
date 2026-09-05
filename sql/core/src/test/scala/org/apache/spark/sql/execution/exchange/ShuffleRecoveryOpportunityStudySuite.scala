@@ -249,6 +249,10 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     }
     intercept[IllegalArgumentException] {
       ShuffleRecoveryOpportunityRawIO.parseLine(
+        json.replace("\"partitionCount\":4", "\"partitionCount\":-1"))
+    }
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
         json.dropRight(1) + ",\"unexpected\":1}")
     }
     intercept[IllegalArgumentException] {
