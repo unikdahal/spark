@@ -19,12 +19,12 @@ For one physical shuffle:
 1. Retry accounting is keyed by `(SQL execution ID, shuffle ID)`, not stage ID. Spark can recreate a finished `ShuffleMapStage` after output loss with a new stage ID while retaining the same shuffle ID.
 2. The coverage denominator is the stage RDD's total partition count, not `StageInfo.numTasks`, because a retry may submit only a subset of maps.
 3. A successful task is keyed by the actual RDD/map `partitionId`; the historical task-set index fallback is used only when `partitionId` is unavailable.
-4. Stage incarnations/attempts are ordered by their `SparkListenerStageSubmitted` observation order. A successful result from a later submitted incarnation/attempt replaces the earlier candidate for that map partition. Successful outputs from an earlier attempt remain represented when Spark's determinate retry does not recompute them.
+4. Stage incarnations/attempts are ordered by their first `SparkListenerStageSubmitted` observation. Duplicate submission delivery preserves the original order. A successful result from a later submitted incarnation/attempt replaces the earlier candidate for that map partition. Successful outputs from an earlier attempt remain represented when Spark's determinate retry does not recompute them.
 5. Within one stage incarnation/attempt, at most one successful result for a map partition contributes. The latest successful completion observed before stage completion replaces an earlier duplicate, matching Spark's replace-on-registration `MapOutputTracker` semantics for accepted duplicate successes. Speculative duplicates are therefore never double-counted.
 6. A zero-task skipped resubmission of an already completed physical shuffle does not move its completion order or alter its winner weights. It may contribute accumulator IDs needed for correlation.
 7. Failed task work is not reusable successful work. A failed stage attempt contributes only map winners that survive into the eventual completed shuffle under the rule above.
 8. A successful stage without complete map-partition winner coverage is `UNWEIGHTED`, never partially weighted.
-9. A repeated logical reference to the same correlated physical shuffle is `EXCLUDED/REUSED_PHYSICAL_WORK` after the first physical count.
+9. A repeated logical reference to the same correlated physical shuffle is `EXCLUDED/REUSED_PHYSICAL_WORK` after the first physical count. No other accounting reason is permitted to remove work from the denominator.
 10. Missing or ambiguous exchange-to-stage correlation is `UNWEIGHTED` with a stable reason.
 
 ## Correlation rule
@@ -110,7 +110,7 @@ If this gate fails, the failure remains visible in the report and umbrella decis
 ## Required artifact/accounting properties
 
 - Raw evidence schema version: `1`.
-- Every observed exchange is `WEIGHTED`, stable-reason `UNWEIGHTED`, or documented `EXCLUDED`.
+- Every observed exchange is `WEIGHTED`, stable-reason `UNWEIGHTED`, or documented `EXCLUDED`; only reused physical work may use the excluded bucket.
 - Failed/cancelled SQL executions remain explicit and are never represented as completed opportunity.
 - Zero exchanges are a valid empty report.
 - Zero byte/time denominators are `N/A`.
