@@ -18,6 +18,7 @@
 package org.apache.spark.shuffle
 
 import java.io.IOException
+import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, StandardOpenOption}
 import java.nio.file.attribute.{PosixFileAttributeView, PosixFilePermissions}
@@ -213,6 +214,25 @@ class ReferenceShuffleProviderSuite extends SparkFunSuite {
       Files.delete(provider.committedMapDirectory(4).resolveSibling("map-4.winner"))
       intercept[IOException] {
         provider.openMap(4)
+      }
+    }
+  }
+
+  test("oversized index is rejected before allocation") {
+    withProvider("oversized-index") { provider =>
+      val descriptor = writeCandidate(provider, 47L, 1, Map(0 -> Array[Byte](1)))
+      provider.commitWinner(0, descriptor)
+      val index = provider.committedMapDirectory(0)
+        .resolve(ReferenceShuffleProvider.IndexFileName)
+      val channel = Files.newByteChannel(index, StandardOpenOption.WRITE)
+      try {
+        channel.position(64L * 1024L * 1024L)
+        channel.write(ByteBuffer.wrap(Array[Byte](1)))
+      } finally {
+        channel.close()
+      }
+      intercept[IOException] {
+        provider.openMap(0)
       }
     }
   }
