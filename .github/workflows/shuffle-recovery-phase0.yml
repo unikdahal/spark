@@ -30,7 +30,7 @@ on:
         type: choice
         options:
           - smoke
-          - larger
+          - evidence
 
 permissions:
   contents: read
@@ -299,10 +299,10 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityAnalyzerSuite"
 
-      - name: Run weighted runtime and report suites
+      - name: Run weighted runtime, correlation, and report suites
         run: |
           ./build/sbt -Phadoop-3 -Phive \
-            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite"
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeCorrelationSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryFailureDistributionSuite"
 
       - name: Run adaptive partition-rule regression suite
         run: |
@@ -326,24 +326,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          analyzer_report="$(find sql -type f -path '*/test-reports/*' \
-            -name '*ShuffleRecoveryOpportunityAnalyzerSuite*.xml' -print -quit)"
-          study_report="$(find sql -type f -path '*/test-reports/*' \
-            -name '*ShuffleRecoveryOpportunityStudySuite*.xml' -print -quit)"
-          retry_report="$(find sql -type f -path '*/test-reports/*' \
-            -name '*ShuffleRecoveryRuntimeWeightsSuite*.xml' -print -quit)"
-          corpus_report="$(find sql -type f -path '*/test-reports/*' \
-            -name '*ShuffleRecoveryOpportunityCorpusSuite*.xml' -print -quit)"
-          adaptive_report="$(find sql -type f -path '*/test-reports/*' \
-            -name '*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml' -print -quit)"
-          for report in \
-            "${analyzer_report}" \
-            "${study_report}" \
-            "${retry_report}" \
-            "${corpus_report}" \
-            "${adaptive_report}"; do
+          for suite in \
+            ShuffleRecoveryOpportunityAnalyzerSuite \
+            ShuffleRecoveryOpportunityStudySuite \
+            ShuffleRecoveryRuntimeWeightsSuite \
+            ShuffleRecoveryRuntimeCorrelationSuite \
+            ShuffleRecoveryFailureDistributionSuite \
+            ShuffleRecoveryOpportunityCorpusSuite \
+            ShuffleRecoveryAdaptivePartitionRulesSuite \
+            ExecutionListenerManagerSuite; do
+            report="$(find sql -type f -path '*/test-reports/*' -name "*${suite}*.xml" -print -quit)"
             if [[ -z "${report}" ]]; then
-              echo "A focused Phase 0-A suite produced no test report." >&2
+              echo "Focused suite ${suite} produced no test report." >&2
               exit 1
             fi
           done
@@ -361,10 +355,21 @@ jobs:
 
           raw="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.jsonl"
           rendered="${OPPORTUNITY_DIR}/opportunity-${OPPORTUNITY_CORPUS_MODE}.md"
-          if [[ ! -s "${raw}" || ! -s "${rendered}" ]]; then
-            echo "Weighted opportunity corpus produced empty raw/report evidence." >&2
-            exit 1
-          fi
+          correlation="${OPPORTUNITY_DIR}/correlation-${OPPORTUNITY_CORPUS_MODE}.md"
+          reconciliation="${OPPORTUNITY_DIR}/reconciliation-${OPPORTUNITY_CORPUS_MODE}.tsv"
+          sensitivity="${OPPORTUNITY_DIR}/sensitivity-${OPPORTUNITY_CORPUS_MODE}.md"
+          for evidence_file in \
+            "${raw}" \
+            "${rendered}" \
+            "${correlation}" \
+            "${reconciliation}" \
+            "${sensitivity}"; do
+            if [[ ! -s "${evidence_file}" ]]; then
+              echo "Expected evidence file ${evidence_file} is empty or missing." >&2
+              exit 1
+            fi
+          done
+
           grep -q '"schemaVersion":1' "${raw}"
           grep -q '"disposition":"WEIGHTED"' "${raw}"
           grep -q 'Gate result:' "${rendered}"
@@ -373,10 +378,44 @@ jobs:
           grep -q 'Unweighted / excluded accounting' "${rendered}"
           grep -q 'TPC-DS' "${rendered}"
           grep -q 'TPC-H' "${rendered}"
+          grep -q 'Frozen minimum completed-task-time coverage: 95.0%' "${correlation}"
+          grep -q $'executionId\texchangeOrdinal\texchangePath' "${reconciliation}"
+          grep -q 'Physical exchanges are not IID samples' "${sensitivity}"
+
+          if [[ "${OPPORTUNITY_CORPUS_MODE}" == "smoke" ]]; then
+            grep -q 'spark-in-tree-tpc-smoke-v2' "${rendered}"
+          else
+            grep -q 'spark-in-tree-tpc-evidence-v2' "${rendered}"
+            synthetic_raw="${OPPORTUNITY_DIR}/opportunity-synthetic-evidence.jsonl"
+            synthetic_report="${OPPORTUNITY_DIR}/opportunity-synthetic-evidence.md"
+            synthetic_correlation="${OPPORTUNITY_DIR}/correlation-synthetic-evidence.md"
+            synthetic_reconciliation="${OPPORTUNITY_DIR}/reconciliation-synthetic-evidence.tsv"
+            synthetic_sensitivity="${OPPORTUNITY_DIR}/sensitivity-synthetic-evidence.md"
+            for evidence_file in \
+              "${synthetic_raw}" \
+              "${synthetic_report}" \
+              "${synthetic_correlation}" \
+              "${synthetic_reconciliation}" \
+              "${synthetic_sensitivity}"; do
+              if [[ ! -s "${evidence_file}" ]]; then
+                echo "Expected synthetic evidence file ${evidence_file} is empty or missing." >&2
+                exit 1
+              fi
+            done
+            grep -q 'spark-controlled-synthetic-evidence-v1' "${synthetic_report}"
+            grep -q 'Frozen minimum completed-task-time coverage: 95.0%' \
+              "${synthetic_correlation}"
+            if grep -q '| SYNTHETIC |' "${rendered}"; then
+              echo "Synthetic evidence leaked into the benchmark headline report." >&2
+              exit 1
+            fi
+          fi
 
           {
             echo "### Phase 0-A weighted opportunity evidence"
             echo "Corpus mode: \`${OPPORTUNITY_CORPUS_MODE}\`"
+            echo
+            cat "${correlation}"
             echo
             cat "${rendered}"
           } >> "${GITHUB_STEP_SUMMARY}"
@@ -394,6 +433,8 @@ jobs:
             **/target/test-reports/*ShuffleRecoveryOpportunityAnalyzerSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityStudySuite*.xml
             **/target/test-reports/*ShuffleRecoveryRuntimeWeightsSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryRuntimeCorrelationSuite*.xml
+            **/target/test-reports/*ShuffleRecoveryFailureDistributionSuite*.xml
             **/target/test-reports/*ShuffleRecoveryOpportunityCorpusSuite*.xml
             **/target/test-reports/*ShuffleRecoveryAdaptivePartitionRulesSuite*.xml
             **/target/test-reports/*ExecutionListenerManagerSuite*.xml
