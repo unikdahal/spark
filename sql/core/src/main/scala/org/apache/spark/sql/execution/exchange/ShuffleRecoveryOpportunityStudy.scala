@@ -215,8 +215,14 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
           val executionStages = runtimeListener.snapshot().filter(_.executionId == executionId)
           val captured = qe.executedPlan match {
             case adaptive: AdaptiveSparkPlanExec =>
-              appendMaterializedInitialPlan(
+              val materialized = appendMaterializedAdaptiveStages(
                 current,
+                adaptive,
+                stableId,
+                runtimeState,
+                executionStages)
+              appendMaterializedInitialPlan(
+                materialized,
                 analyzePlan(adaptive.initialPlan, stableId, runtimeState),
                 executionStages)
             case _ => current
@@ -251,6 +257,101 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
     require(byRule.forall(_._2.size == keys.size),
       s"classification/runtime-key count mismatch for $stableId")
     AnalyzedPlan(byRule, keys)
+  }
+
+  /**
+   * AQE materializes copied exchange nodes. A completed stage can later disappear from the final
+   * plan, while its concrete exchange remains in the adaptive stage cache when exchange reuse is
+   * enabled. Analyze the actual materialized root exchange so its RDD scope is the one seen by the
+   * scheduler, then append only runtime work not already represented by the final plan.
+   */
+  private def appendMaterializedAdaptiveStages(
+      current: AnalyzedPlan,
+      adaptive: AdaptiveSparkPlanExec,
+      stableId: String,
+      runtimeState: ShuffleRecoveryRuntimeState,
+      stages: Seq[ShuffleRecoveryStageRuntime]): AnalyzedPlan = {
+    val completedStages = stages.filter(_.complete)
+    val materialized = adaptive.context.stageCache.values.toVector
+      .filter(_.isMaterialized)
+      .flatMap { queryStage =>
+        queryStage.plan match {
+          case _: ShuffleExchangeExec =>
+            val analyzed = analyzePlan(queryStage.plan, stableId, runtimeState)
+            analyzed.runtimeKeys.indexWhere(_.exchangePath == "root") match {
+              case -1 => None
+              case rootIndex =>
+                val root = selectAnalyzedExchange(analyzed, rootIndex)
+                uniqueMatchingStage(root.runtimeKeys.head, completedStages).map(_ -> root)
+            }
+          case _ => None
+        }
+      }
+      .sortBy { case (stage, _) =>
+        (stage.completionOrder, stage.stageId, stage.stageAttemptId, stage.shuffleId)
+      }
+
+    materialized.foldLeft(current) { case (captured, (stage, analyzed)) =>
+      if (captured.runtimeKeys.exists(key => runtimeKeyMatchesStage(key, stage))) {
+        captured
+      } else {
+        appendHistoricalExchange(
+          captured,
+          analyzed,
+          s"historical-aqe.stage-${stage.stageId}")
+      }
+    }
+  }
+
+  private def selectAnalyzedExchange(plan: AnalyzedPlan, index: Int): AnalyzedPlan = {
+    require(index >= 0 && index < plan.runtimeKeys.size, "exchange index must be in range")
+    val byRule = plan.byRule.map { case (ruleSet, observations) =>
+      require(index < observations.size, "classification/runtime-key count mismatch")
+      ruleSet -> Seq(observations(index))
+    }
+    AnalyzedPlan(byRule, Seq(plan.runtimeKeys(index)))
+  }
+
+  private def uniqueMatchingStage(
+      key: ShuffleRecoveryExchangeRuntimeKey,
+      stages: Seq[ShuffleRecoveryStageRuntime]): Option[ShuffleRecoveryStageRuntime] = {
+    val scopeMatches = key.rddScopeId.toSeq.flatMap { scopeId =>
+      stages.filter(_.rddScopeIds.contains(scopeId))
+    }
+    if (scopeMatches.size == 1) {
+      Some(scopeMatches.head)
+    } else if (scopeMatches.nonEmpty) {
+      None
+    } else {
+      val metricMatches = stages.filter { stage =>
+        key.shuffleWriteMetricIds.exists(stage.accumulatorIds.contains)
+      }
+      if (metricMatches.size == 1) Some(metricMatches.head) else None
+    }
+  }
+
+  private def appendHistoricalExchange(
+      current: AnalyzedPlan,
+      historical: AnalyzedPlan,
+      pathPrefix: String): AnalyzedPlan = {
+    require(historical.runtimeKeys.size == 1, "historical append requires one exchange")
+    val ordinal = current.runtimeKeys.size.toLong
+    val historicalKey = historical.runtimeKeys.head
+    val appendedKey = historicalKey.copy(
+      exchangeOrdinal = ordinal,
+      exchangePath = s"$pathPrefix.${historicalKey.exchangePath}")
+    val mergedByRule = current.byRule.zip(historical.byRule).map {
+      case ((currentRule, currentObservations), (historicalRule, historicalObservations)) =>
+        require(currentRule == historicalRule, "current/historical rule-set order mismatch")
+        require(historicalObservations.size == 1, "historical append requires one observation")
+        val observation = historicalObservations.head
+        val appendedObservation = observation.copy(
+          exchangeOrdinal = ordinal,
+          exchangePath = s"$pathPrefix.${observation.exchangePath}",
+          flags = observation.flags.copy(adaptivePlan = true))
+        currentRule -> (currentObservations :+ appendedObservation)
+    }
+    AnalyzedPlan(mergedByRule, current.runtimeKeys :+ appendedKey)
   }
 
   /**
