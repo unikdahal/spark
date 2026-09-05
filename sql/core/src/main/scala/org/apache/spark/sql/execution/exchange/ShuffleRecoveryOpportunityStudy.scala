@@ -186,7 +186,7 @@ private[sql] final class ShuffleRecoveryOpportunityStudy(
   private def shouldReport(event: SparkListenerSQLExecutionEnd): Boolean = {
     event.executionName.isDefined &&
       event.qe != null &&
-      event.qe.sparkSession.sessionUUID == spark.sessionUUID
+      (event.qe.sparkSession eq spark)
   }
 
   private def recordExecution(event: SparkListenerSQLExecutionEnd): Unit = {
