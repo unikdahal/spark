@@ -227,6 +227,42 @@ private[sql] case class ShuffleRecoveryWeightedObservation(
   }
 }
 
+private[exchange] final class ShuffleRecoveryRuntimeStageIndex private (
+    byAccumulatorId: Map[(Long, Long), Vector[ShuffleRecoveryStageRuntime]]) {
+
+  def candidates(
+      executionId: Long,
+      accumulatorIds: Set[Long]): Seq[ShuffleRecoveryStageRuntime] = {
+    val unique = mutable.LinkedHashSet.empty[ShuffleRecoveryStageRuntime]
+    accumulatorIds.toSeq.sorted.foreach { accumulatorId =>
+      byAccumulatorId.get((executionId, accumulatorId)).foreach { stages =>
+        stages.foreach(unique += _)
+      }
+    }
+    unique.toVector
+  }
+}
+
+private[exchange] object ShuffleRecoveryRuntimeStageIndex {
+  def fromStages(stages: Seq[ShuffleRecoveryStageRuntime]): ShuffleRecoveryRuntimeStageIndex = {
+    val builders = mutable.HashMap.empty[
+      (Long, Long), mutable.ArrayBuffer[ShuffleRecoveryStageRuntime]]
+    stages.foreach { stage =>
+      stage.accumulatorIds.foreach { accumulatorId =>
+        builders
+          .getOrElseUpdate(
+            (stage.executionId, accumulatorId),
+            mutable.ArrayBuffer.empty[ShuffleRecoveryStageRuntime])
+          .append(stage)
+      }
+    }
+    val index = builders.iterator.map { case (key, values) =>
+      key -> values.toVector
+    }.toMap
+    new ShuffleRecoveryRuntimeStageIndex(index)
+  }
+}
+
 private[sql] object ShuffleRecoveryRuntimeCorrelator {
   import ShuffleRecoveryAccountingReason._
   import ShuffleRecoveryWeightDisposition._
@@ -245,22 +281,23 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
         s"observation/key path mismatch at ordinal ${observation.exchangeOrdinal}")
     }
 
+    val stageIndex = ShuffleRecoveryRuntimeStageIndex.fromStages(stages)
     val seenPhysicalStages = mutable.HashSet.empty[(Long, Int, Int, Int)]
     observations.zip(keys).map { case (observation, key) =>
-      correlateOne(observation, key, stages, seenPhysicalStages)
+      correlateOne(observation, key, stageIndex, seenPhysicalStages)
     }
   }
 
   private def correlateOne(
       observation: ShuffleRecoveryExchangeObservation,
       key: ShuffleRecoveryExchangeRuntimeKey,
-      stages: Seq[ShuffleRecoveryStageRuntime],
+      stageIndex: ShuffleRecoveryRuntimeStageIndex,
       seen: mutable.HashSet[(Long, Int, Int, Int)]): ShuffleRecoveryWeightedObservation = {
     val executionId = parseExecutionId(observation.executionId)
-    val candidates = stages.filter { stage =>
-      stage.executionId == executionId &&
-        key.shuffleWriteMetricIds.nonEmpty &&
-        key.shuffleWriteMetricIds.exists(stage.accumulatorIds.contains)
+    val candidates = if (key.shuffleWriteMetricIds.isEmpty) {
+      Nil
+    } else {
+      stageIndex.candidates(executionId, key.shuffleWriteMetricIds)
     }
     candidates match {
       case Seq(stage) if !stage.complete =>
