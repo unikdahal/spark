@@ -106,8 +106,7 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
     } else if (reservation.targetShuffleId != dependency.shuffleId ||
         mapperCount != dependency.rdd.partitions.length ||
         reducerCount != dependency.partitioner.numPartitions ||
-        mapperCount < 0 || mapperCount > ShuffleRecoveryManifestCodec.MaxMaps ||
-        reducerCount <= 0 || reducerCount > ShuffleRecoveryManifestCodec.MaxReducers) {
+        mapperCount < 0 || reducerCount <= 0) {
       Left("scheduler adoption reservation does not match the current shuffle dependency")
     } else if (!manager.isCurrent(reservation)) {
       Left("scheduler adoption reservation is no longer current")
@@ -365,7 +364,8 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       if (descriptor == null || descriptor.mapIndex != mapIndex) {
         throw new IllegalArgumentException("prepared adoption maps are not complete and ordered")
       }
-      val resolved = provider.openBoundMap(prepared.binding, mapIndex)
+      val resolved =
+        resolver.openBoundMapForPreparation(provider, prepared.binding, mapIndex)
       if (resolved.numReducers != prepared.reducerCount ||
           resolved.dataLength != descriptor.dataLength ||
           resolved.indexBytes != descriptor.indexLength) {
