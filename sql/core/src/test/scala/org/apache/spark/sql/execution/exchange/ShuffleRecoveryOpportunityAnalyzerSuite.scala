@@ -30,8 +30,7 @@ import org.apache.spark.sql.catalyst.expressions.{
 import org.apache.spark.sql.catalyst.plans.physical.{
   HashPartitioning, Partitioning, RangePartitioning, RoundRobinPartitioning, UnknownPartitioning}
 import org.apache.spark.sql.execution.{LeafExecNode, SparkPlan, UnaryExecNode, UnionExec}
-import org.apache.spark.sql.expressions.Window
-import org.apache.spark.sql.functions.row_number
+import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
 
@@ -326,19 +325,18 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
   }
 
   test("window presence is recorded independently from operator allowlisting") {
-    val df = spark.range(16)
-      .select($"id", row_number().over(Window.orderBy($"id")).as("rn"))
-      .repartition(2, $"rn")
+    val plan = hashExchange(WindowExec(Nil, Nil, Nil, rangePlan()))
 
-    val refused = analyze(df.queryExecution.executedPlan)
-      .find(_.flags.window).getOrElse(fail("expected a window-bearing exchange"))
-    val admitted = analyze(
-      df.queryExecution.executedPlan,
-      analyzerRules = rules.copy(allowWindow = true))
-      .find(_.exchangePath == refused.exchangePath).get
+    val refused = analyze(plan).head
+    val admitted = analyze(plan, analyzerRules = rules.copy(allowWindow = true)).head
 
+    assert(refused.flags.window)
+    assert(refused.immediateMissReason.contains(WindowPresent))
     assert(refused.rootMissReason.contains(WindowPresent))
-    assert(!admitted.rootMissReason.contains(WindowPresent))
+    assert(admitted.flags.window)
+    assert(admitted.eligible)
+    assert(admitted.immediateMissReason.isEmpty)
+    assert(admitted.rootMissReason.isEmpty)
   }
 
   test("empty query results remain observable without special-case mutation") {
