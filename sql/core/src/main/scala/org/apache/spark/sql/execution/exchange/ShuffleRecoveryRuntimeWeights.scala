@@ -247,7 +247,7 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
           accumulator.stageId,
           accumulator.shuffleId)
         activeStages.remove(stageKey)
-        attemptToStage.retain((_, key) => key != stageKey)
+        attemptToStage.filterInPlace((_, key) => key != stageKey)
       } else {
         accumulator.recordAccumulatorIds(info.accumulables.keys)
       }
