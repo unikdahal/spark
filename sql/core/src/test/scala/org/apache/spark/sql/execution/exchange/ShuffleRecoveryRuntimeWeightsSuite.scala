@@ -20,12 +20,14 @@ package org.apache.spark.sql.execution.exchange
 import java.util.Properties
 
 import org.apache.spark.SparkFunSuite
+import org.apache.spark.rdd.RDDOperationScope
 import org.apache.spark.scheduler.{
   AccumulableInfo,
   SparkListenerStageCompleted,
   SparkListenerStageSubmitted,
   StageInfo}
 import org.apache.spark.sql.execution.SQLExecution
+import org.apache.spark.storage.{RDDInfo, StorageLevel}
 
 class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
 
@@ -52,6 +54,8 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
       finalAccumulatorIds = Set(7L),
       completionOrder = 1L)
     assert(first.complete)
+    assert(first.observedSuccessfulMapTaskCompletions === 2L)
+    assert(first.successfulMapTaskWinners === 2)
     assert(first.shuffleWriteBytes === 40L)
     assert(first.executorRunTimeMs === 42L)
 
@@ -71,6 +75,7 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
     assert(recomputed.complete)
     assert(recomputed.stageId === 9)
     assert(recomputed.stageAttemptId === 0)
+    assert(recomputed.observedSuccessfulMapTaskCompletions === 3L)
     assert(recomputed.successfulMapTaskWinners === 2)
     assert(recomputed.shuffleWriteBytes === 50L)
     assert(recomputed.executorRunTimeMs === 52L)
@@ -101,6 +106,8 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
       successfulStageAttemptId = 0,
       completionOrder = 1L)
     assert(result.complete)
+    assert(result.observedSuccessfulMapTaskCompletions === 2L)
+    assert(result.successfulMapTaskWinners === 1)
     assert(result.shuffleWriteBytes === 20L)
     assert(result.executorRunTimeMs === 21L)
   }
@@ -130,8 +137,55 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
       successfulStageAttemptId = 0,
       completionOrder = 1L)
     assert(result.complete)
+    assert(result.observedSuccessfulMapTaskCompletions === 2L)
+    assert(result.successfulMapTaskWinners === 1)
     assert(result.shuffleWriteBytes === 20L)
     assert(result.executorRunTimeMs === 21L)
+  }
+
+  test("listener keeps only the direct shuffle-map RDD scope") {
+    val listener = new ShuffleRecoveryRuntimeWeightListener
+    val properties = new Properties()
+    properties.setProperty(SQLExecution.EXECUTION_ID_KEY, "1")
+    val directScope = new RDDOperationScope("Exchange", None, "spark_plan_42")
+    val ancestorScope = new RDDOperationScope("Exchange", None, "spark_plan_7")
+    val directRddInfo = new RDDInfo(
+      id = 1,
+      name = "MapPartitionsRDD",
+      numPartitions = 0,
+      storageLevel = StorageLevel.NONE,
+      isBarrier = false,
+      parentIds = Seq(0),
+      scope = Some(directScope))
+    val ancestorRddInfo = new RDDInfo(
+      id = 0,
+      name = "MapPartitionsRDD",
+      numPartitions = 0,
+      storageLevel = StorageLevel.NONE,
+      isBarrier = false,
+      parentIds = Nil,
+      scope = Some(ancestorScope))
+    val info = new StageInfo(
+      stageId = 2,
+      attemptId = 0,
+      name = "shuffle",
+      numTasks = 0,
+      rddInfos = Seq(directRddInfo, ancestorRddInfo),
+      parentIds = Nil,
+      details = "",
+      shuffleDepId = Some(3),
+      resourceProfileId = 0)
+
+    listener.onStageSubmitted(SparkListenerStageSubmitted(info, properties))
+    listener.onStageCompleted(SparkListenerStageCompleted(info))
+
+    val result = listener.snapshot()
+    assert(result.size === 1)
+    assert(result.head.complete)
+    assert(result.head.shuffleWriteBytes === 0L)
+    assert(result.head.accumulatorIds.isEmpty)
+    assert(result.head.rddScopeIds === Set("spark_plan_42"))
+    assert(result.head.observedSuccessfulMapTaskCompletions === 0L)
   }
 
   test("zero-task skipped stage preserves completion and adds correlation IDs") {
@@ -178,5 +232,6 @@ class ShuffleRecoveryRuntimeWeightsSuite extends SparkFunSuite {
     assert(result.head.stageId === 2)
     assert(result.head.completionOrder === 1L)
     assert(result.head.accumulatorIds === Set(7L, 8L))
+    assert(result.head.observedSuccessfulMapTaskCompletions === 0L)
   }
 }

@@ -386,15 +386,19 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
 
   val FrozenBaselineSha = "2a7cfea06ba135cf0ddc62902eb0daf5a835c672"
   val FailureDistributionVersion = "equal-three-points-v1"
+  val EvidenceFailureDistributionVersion = "equal-four-points-v2"
   val GateThresholdBasisPoints = 2000L
 
   private val AfterFirstEligible = "AFTER_FIRST_ELIGIBLE_COMPLETES"
   private val AfterMultipleUpstream = "AFTER_MULTIPLE_UPSTREAM_SHUFFLES_COMPLETE"
   private val BeforeMostExpensive = "BEFORE_MOST_EXPENSIVE_SHUFFLE_COMPLETES"
-  private val failurePointOrder = Seq(
+  private val AfterEligibleIneligibleMix = "AFTER_ELIGIBLE_INELIGIBLE_MIX"
+  private val smokeFailurePointOrder = Seq(
     AfterFirstEligible,
     AfterMultipleUpstream,
     BeforeMostExpensive)
+  private val evidenceFailurePointOrder =
+    smokeFailurePointOrder :+ AfterEligibleIneligibleMix
 
   def build(
       snapshot: ShuffleRecoveryOpportunityStudySnapshot,
@@ -404,9 +408,11 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
     require(
       corpus.baselineSha == FrozenBaselineSha,
       s"opportunity corpus must use frozen baseline $FrozenBaselineSha")
-    require(
-      corpus.failureDistributionVersion == FailureDistributionVersion,
-      s"unsupported failure distribution ${corpus.failureDistributionVersion}")
+    val failurePointOrder = corpus.failureDistributionVersion match {
+      case FailureDistributionVersion => smokeFailurePointOrder
+      case EvidenceFailureDistributionVersion => evidenceFailurePointOrder
+      case other => throw new IllegalArgumentException(s"unsupported failure distribution $other")
+    }
     require(
       corpus.gateThresholdBasisPoints == GateThresholdBasisPoints,
       s"value gate must remain at $GateThresholdBasisPoints basis points")
@@ -438,8 +444,11 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
       snapshot,
       corpus.gateRuleSetName,
       corpus.gateRuleSetVersion)
-    val rows = failureRows(gateRecords, snapshot.completedExecutionIds)
-    val failureSummaries = summarizeFailurePoints(rows)
+    val rows = failureRows(
+      gateRecords,
+      snapshot.completedExecutionIds,
+      includeMixedPoint = corpus.failureDistributionVersion == EvidenceFailureDistributionVersion)
+    val failureSummaries = summarizeFailurePoints(rows, failurePointOrder)
     val gate = buildGate(corpus, gateRecords, rows)
 
     ShuffleRecoveryOpportunityReport(
@@ -559,7 +568,8 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
 
   private def failureRows(
       records: Seq[ShuffleRecoveryWeightedObservation],
-      completedExecutionIds: Seq[Long]): Seq[ShuffleRecoveryFailurePointRow] = {
+      completedExecutionIds: Seq[Long],
+      includeMixedPoint: Boolean): Seq[ShuffleRecoveryFailurePointRow] = {
     val byExecution = records.groupBy(_.classification.executionId)
     completedExecutionIds.distinct.sorted.flatMap { rawExecutionId =>
       val executionId = f"query-$rawExecutionId%020d"
@@ -589,8 +599,9 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
         }
         .headOption
         .flatMap(_.completionOrder)
+      val mixed = firstMixedCompletionOrder(physical)
 
-      Seq(
+      val baseRows = Seq(
         failureRow(
           executionId,
           AfterFirstEligible,
@@ -612,7 +623,31 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
           physical,
           expensive,
           inclusive = false))
+      if (includeMixedPoint) {
+        baseRows :+ failureRow(
+          executionId,
+          AfterEligibleIneligibleMix,
+          allCount,
+          physical,
+          mixed,
+          inclusive = true)
+      } else {
+        baseRows
+      }
     }
+  }
+
+  private def firstMixedCompletionOrder(
+      physical: Seq[ShuffleRecoveryWeightedObservation]): Option[Long] = {
+    var sawEligible = false
+    var sawIneligible = false
+    physical.iterator.foreach { record =>
+      if (record.classification.eligible) sawEligible = true else sawIneligible = true
+      if (sawEligible && sawIneligible) {
+        return record.completionOrder
+      }
+    }
+    None
   }
 
   private def failureRow(
@@ -665,7 +700,8 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
   }
 
   private def summarizeFailurePoints(
-      rows: Seq[ShuffleRecoveryFailurePointRow]): Seq[ShuffleRecoveryFailurePointSummary] = {
+      rows: Seq[ShuffleRecoveryFailurePointRow],
+      failurePointOrder: Seq[String]): Seq[ShuffleRecoveryFailurePointSummary] = {
     val byPoint = rows.groupBy(_.point)
     failurePointOrder.map { point =>
       val applicable = byPoint.getOrElse(point, Nil).filter(_.applicable)

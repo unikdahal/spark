@@ -26,7 +26,8 @@ import org.apache.spark.sql.execution.metric.SQLShuffleWriteMetricsReporter
 private[sql] case class ShuffleRecoveryExchangeRuntimeKey(
     exchangeOrdinal: Long,
     exchangePath: String,
-    shuffleWriteMetricIds: Set[Long])
+    shuffleWriteMetricIds: Set[Long],
+    rddScopeId: Option[String] = None)
 
 /** Produces correlation keys without forcing a shuffle dependency. */
 private[exchange] object ShuffleRecoveryExchangeRuntimeKeys {
@@ -61,7 +62,11 @@ private[exchange] object ShuffleRecoveryExchangeRuntimeKeys {
       val metricIds = exchange.metrics.iterator.collect {
         case (name, metric) if writeMetricNames.contains(name) => metric.id
       }.toSet
-      ShuffleRecoveryExchangeRuntimeKey(ordinal.toLong, path, metricIds)
+      ShuffleRecoveryExchangeRuntimeKey(
+        ordinal.toLong,
+        path,
+        metricIds,
+        Some(exchange.rddScopeId))
     }.toVector
   }
 
@@ -228,9 +233,10 @@ private[sql] case class ShuffleRecoveryWeightedObservation(
 }
 
 private[exchange] final class ShuffleRecoveryRuntimeStageIndex private (
-    byAccumulatorId: Map[(Long, Long), Vector[ShuffleRecoveryStageRuntime]]) {
+    byAccumulatorId: Map[(Long, Long), Vector[ShuffleRecoveryStageRuntime]],
+    byRddScopeId: Map[(Long, String), Vector[ShuffleRecoveryStageRuntime]]) {
 
-  def candidates(
+  def candidatesByAccumulator(
       executionId: Long,
       accumulatorIds: Set[Long]): Seq[ShuffleRecoveryStageRuntime] = {
     val unique = mutable.LinkedHashSet.empty[ShuffleRecoveryStageRuntime]
@@ -241,25 +247,45 @@ private[exchange] final class ShuffleRecoveryRuntimeStageIndex private (
     }
     unique.toVector
   }
+
+  def candidatesByRddScope(
+      executionId: Long,
+      rddScopeId: Option[String]): Seq[ShuffleRecoveryStageRuntime] = {
+    rddScopeId.toSeq.flatMap { scopeId =>
+      byRddScopeId.getOrElse((executionId, scopeId), Vector.empty)
+    }
+  }
 }
 
 private[exchange] object ShuffleRecoveryRuntimeStageIndex {
   def fromStages(stages: Seq[ShuffleRecoveryStageRuntime]): ShuffleRecoveryRuntimeStageIndex = {
-    val builders = mutable.HashMap.empty[
+    val accumulatorBuilders = mutable.HashMap.empty[
       (Long, Long), mutable.ArrayBuffer[ShuffleRecoveryStageRuntime]]
+    val scopeBuilders = mutable.HashMap.empty[
+      (Long, String), mutable.ArrayBuffer[ShuffleRecoveryStageRuntime]]
     stages.foreach { stage =>
       stage.accumulatorIds.foreach { accumulatorId =>
-        builders
+        accumulatorBuilders
           .getOrElseUpdate(
             (stage.executionId, accumulatorId),
             mutable.ArrayBuffer.empty[ShuffleRecoveryStageRuntime])
           .append(stage)
       }
+      stage.rddScopeIds.foreach { scopeId =>
+        scopeBuilders
+          .getOrElseUpdate(
+            (stage.executionId, scopeId),
+            mutable.ArrayBuffer.empty[ShuffleRecoveryStageRuntime])
+          .append(stage)
+      }
     }
-    val index = builders.iterator.map { case (key, values) =>
-      key -> values.toVector
+    val accumulatorIndex = accumulatorBuilders.iterator.map { case (key, values) =>
+      key -> values.distinct.toVector
     }.toMap
-    new ShuffleRecoveryRuntimeStageIndex(index)
+    val scopeIndex = scopeBuilders.iterator.map { case (key, values) =>
+      key -> values.distinct.toVector
+    }.toMap
+    new ShuffleRecoveryRuntimeStageIndex(accumulatorIndex, scopeIndex)
   }
 }
 
@@ -282,7 +308,7 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
     }
 
     val stageIndex = ShuffleRecoveryRuntimeStageIndex.fromStages(stages)
-    val seenPhysicalStages = mutable.HashSet.empty[(Long, Int, Int, Int)]
+    val seenPhysicalStages = mutable.HashSet.empty[(Long, Int)]
     observations.zip(keys).map { case (observation, key) =>
       correlateOne(observation, key, stageIndex, seenPhysicalStages)
     }
@@ -292,24 +318,22 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
       observation: ShuffleRecoveryExchangeObservation,
       key: ShuffleRecoveryExchangeRuntimeKey,
       stageIndex: ShuffleRecoveryRuntimeStageIndex,
-      seen: mutable.HashSet[(Long, Int, Int, Int)]): ShuffleRecoveryWeightedObservation = {
+      seen: mutable.HashSet[(Long, Int)]): ShuffleRecoveryWeightedObservation = {
     val executionId = parseExecutionId(observation.executionId)
-    val candidates = if (key.shuffleWriteMetricIds.isEmpty) {
+    val scopeCandidates = stageIndex.candidatesByRddScope(executionId, key.rddScopeId)
+    val metricCandidates = if (key.shuffleWriteMetricIds.isEmpty) {
       Nil
     } else {
-      stageIndex.candidates(executionId, key.shuffleWriteMetricIds)
+      stageIndex.candidatesByAccumulator(executionId, key.shuffleWriteMetricIds)
     }
+    val candidates = chooseCandidates(scopeCandidates, metricCandidates)
     candidates match {
       case Seq(stage) if !stage.complete =>
         unweighted(
           observation,
           stage.invalidReason.getOrElse(IncompleteMapWinnerCoverage))
       case Seq(stage) =>
-        val physicalKey = (
-          stage.executionId,
-          stage.stageId,
-          stage.stageAttemptId,
-          stage.shuffleId)
+        val physicalKey = (stage.executionId, stage.shuffleId)
         if (!seen.add(physicalKey)) {
           excluded(observation, ReusedPhysicalWork)
         } else {
@@ -326,7 +350,7 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
             Some(stage.completionOrder))
         }
       case Seq() =>
-        val reason = if (key.shuffleWriteMetricIds.isEmpty) {
+        val reason = if (key.rddScopeId.isEmpty && key.shuffleWriteMetricIds.isEmpty) {
           MissingWriteMetricKey
         } else {
           NoRuntimeCorrelation
@@ -334,6 +358,20 @@ private[sql] object ShuffleRecoveryRuntimeCorrelator {
         unweighted(observation, reason)
       case _ =>
         unweighted(observation, AmbiguousRuntimeCorrelation)
+    }
+  }
+
+  private def chooseCandidates(
+      scopeCandidates: Seq[ShuffleRecoveryStageRuntime],
+      metricCandidates: Seq[ShuffleRecoveryStageRuntime]): Seq[ShuffleRecoveryStageRuntime] = {
+    if (scopeCandidates.nonEmpty) {
+      val metricShuffleIds = metricCandidates.iterator.map(_.shuffleId).toSet
+      val uniqueMetricConflict = scopeCandidates.size == 1 &&
+        metricShuffleIds.size == 1 &&
+        !metricShuffleIds.contains(scopeCandidates.head.shuffleId)
+      if (uniqueMetricConflict) scopeCandidates ++ metricCandidates else scopeCandidates
+    } else {
+      metricCandidates
     }
   }
 

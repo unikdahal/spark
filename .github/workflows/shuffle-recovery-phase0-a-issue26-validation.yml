@@ -1,0 +1,190 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file to You under the Apache License,
+# Version 2.0 (the "License"); you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Shuffle recovery Phase 0-A Issue 26 validation
+
+on:
+  push:
+    branches:
+      - spip/p0-a-expanded-opportunity-evidence
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shuffle-recovery-phase0-a-issue26-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  opportunity-analyzer:
+    name: Opportunity analyzer and weighted gate (SQL, JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OPPORTUNITY_DIR: ${{ github.workspace }}/sql/core/target/shuffle-recovery-phase0/opportunity
+
+    steps:
+      - name: Checkout branch head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Determine integration base
+        id: integration-base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            spip/shuffle-recovery-phase0:refs/remotes/origin/spip/shuffle-recovery-phase0
+          base="$(git merge-base HEAD origin/spip/shuffle-recovery-phase0)"
+          echo "sha=${base}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Cache SBT and Maven launchers
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+          key: shuffle-recovery-build-${{ runner.os }}-${{ hashFiles('**/pom.xml', 'project/build.properties', 'build/mvn', 'build/sbt', 'build/sbt-launch-lib.bash', 'build/spark-build-info') }}
+          restore-keys: |
+            shuffle-recovery-build-${{ runner.os }}-
+            build-${{ runner.os }}-
+
+      - name: Cache Coursier repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/coursier
+          key: shuffle-recovery-coursier-${{ runner.os }}-17-${{ hashFiles('**/pom.xml', '**/plugins.sbt') }}
+          restore-keys: |
+            shuffle-recovery-coursier-${{ runner.os }}-17-
+            coursier-${{ runner.os }}-17-
+            coursier-${{ runner.os }}-
+
+      - name: Check patch whitespace
+        env:
+          BASE_SHA: ${{ steps.integration-base.outputs.sha }}
+        run: git diff --check "${BASE_SHA}...HEAD"
+
+      - name: Run Scala style checks
+        run: timeout --signal=TERM 20m ./dev/scalastyle "-Phadoop-3 -Phive"
+
+      - name: Run Java checkstyle when Java is affected
+        env:
+          BASE_SHA: ${{ steps.integration-base.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --name-only "${BASE_SHA}...HEAD" -- '*.java' | grep -q .; then
+            ./dev/lint-java
+          else
+            echo "No Java files changed; Java checkstyle is not applicable."
+          fi
+
+      - name: Compile SQL production and test code
+        shell: bash
+        run: |
+          set -uo pipefail
+          diagnostic_dir="${GITHUB_WORKSPACE}/sql/core/target/shuffle-recovery-phase0"
+          mkdir -p "${diagnostic_dir}"
+          compile_log="${diagnostic_dir}/sql-test-compile.log"
+          set +e
+          ./build/sbt -Phadoop-3 -Phive "sql/Test/compile" 2>&1 | tee "${compile_log}"
+          compile_status=${PIPESTATUS[0]}
+          set -e
+          exit "${compile_status}"
+
+      - name: Run focused opportunity analyzer suite
+        env:
+          SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_OUTPUT: >-
+            ${{ github.workspace }}/sql/core/target/shuffle-recovery-phase0/analyzer-records.jsonl
+        run: |
+          ./build/sbt -Phadoop-3 -Phive \
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityAnalyzerSuite"
+
+      - name: Run weighted runtime, correlation, and report suites
+        run: |
+          ./build/sbt -Phadoop-3 -Phive \
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityStudySuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeWeightsSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryRuntimeCorrelationSuite org.apache.spark.sql.execution.exchange.ShuffleRecoveryFailureDistributionSuite"
+
+      - name: Run adaptive partition-rule regression suite
+        run: |
+          ./build/sbt -Phadoop-3 -Phive \
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryAdaptivePartitionRulesSuite"
+
+      - name: Run AQE-on/off TPC opportunity corpus
+        env:
+          SPARK_SHUFFLE_RECOVERY_CORPUS_MODE: smoke
+          SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_DIR: ${{ env.OPPORTUNITY_DIR }}
+        run: |
+          ./build/sbt -Phadoop-3 -Phive \
+            "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryOpportunityCorpusSuite"
+
+      - name: Run listener-manager regression suite
+        run: >-
+          ./build/sbt -Phadoop-3 -Phive
+          "sql/testOnly org.apache.spark.sql.util.ExecutionListenerManagerSuite"
+
+      - name: Validate focused test discovery and evidence accounting
+        shell: bash
+        run: |
+          set -euo pipefail
+          for suite in \
+            ShuffleRecoveryOpportunityAnalyzerSuite \
+            ShuffleRecoveryOpportunityStudySuite \
+            ShuffleRecoveryRuntimeWeightsSuite \
+            ShuffleRecoveryRuntimeCorrelationSuite \
+            ShuffleRecoveryFailureDistributionSuite \
+            ShuffleRecoveryOpportunityCorpusSuite \
+            ShuffleRecoveryAdaptivePartitionRulesSuite \
+            ExecutionListenerManagerSuite; do
+            report="$(find sql -type f -path '*/test-reports/*' -name "*${suite}*.xml" -print -quit)"
+            if [[ -z "${report}" ]]; then
+              echo "Focused suite ${suite} produced no test report." >&2
+              exit 1
+            fi
+          done
+
+          raw="${OPPORTUNITY_DIR}/opportunity-smoke.jsonl"
+          rendered="${OPPORTUNITY_DIR}/opportunity-smoke.md"
+          correlation="${OPPORTUNITY_DIR}/correlation-smoke.md"
+          reconciliation="${OPPORTUNITY_DIR}/reconciliation-smoke.tsv"
+          sensitivity="${OPPORTUNITY_DIR}/sensitivity-smoke.md"
+          for evidence in "${raw}" "${rendered}" "${correlation}" "${reconciliation}" "${sensitivity}"; do
+            test -s "${evidence}"
+          done
+          grep -q '"disposition":"WEIGHTED"' "${raw}"
+          grep -q 'Frozen minimum completed-task-time coverage: 95.0%' "${correlation}"
+          grep -q $'executionId\texchangeOrdinal\texchangePath' "${reconciliation}"
+
+      - name: Upload Phase 0-A validation evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-phase0-a-issue26-smoke-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            sql/core/target/shuffle-recovery-phase0/**
+            **/target/test-reports/*ShuffleRecovery*.xml
+            **/target/test-reports/*ExecutionListenerManagerSuite*.xml
+            **/target/*.log
