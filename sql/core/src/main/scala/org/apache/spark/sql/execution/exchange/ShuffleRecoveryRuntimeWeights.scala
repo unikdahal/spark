@@ -57,8 +57,9 @@ private[sql] case class ShuffleRecoveryStageRuntime(
   require(executorRunTimeMs >= 0L, "executor run time must be non-negative")
   require(rddScopeIds.forall(_.nonEmpty), "RDD scope IDs must be non-empty")
   require(
-    observedSuccessfulMapTaskCompletions >= successfulMapTaskWinners.toLong,
-    "observed successful map-task completions cannot be below accepted winner count")
+    observedSuccessfulMapTaskCompletions == 0L ||
+      observedSuccessfulMapTaskCompletions >= successfulMapTaskWinners.toLong,
+    "known observed successful map-task completions cannot be below accepted winner count")
 }
 
 /**
