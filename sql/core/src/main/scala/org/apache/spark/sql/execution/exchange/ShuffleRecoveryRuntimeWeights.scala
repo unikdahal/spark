@@ -47,10 +47,14 @@ private[sql] case class ShuffleRecoveryStageRuntime(
     completionOrder: Long,
     complete: Boolean,
     invalidReason: Option[String],
-    rddScopeIds: Set[String] = Set.empty) {
+    rddScopeIds: Set[String] = Set.empty,
+    observedSuccessfulMapTaskCompletions: Long = 0L) {
 
   require(expectedMapTasks >= 0, "expected map task count must be non-negative")
   require(successfulMapTaskWinners >= 0, "successful winner count must be non-negative")
+  require(
+    observedSuccessfulMapTaskCompletions >= 0L,
+    "observed successful map task completion count must be non-negative")
   require(shuffleWriteBytes >= 0L, "shuffle-write bytes must be non-negative")
   require(executorRunTimeMs >= 0L, "executor run time must be non-negative")
 }
@@ -83,6 +87,7 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
   private val winners = mutable.HashMap.empty[Int, Winner]
   private val accumulatorIds = mutable.HashSet.empty[Long]
   private val rddScopeIds = mutable.HashSet.empty[String]
+  private var observedSuccessfulTaskCompletions = 0L
   private var invalidReason: Option[String] = None
 
   def startAttempt(stageAttemptId: Int): Unit = {
@@ -143,12 +148,20 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
         case Some(_) if shuffleWriteBytes < 0L || executorRunTimeMs < 0L =>
           invalidate(NegativeRuntimeMetric)
         case Some(attemptOrder) =>
-          winners.get(mapPartitionId) match {
-            case Some(current) if current.attemptOrder > attemptOrder =>
-            case _ =>
-              winners.update(
-                mapPartitionId,
-                Winner(attemptOrder, shuffleWriteBytes, executorRunTimeMs))
+          try {
+            observedSuccessfulTaskCompletions =
+              Math.addExact(observedSuccessfulTaskCompletions, 1L)
+          } catch {
+            case _: ArithmeticException => invalidate(RuntimeMetricOverflow)
+          }
+          if (invalidReason.isEmpty) {
+            winners.get(mapPartitionId) match {
+              case Some(current) if current.attemptOrder > attemptOrder =>
+              case _ =>
+                winners.update(
+                  mapPartitionId,
+                  Winner(attemptOrder, shuffleWriteBytes, executorRunTimeMs))
+            }
           }
       }
     }
@@ -204,7 +217,8 @@ private[exchange] final class ShuffleRecoveryStageAccumulator(
       completionOrder,
       complete = finalInvalid.isEmpty,
       finalInvalid,
-      rddScopeIds.toSet)
+      rddScopeIds.toSet,
+      observedSuccessfulTaskCompletions)
   }
 
   private def checkedTotals(): Either[String, (Long, Long)] = {
@@ -345,9 +359,11 @@ private[sql] final class ShuffleRecoveryRuntimeWeightListener extends SparkListe
   }
 
   private def stageRddScopeIds(rddInfos: Seq[org.apache.spark.storage.RDDInfo]): Set[String] = {
-    rddInfos.iterator.flatMap { rddInfo =>
-      rddInfo.scope.iterator.flatMap(_.getAllScopes.iterator.map(_.id))
-    }.filter(_.nonEmpty).toSet
+    rddInfos.headOption
+      .flatMap(_.scope)
+      .map(_.id)
+      .filter(_.nonEmpty)
+      .toSet
   }
 
   private def executionIdFrom(properties: Properties): Option[Long] = {
