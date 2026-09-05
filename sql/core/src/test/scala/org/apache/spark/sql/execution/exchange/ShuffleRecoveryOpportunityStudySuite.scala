@@ -25,7 +25,6 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
   import ShuffleRecoveryMissReason._
   import ShuffleRecoverySourceTokenAvailability._
   import ShuffleRecoveryWeightDisposition._
-  import testImplicits._
 
   private val gateRule = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual
   private val oneRule = Seq(gateRule)
