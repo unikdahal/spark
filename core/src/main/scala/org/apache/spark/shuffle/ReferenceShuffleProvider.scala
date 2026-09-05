@@ -458,9 +458,26 @@ private final class ReferenceShuffleMapOutputWriter(
       while (reduceId < numPartitions) {
         val writer = partitionWriters(reduceId)
         if (writer != null) {
-          val part = writer.path
-          lengths(reduceId) = Files.size(part)
-          Files.copy(part, out)
+          val partitionLength = writer.getNumBytesWritten()
+          lengths(reduceId) = partitionLength
+          if (partitionLength > 0L) {
+            val part = writer.path
+            if (!Files.isRegularFile(part, LinkOption.NOFOLLOW_LINKS)) {
+              throw new IOException(s"missing shuffle partition data: $part")
+            }
+            val physicalLength = Files.size(part)
+            if (physicalLength != partitionLength) {
+              throw new IOException(
+                s"shuffle partition length $physicalLength does not match writer length " +
+                  s"$partitionLength")
+            }
+            val copied = Files.copy(part, out)
+            if (copied != partitionLength) {
+              throw new IOException(
+                s"copied shuffle partition length $copied does not match expected " +
+                  s"$partitionLength")
+            }
+          }
         }
         reduceId += 1
       }
