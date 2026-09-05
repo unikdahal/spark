@@ -19,7 +19,7 @@ package org.apache.spark.sql.execution.exchange
 
 import scala.jdk.CollectionConverters._
 
-import com.fasterxml.jackson.databind.{JsonNode, ObjectMapper}
+import com.fasterxml.jackson.databind.{DeserializationFeature, JsonNode, ObjectMapper}
 
 /** Strict persisted shape for weighted opportunity evidence. */
 private[sql] case class ShuffleRecoveryRawOpportunityRecord(
@@ -77,6 +77,7 @@ private[sql] object ShuffleRecoveryOpportunityRawIO {
   private val MaxRecordCharacters = 1024 * 1024
 
   private val mapper = new ObjectMapper()
+    .enable(DeserializationFeature.FAIL_ON_READING_DUP_TREE_KEY)
   private val fields = Set(
     "schemaVersion",
     "executionId",
