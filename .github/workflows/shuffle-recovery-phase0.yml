@@ -2,8 +2,8 @@
 # Licensed to the Apache Software Foundation (ASF) under one
 # or more contributor license agreements.  See the NOTICE file
 # distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file to You under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance with the License.
+# regarding copyright ownership.  The ASF licenses this file to You under the Apache License,
+# Version 2.0 (the "License"); you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
 #
 #    http://www.apache.org/licenses/LICENSE-2.0
@@ -40,13 +40,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  opportunity-analyzer:
-    name: Opportunity analyzer and weighted gate (SQL, JDK 17)
+  reference-provider:
+    name: Persistent reference provider (Core, JDK 17)
     runs-on: ubuntu-latest
     timeout-minutes: 90
-    env:
-      OPPORTUNITY_CORPUS_MODE: ${{ github.event_name == 'workflow_dispatch' && inputs.opportunity-corpus-mode || 'smoke' }}
-      OPPORTUNITY_DIR: ${{ github.workspace }}/sql/core/target/shuffle-recovery-phase0/opportunity
 
     steps:
       - name: Checkout pull request head
@@ -54,6 +51,162 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Determine integration base
+        id: integration-base
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin \
+            spip/shuffle-recovery-phase0:refs/remotes/origin/spip/shuffle-recovery-phase0
+          base="$(git merge-base HEAD origin/spip/shuffle-recovery-phase0)"
+          echo "sha=${base}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Cache SBT and Maven launchers
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+          key: shuffle-recovery-build-${{ runner.os }}-${{ hashFiles('**/pom.xml', 'project/build.properties', 'build/mvn', 'build/sbt', 'build/sbt-launch-lib.bash', 'build/spark-build-info') }}
+          restore-keys: |
+            shuffle-recovery-build-${{ runner.os }}-
+            build-${{ runner.os }}-
+
+      - name: Cache Coursier repository
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/coursier
+          key: shuffle-recovery-coursier-${{ runner.os }}-17-${{ hashFiles('**/pom.xml', '**/plugins.sbt') }}
+          restore-keys: |
+            shuffle-recovery-coursier-${{ runner.os }}-17-
+            coursier-${{ runner.os }}-17-
+            coursier-${{ runner.os }}-
+
+      - name: Check patch whitespace
+        env:
+          BASE_SHA: ${{ steps.integration-base.outputs.sha }}
+        run: git diff --check "${BASE_SHA}...HEAD"
+
+      - name: Run Scala style checks
+        run: timeout --signal=TERM 20m ./dev/scalastyle "-Phadoop-3 -Phive"
+
+      - name: Run Java checkstyle when Java is affected
+        env:
+          BASE_SHA: ${{ steps.integration-base.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git diff --name-only "${BASE_SHA}...HEAD" -- '*.java' | grep -q .; then
+            ./dev/lint-java
+          else
+            echo "No Java files changed; Java checkstyle is not applicable."
+          fi
+
+      - name: Compile Core production and test code
+        shell: bash
+        run: |
+          set -uo pipefail
+          diagnostic_dir="${GITHUB_WORKSPACE}/core/target/shuffle-recovery-phase0"
+          mkdir -p "${diagnostic_dir}"
+          compile_log="${diagnostic_dir}/core-test-compile.log"
+          set +e
+          ./build/sbt -Phadoop-3 "core/Test/compile" 2>&1 | tee "${compile_log}"
+          compile_status=${PIPESTATUS[0]}
+          set -e
+          if [[ ${compile_status} -ne 0 ]]; then
+            {
+              echo "### core/Test/compile diagnostics"
+              echo '```text'
+              if ! grep -E '^\[error\]' "${compile_log}" | tail -n 200; then
+                tail -n 200 "${compile_log}"
+              fi
+              echo '```'
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+          exit "${compile_status}"
+
+      - name: Run persistent provider suite
+        run: |
+          ./build/sbt -Phadoop-3 \
+            "core/testOnly org.apache.spark.shuffle.ReferenceShuffleProviderSuite"
+
+      - name: Run affected sort-shuffle regressions
+        run: |
+          ./build/sbt -Phadoop-3 \
+            "core/testOnly org.apache.spark.shuffle.sort.IndexShuffleBlockResolverSuite org.apache.spark.shuffle.sort.SortShuffleManagerSuite"
+
+      - name: Run independent-JVM persistent read proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          proof_root="${RUNNER_TEMP}/shuffle-recovery-reference-provider-${GITHUB_RUN_ID}"
+          report="${GITHUB_WORKSPACE}/core/target/shuffle-recovery-phase0/reference-provider/read-representation.md"
+          rm -rf "${proof_root}"
+          mkdir -p "$(dirname "${report}")"
+
+          ./build/sbt -Phadoop-3 \
+            "core/Test/runMain org.apache.spark.shuffle.ReferenceShuffleProviderProcess write ${proof_root}"
+          ./build/sbt -Phadoop-3 \
+            "core/Test/runMain org.apache.spark.shuffle.ReferenceShuffleProviderProcess read ${proof_root} ${report}"
+
+          grep -q 'Selected Spark extension points' "${report}"
+          grep -q '40 + 16R' "${report}"
+          grep -q 'Process-boundary proof' "${report}"
+          grep -q '| 0 | 1 | 0 | 0 |' "${report}"
+          grep -q '| 2 | 4096 |' "${report}"
+          if find "${proof_root}" -mindepth 1 -print -quit | grep -q .; then
+            echo "Cross-JVM proof left group artifacts behind." >&2
+            exit 1
+          fi
+          cat "${report}" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Validate focused test discovery
+        shell: bash
+        run: |
+          set -euo pipefail
+          report="$(find core -type f -path '*/test-reports/*' \
+            -name '*ReferenceShuffleProviderSuite*.xml' -print -quit)"
+          if [[ -z "${report}" ]]; then
+            echo "Reference provider suite produced no test report." >&2
+            exit 1
+          fi
+
+      - name: Upload Phase 0-B reference-provider evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-phase0-reference-provider-${{ github.run_id }}
+          if-no-files-found: error
+          path: |
+            core/target/shuffle-recovery-phase0/core-test-compile.log
+            core/target/shuffle-recovery-phase0/reference-provider/**
+            **/target/test-reports/*ReferenceShuffleProviderSuite*.xml
+            **/target/test-reports/*IndexShuffleBlockResolverSuite*.xml
+            **/target/test-reports/*SortShuffleManagerSuite*.xml
+
+  opportunity-analyzer:
+    if: github.event_name == 'workflow_dispatch'
+    name: Opportunity analyzer and weighted gate (SQL, JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      OPPORTUNITY_CORPUS_MODE: ${{ inputs.opportunity-corpus-mode }}
+      OPPORTUNITY_DIR: ${{ github.workspace }}/sql/core/target/shuffle-recovery-phase0/opportunity
+
+    steps:
+      - name: Checkout requested head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
 
       - name: Determine integration base
         id: integration-base
