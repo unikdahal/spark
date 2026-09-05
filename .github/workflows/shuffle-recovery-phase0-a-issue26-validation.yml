@@ -132,9 +132,9 @@ jobs:
           ./build/sbt -Phadoop-3 -Phive \
             "sql/testOnly org.apache.spark.sql.execution.exchange.ShuffleRecoveryAdaptivePartitionRulesSuite"
 
-      - name: Run AQE-on/off TPC opportunity corpus
+      - name: Run frozen AQE-on/off TPC evidence corpus
         env:
-          SPARK_SHUFFLE_RECOVERY_CORPUS_MODE: smoke
+          SPARK_SHUFFLE_RECOVERY_CORPUS_MODE: evidence
           SPARK_SHUFFLE_RECOVERY_OPPORTUNITY_DIR: ${{ env.OPPORTUNITY_DIR }}
         run: |
           ./build/sbt -Phadoop-3 -Phive \
@@ -165,23 +165,32 @@ jobs:
             fi
           done
 
-          raw="${OPPORTUNITY_DIR}/opportunity-smoke.jsonl"
-          rendered="${OPPORTUNITY_DIR}/opportunity-smoke.md"
-          correlation="${OPPORTUNITY_DIR}/correlation-smoke.md"
-          reconciliation="${OPPORTUNITY_DIR}/reconciliation-smoke.tsv"
-          sensitivity="${OPPORTUNITY_DIR}/sensitivity-smoke.md"
-          for evidence in "${raw}" "${rendered}" "${correlation}" "${reconciliation}" "${sensitivity}"; do
-            test -s "${evidence}"
+          for tier in evidence synthetic-evidence; do
+            raw="${OPPORTUNITY_DIR}/opportunity-${tier}.jsonl"
+            rendered="${OPPORTUNITY_DIR}/opportunity-${tier}.md"
+            correlation="${OPPORTUNITY_DIR}/correlation-${tier}.md"
+            reconciliation="${OPPORTUNITY_DIR}/reconciliation-${tier}.tsv"
+            sensitivity="${OPPORTUNITY_DIR}/sensitivity-${tier}.md"
+            for evidence in "${raw}" "${rendered}" "${correlation}" "${reconciliation}" "${sensitivity}"; do
+              test -s "${evidence}"
+            done
+            grep -q '"disposition":"WEIGHTED"' "${raw}"
+            grep -q 'Frozen minimum completed-task-time coverage: 95.0%' "${correlation}"
+            grep -q $'executionId\texchangeOrdinal\texchangePath' "${reconciliation}"
           done
-          grep -q '"disposition":"WEIGHTED"' "${raw}"
-          grep -q 'Frozen minimum completed-task-time coverage: 95.0%' "${correlation}"
-          grep -q $'executionId\texchangeOrdinal\texchangePath' "${reconciliation}"
+
+          grep -q 'spark-in-tree-tpc-evidence-v1' "${OPPORTUNITY_DIR}/opportunity-evidence.md"
+          grep -q 'SYNTHETIC' "${OPPORTUNITY_DIR}/opportunity-synthetic-evidence.md"
+          if grep -q '| SYNTHETIC |' "${OPPORTUNITY_DIR}/opportunity-evidence.md"; then
+            echo "Synthetic workloads leaked into benchmark headline evidence." >&2
+            exit 1
+          fi
 
       - name: Upload Phase 0-A validation evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: shuffle-recovery-phase0-a-issue26-smoke-${{ github.run_id }}
+          name: shuffle-recovery-phase0-a-issue26-evidence-${{ github.run_id }}
           if-no-files-found: warn
           path: |
             sql/core/target/shuffle-recovery-phase0/**
