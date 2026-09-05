@@ -410,6 +410,11 @@ private[sql] object ShuffleRecoveryOpportunityReportBuilder {
     require(
       corpus.gateThresholdBasisPoints == GateThresholdBasisPoints,
       s"value gate must remain at $GateThresholdBasisPoints basis points")
+    val preregisteredGate = ShuffleRecoveryStudyRuleSets.exactSourceCounterfactual.rules
+    require(
+      corpus.gateRuleSetName == preregisteredGate.name &&
+        corpus.gateRuleSetVersion == preregisteredGate.version,
+      "value gate must use the preregistered exact-source counterfactual rule")
     val gateRuleExists = ruleSets.exists { rule =>
       rule.rules.name == corpus.gateRuleSetName &&
         rule.rules.version == corpus.gateRuleSetVersion
