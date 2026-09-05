@@ -39,11 +39,11 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
     taskIdMapsForShuffle: ConcurrentMap[Int, OpenHashSet[Long]])
   extends IndexShuffleBlockResolver(conf, null, taskIdMapsForShuffle) {
 
-  private final case class RecoveredReadBinding(
-      provider: ReferenceShuffleRecoveryClaimProvider,
-      binding: ShuffleRecoveryBinding,
-      mapperCount: Int,
-      reducerCount: Int)
+  private final class RecoveredReadBinding(
+      val provider: ReferenceShuffleRecoveryClaimProvider,
+      val binding: ShuffleRecoveryBinding,
+      val mapperCount: Int,
+      val reducerCount: Int)
 
   private val recoveredBindings = new ConcurrentHashMap[Int, RecoveredReadBinding]()
 
@@ -59,9 +59,13 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
         binding.targetShuffleId != targetShuffleId || mapperCount < 0 || reducerCount <= 0) {
       false
     } else {
-      val candidate = RecoveredReadBinding(provider, binding, mapperCount, reducerCount)
+      val candidate = new RecoveredReadBinding(provider, binding, mapperCount, reducerCount)
       val existing = recoveredBindings.putIfAbsent(targetShuffleId, candidate)
-      existing == null || existing == candidate
+      existing == null ||
+        ((existing.provider eq provider) &&
+          existing.binding == binding &&
+          existing.mapperCount == mapperCount &&
+          existing.reducerCount == reducerCount)
     }
   }
 
