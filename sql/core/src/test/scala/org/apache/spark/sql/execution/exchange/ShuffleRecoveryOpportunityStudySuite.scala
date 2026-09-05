@@ -105,6 +105,21 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
       completionOrder = Some(completionOrder))
   }
 
+  private def withoutRuntime(
+      disposition: ShuffleRecoveryWeightDisposition,
+      reason: String): ShuffleRecoveryWeightedObservation = {
+    weighted().copy(
+      disposition = disposition,
+      accountingReason = Some(reason),
+      stageId = None,
+      stageAttemptId = None,
+      shuffleId = None,
+      mapperCount = None,
+      shuffleWriteBytes = None,
+      executorRunTimeMs = None,
+      completionOrder = None)
+  }
+
   private def snapshot(
       records: Seq[ShuffleRecoveryWeightedObservation],
       completedExecutionIds: Seq[Long] = Seq(1L),
@@ -232,6 +247,41 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     assert(report.rules.head.taskTimeRatio.render === "N/A")
   }
 
+  test("failure distribution uses completed physical work at each declared restart point") {
+    val records = Seq(
+      weighted(observation(ordinal = 0L), stageId = 10, shuffleId = 20,
+        bytes = 10L, runTimeMs = 10L, completionOrder = 1L),
+      weighted(observation(ordinal = 1L, eligible = false), stageId = 11, shuffleId = 21,
+        bytes = 20L, runTimeMs = 20L, completionOrder = 2L),
+      weighted(observation(ordinal = 2L), stageId = 12, shuffleId = 22,
+        bytes = 30L, runTimeMs = 30L, completionOrder = 3L))
+    val report = ShuffleRecoveryOpportunityReportBuilder.build(
+      snapshot(records), oneRule, corpus())
+
+    val byPoint = report.failurePoints.map(point => point.point -> point).toMap
+    val first = byPoint("AFTER_FIRST_ELIGIBLE_COMPLETES")
+    assert(first.completedExchangeCount === 1L)
+    assert(first.eligibleCompletedExchangeCount === 1L)
+    assert(first.completedExecutorRunTimeMs === 10L)
+    assert(first.avoidableExecutorRunTimeMs === 10L)
+
+    val multiple = byPoint("AFTER_MULTIPLE_UPSTREAM_SHUFFLES_COMPLETE")
+    assert(multiple.completedExchangeCount === 2L)
+    assert(multiple.eligibleCompletedExchangeCount === 1L)
+    assert(multiple.completedExecutorRunTimeMs === 30L)
+    assert(multiple.avoidableExecutorRunTimeMs === 10L)
+
+    val negative = byPoint("BEFORE_MOST_EXPENSIVE_SHUFFLE_COMPLETES")
+    assert(negative.completedExchangeCount === 2L)
+    assert(negative.eligibleCompletedExchangeCount === 1L)
+    assert(negative.completedExecutorRunTimeMs === 30L)
+    assert(negative.avoidableExecutorRunTimeMs === 10L)
+
+    assert(report.valueGate.reusableExecutorRunTimeMs === 30L)
+    assert(report.valueGate.completedExecutorRunTimeMs === 70L)
+    assert(report.valueGate.result.contains(true))
+  }
+
   test("raw evidence parser rejects malformed and inconsistent records") {
     val json = weighted().toJson
     val parsed = ShuffleRecoveryOpportunityRawIO.parseLine(json)
@@ -253,6 +303,12 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     }
     intercept[IllegalArgumentException] {
       ShuffleRecoveryOpportunityRawIO.parseLine(
+        json.replace(
+          "\"executionId\":\"query-00000000000000000001\"",
+          "\"executionId\":\"query-99999999999999999999\""))
+    }
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
         json.dropRight(1) + ",\"unexpected\":1}")
     }
     intercept[IllegalArgumentException] {
@@ -260,16 +316,7 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
         json.dropRight(1) + ",\"disposition\":\"UNWEIGHTED\"}")
     }
 
-    val unweighted = weighted().copy(
-      disposition = Unweighted,
-      accountingReason = Some("NO_RUNTIME_CORRELATION"),
-      stageId = None,
-      stageAttemptId = None,
-      shuffleId = None,
-      mapperCount = None,
-      shuffleWriteBytes = None,
-      executorRunTimeMs = None,
-      completionOrder = None).toJson
+    val unweighted = withoutRuntime(Unweighted, "NO_RUNTIME_CORRELATION").toJson
     assert(ShuffleRecoveryOpportunityRawIO.parseLine(unweighted).disposition === "UNWEIGHTED")
     intercept[IllegalArgumentException] {
       ShuffleRecoveryOpportunityRawIO.parseLine(
@@ -279,6 +326,16 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
       ShuffleRecoveryOpportunityRawIO.parseLine(
         unweighted.replace("NO_RUNTIME_CORRELATION", "UNKNOWN_ACCOUNTING_REASON"))
     }
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
+        withoutRuntime(Excluded, "NO_RUNTIME_CORRELATION").toJson)
+    }
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityRawIO.parseLine(
+        withoutRuntime(Unweighted, "REUSED_PHYSICAL_WORK").toJson)
+    }
+    val excluded = withoutRuntime(Excluded, "REUSED_PHYSICAL_WORK").toJson
+    assert(ShuffleRecoveryOpportunityRawIO.parseLine(excluded).disposition === "EXCLUDED")
 
     val ineligible = weighted(observation(eligible = false)).toJson
     intercept[IllegalArgumentException] {
@@ -340,6 +397,17 @@ class ShuffleRecoveryOpportunityStudySuite extends SharedSparkSession {
     assert(report.rules.head.weightedExchangeCount === 10000L)
     assert(report.rules.head.weightedShuffleWriteBytes === 10000L)
     assert(report.rules.head.weightedExecutorRunTimeMs === 10000L)
+  }
+
+  test("report aggregation rejects byte and task-time overflow") {
+    val records = Seq(
+      weighted(observation(ordinal = 0L), stageId = 10, shuffleId = 20,
+        bytes = Long.MaxValue, runTimeMs = Long.MaxValue, completionOrder = 1L),
+      weighted(observation(ordinal = 1L), stageId = 11, shuffleId = 21,
+        bytes = 1L, runTimeMs = 1L, completionOrder = 2L))
+    intercept[IllegalArgumentException] {
+      ShuffleRecoveryOpportunityReportBuilder.build(snapshot(records), oneRule, corpus())
+    }
   }
 
   test("rule-set version changes remain independently classified") {
