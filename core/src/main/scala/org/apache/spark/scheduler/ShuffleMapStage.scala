@@ -119,16 +119,30 @@ private[spark] class ShuffleMapStage(
   /**
    * Returns true if the map stage is ready, i.e. all partitions have shuffle outputs.
    */
-  def isAvailable: Boolean = numAvailableOutputs == numPartitions
+  def isAvailable: Boolean = {
+    // Parent discovery asks isAvailable before it decides whether this stage must be submitted.
+    // Make an already-prepared recovery transaction visible at that decision point, rather than
+    // waiting until findMissingPartitions. Otherwise recursive parent submission can install a
+    // zero-task adoption synchronously after the child captured a stale "missing parent" snapshot;
+    // the parent's completion notification then runs before the child enters waitingStages and the
+    // child can be stranded there forever. This hook remains local-only and non-blocking: external
+    // recovery work completed before the prepared transaction was offered to the scheduler.
+    if (!isPipelined) {
+      ShuffleRecoverySchedulerAdoption.beforeFindMissingPartitions(
+        mapOutputTrackerMaster,
+        shuffleDep,
+        numPartitions)
+    }
+    numAvailableOutputs == numPartitions
+  }
 
   /** Returns the sequence of partition ids that are missing (i.e. needs to be computed). */
   override def findMissingPartitions(): Seq[Int] = {
     if (isPipelined) {
       (0 until numPartitions).filterNot(pipelinedCompletedPartitions.contains)
     } else {
-      // A prepared adoption is installed at the same local point where the scheduler is about to
-      // decide which map partitions to launch. The hook is deliberately local-only: all manifest,
-      // provider, filesystem, and validation work completed before the DAGScheduler can reach it.
+      // Keep the installation hook here as well for direct callers that ask for missing partitions
+      // without first checking stage availability. The operation is idempotent after adoption.
       ShuffleRecoverySchedulerAdoption.beforeFindMissingPartitions(
         mapOutputTrackerMaster,
         shuffleDep,

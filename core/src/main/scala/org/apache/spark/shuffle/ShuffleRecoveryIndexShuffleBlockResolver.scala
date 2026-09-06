@@ -20,11 +20,18 @@ package org.apache.spark.shuffle
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap}
+import java.util.concurrent.atomic.AtomicLong
 
 import org.apache.spark.{ShuffleRecoverySchedulerAdoptionState, SparkConf}
 import org.apache.spark.network.buffer.{ManagedBuffer, NioManagedBuffer}
 import org.apache.spark.storage.{BlockId, ShuffleBlockBatchId, ShuffleBlockId}
 import org.apache.spark.util.collection.OpenHashSet
+
+private[spark] final case class ShuffleRecoveryReadMetrics(
+    blockReads: Long,
+    nonEmptyBlockReads: Long,
+    emptyBlockReads: Long,
+    bytesRead: Long)
 
 /**
  * Feasibility-only read indirection for an adopted reference-provider shuffle.
@@ -45,7 +52,15 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       val mapperCount: Int,
       val reducerCount: Int)
 
+  private final class RecoveredReadCounters {
+    val blockReads = new AtomicLong(0L)
+    val nonEmptyBlockReads = new AtomicLong(0L)
+    val emptyBlockReads = new AtomicLong(0L)
+    val bytesRead = new AtomicLong(0L)
+  }
+
   private val recoveredBindings = new ConcurrentHashMap[Int, RecoveredReadBinding]()
+  private val recoveredReadCounters = new ConcurrentHashMap[Int, RecoveredReadCounters]()
 
   private[spark] val schedulerAdoption = new ShuffleRecoverySchedulerAdoptionState(this)
 
@@ -61,11 +76,15 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
     } else {
       val candidate = new RecoveredReadBinding(provider, binding, mapperCount, reducerCount)
       val existing = recoveredBindings.putIfAbsent(targetShuffleId, candidate)
-      existing == null ||
+      val installed = existing == null ||
         ((existing.provider eq provider) &&
           existing.binding == binding &&
           existing.mapperCount == mapperCount &&
           existing.reducerCount == reducerCount)
+      if (installed) {
+        recoveredReadCounters.putIfAbsent(targetShuffleId, new RecoveredReadCounters)
+      }
+      installed
     }
   }
 
@@ -74,14 +93,28 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       binding: ShuffleRecoveryBinding): Unit = {
     if (binding != null) {
       val existing = recoveredBindings.get(targetShuffleId)
-      if (existing != null && existing.binding == binding) {
-        recoveredBindings.remove(targetShuffleId, existing)
+      if (existing != null && existing.binding == binding &&
+          recoveredBindings.remove(targetShuffleId, existing)) {
+        recoveredReadCounters.remove(targetShuffleId)
       }
     }
   }
 
   private[spark] def isRecovered(targetShuffleId: Int): Boolean =
     recoveredBindings.containsKey(targetShuffleId)
+
+  private[spark] def recoveredReadMetrics(targetShuffleId: Int): ShuffleRecoveryReadMetrics = {
+    val counters = recoveredReadCounters.get(targetShuffleId)
+    if (counters == null) {
+      ShuffleRecoveryReadMetrics(0L, 0L, 0L, 0L)
+    } else {
+      ShuffleRecoveryReadMetrics(
+        counters.blockReads.get(),
+        counters.nonEmptyBlockReads.get(),
+        counters.emptyBlockReads.get(),
+        counters.bytesRead.get())
+    }
+  }
 
   private[spark] def openBoundMapForPreparation(
       provider: ReferenceShuffleRecoveryClaimProvider,
@@ -108,6 +141,17 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
             throw new IOException("recovered shuffle block coordinates are outside the binding")
           }
           val resolved = recovered.provider.openBoundMap(recovered.binding, mapIndex)
+          val metadata = resolved.blockMetadata(id.reduceId)
+          val counters = recoveredReadCounters.get(id.shuffleId)
+          if (counters != null) {
+            counters.blockReads.incrementAndGet()
+            if (metadata.isEmpty) {
+              counters.emptyBlockReads.incrementAndGet()
+            } else {
+              counters.nonEmptyBlockReads.incrementAndGet()
+              counters.bytesRead.addAndGet(metadata.length)
+            }
+          }
           resolved.getBlockData(id.reduceId).getOrElse {
             new NioManagedBuffer(ByteBuffer.allocate(0))
           }
