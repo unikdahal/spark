@@ -808,9 +808,8 @@ object ShuffleRecoveryColdProcessProcess {
   }
 
   private def consumeUnrelatedShuffleId(spark: SparkSession): Unit = {
-    spark.sparkContext.parallelize(0 until 8, 2)
-      .map(value => (value % 3, value))
-      .groupByKey(3)
+    spark.range(0L, 8L, 1L, 2)
+      .repartition(3, col("id"))
       .count()
   }
 
