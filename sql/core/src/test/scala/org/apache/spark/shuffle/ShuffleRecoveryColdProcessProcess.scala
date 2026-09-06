@@ -808,9 +808,7 @@ object ShuffleRecoveryColdProcessProcess {
   }
 
   private def consumeUnrelatedShuffleId(spark: SparkSession): Unit = {
-    spark.range(0L, 8L, 1L, 2)
-      .repartition(3, col("id"))
-      .count()
+    spark.sparkContext.newShuffleId()
   }
 
   private def collectResult(query: DataFrame): ResultSummary = {
