@@ -58,7 +58,7 @@ private[shuffle] object ShuffleRecoveryColdProcessData {
     "role",
     "scenario",
     "control",
-    "frozenBaseline",
+    "sparkBaseline",
     "testedCommit",
     "sparkCompatibility",
     "providerCompatibility",
