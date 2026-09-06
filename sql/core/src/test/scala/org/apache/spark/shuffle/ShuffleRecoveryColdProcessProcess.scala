@@ -33,6 +33,7 @@ import org.apache.spark.scheduler.{SparkListener, SparkListenerStageSubmitted, S
 import org.apache.spark.sql.{DataFrame, Row, SparkSession}
 import org.apache.spark.sql.execution.exchange.ShuffleExchangeExec
 import org.apache.spark.sql.functions.{col, lit, pmod, repeat, substring, when}
+import org.apache.spark.sql.types.{LongType, StructField, StructType}
 import org.apache.spark.storage.ShuffleBlockId
 
 /**
@@ -765,7 +766,13 @@ object ShuffleRecoveryColdProcessProcess {
   }
 
   private def buildQuery(spark: SparkSession, scenarioValue: Scenario): DataFrame = {
-    val range = spark.range(0L, scenarioValue.rows, 1L, scenarioValue.mappers)
+    val range = if (scenarioValue.rows == 0L) {
+      val schema = StructType(Seq(StructField("id", LongType, nullable = false)))
+      val emptyRows = spark.sparkContext.parallelize(Seq.empty[Row], scenarioValue.mappers)
+      spark.createDataFrame(emptyRows, schema)
+    } else {
+      spark.range(0L, scenarioValue.rows, 1L, scenarioValue.mappers)
+    }
     val key = scenarioValue.shape match {
       case "skewed" =>
         val cutoff = scenarioValue.rows * 19L / 20L
