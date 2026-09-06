@@ -224,6 +224,7 @@ class ShuffleRecoveryColdProcessSuite extends SparkFunSuite {
     Vector(
       java,
       s"-Djava.io.tmpdir=$temporary",
+      "-Dspark.shuffle.useOldFetchProtocol=true",
       "-cp",
       System.getProperty("java.class.path"),
       "org.apache.spark.shuffle.ShuffleRecoveryColdProcessProcess",
