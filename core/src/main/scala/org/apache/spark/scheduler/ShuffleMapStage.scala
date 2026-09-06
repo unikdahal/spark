@@ -154,11 +154,18 @@ private[spark] class ShuffleMapStage(
   }
 
   /**
-   * Whether the stage is statically declared as indeterminate based on the RDD's
-   * outputDeterministicLevel property. This is known at RDD creation time.
+   * Whether the stage needs the scheduler's conservative whole-stage rollback path.
+   *
+   * Normally this is a static RDD property. An adopted shuffle adds one deliberately narrow case:
+   * after the complete recovered registration has already been invalidated, the next FetchFailed
+   * must use the same existing rollback machinery so succeeding active consumers cannot retain
+   * state derived from the old binding. The marker is consumed exactly once; it does not declare
+   * the deterministic computation itself indeterminate, and later failures of the all-fresh retry
+   * follow ordinary Spark semantics.
    */
   def isStaticallyIndeterminate: Boolean = {
-    rdd.outputDeterministicLevel == DeterministicLevel.INDETERMINATE
+    rdd.outputDeterministicLevel == DeterministicLevel.INDETERMINATE ||
+      ShuffleRecoverySchedulerAdoption.consumeWholeStageRetryRequirement(shuffleDep.shuffleId)
   }
 
   /**
