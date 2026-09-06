@@ -83,7 +83,7 @@ private[spark] class SortShuffleManager(conf: SparkConf)
   private lazy val shuffleExecutorComponents = loadShuffleExecutorComponents(conf)
 
   override val shuffleBlockResolver =
-    new IndexShuffleBlockResolver(conf, taskIdMapsForShuffle = taskIdMapsForShuffle)
+    new ShuffleRecoveryIndexShuffleBlockResolver(conf, taskIdMapsForShuffle)
 
   /**
    * Obtains a [[ShuffleHandle]] to pass to tasks.
@@ -139,7 +139,8 @@ private[spark] class SortShuffleManager(conf: SparkConf)
     new BlockStoreShuffleReader(
       handle.asInstanceOf[BaseShuffleHandle[K, _, C]], blocksByAddress, context, metrics,
       shouldBatchFetch =
-        canEnableBatchFetch && canUseBatchFetch(startPartition, endPartition, context))
+        !shuffleBlockResolver.isRecovered(handle.shuffleId) &&
+          canEnableBatchFetch && canUseBatchFetch(startPartition, endPartition, context))
   }
 
   /** Get a writer for a given partition. Called on executors by map tasks. */
@@ -190,6 +191,7 @@ private[spark] class SortShuffleManager(conf: SparkConf)
 
   /** Shut down this ShuffleManager. */
   override def stop(): Unit = {
+    shuffleBlockResolver.schedulerAdoption.close()
     shuffleBlockResolver.stop()
   }
 }
