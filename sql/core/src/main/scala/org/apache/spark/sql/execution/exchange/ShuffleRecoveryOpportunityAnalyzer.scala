@@ -689,7 +689,9 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       val (plan, expanded) = stack.remove(stack.length - 1)
       if (expanded) {
         if (!summaries.containsKey(plan)) {
-          val childSummaries = effectiveChildren(plan, rules).map(child => summaries.get(child.plan))
+          val childSummaries = effectiveChildren(plan, rules).map { child =>
+            summaries.get(child.plan)
+          }
           summaries.put(plan, summarizePlan(plan, childSummaries, rules, runtimeState))
           states.put(plan, 2.toByte)
         }
