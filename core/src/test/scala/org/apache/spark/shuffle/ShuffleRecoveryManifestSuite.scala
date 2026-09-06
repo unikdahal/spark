@@ -50,7 +50,9 @@ class ShuffleRecoveryManifestSuite extends SparkFunSuite {
 
       val conf = listenerConf(
         providerRoot, manifestRoot, group, generation, incarnation, shuffleId)
-      val listener = new ShuffleRecoveryManifestListener(conf)
+      val listener = new ShuffleRecoveryManifestListener(
+        conf,
+        publication => publication.winningMapTaskIds == taskIds)
       val stageInfo = shuffleStageInfo(stageId, shuffleId, taskIds.size)
       listener.onStageSubmitted(SparkListenerStageSubmitted(stageInfo))
       listener.onTaskEnd(successfulShuffleTask(stageId, 0, taskIds(0)))
@@ -84,7 +86,7 @@ class ShuffleRecoveryManifestSuite extends SparkFunSuite {
       val shuffleId = 88
       val conf = listenerConf(
         providerRoot, manifestRoot, group, generation, incarnation, shuffleId)
-      val listener = new ShuffleRecoveryManifestListener(conf)
+      val listener = new ShuffleRecoveryManifestListener(conf, _ => true)
       val provider = ReferenceShuffleProvider.open(
         providerRoot,
         group,
