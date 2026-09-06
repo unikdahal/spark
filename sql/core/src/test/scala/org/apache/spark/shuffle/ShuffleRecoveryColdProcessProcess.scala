@@ -228,7 +228,10 @@ object ShuffleRecoveryColdProcessProcess {
       val query = buildQuery(spark, scenarioValue)
       val exchange = onlyExchange(query)
       val listener = attachTargetListener(spark, exchange)
-      val result = collectResult(query)
+
+      // Publish while the completed map stage is still registered. A full SQL action is allowed
+      // to release its shuffle tracker state once the query has consumed the output.
+      spark.sparkContext.submitMapStage(exchange.shuffleDependency).get()
       drainListeners(spark)
       require(listener.taskCount > 0L, "producer did not execute the selected shuffle map stage")
 
@@ -260,6 +263,8 @@ object ShuffleRecoveryColdProcessProcess {
         store.findCompatible(group, identity, ReplacementGeneration).contains(manifest),
         "published manifest was not durably readable")
 
+      val result = collectResult(query)
+      drainListeners(spark)
       writeEvidence(
         evidencePath,
         buildEvidence(
