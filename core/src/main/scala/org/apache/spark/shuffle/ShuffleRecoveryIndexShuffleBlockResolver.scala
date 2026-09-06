@@ -133,6 +133,7 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
           recoveredBindings.remove(targetShuffleId, existing)) {
         existing.usable.set(false)
         recoveredReadCounters.remove(targetShuffleId)
+        observedFailures.remove(targetShuffleId)
       }
     }
   }
@@ -141,8 +142,9 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       targetShuffleId: Int): Option[ShuffleRecoveryObservedFetchFailure] =
     Option(observedFailures.get(targetShuffleId))
 
-  private[spark] def clearObservedFetchFailure(targetShuffleId: Int): Unit = {
+  private[spark] def clearRecoveryState(targetShuffleId: Int): Unit = {
     observedFailures.remove(targetShuffleId)
+    recoveredReadCounters.remove(targetShuffleId)
   }
 
   private[spark] def isRecovered(targetShuffleId: Int): Boolean =
@@ -262,10 +264,15 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       id: ShuffleBlockId,
       recovered: RecoveredReadBinding,
       failureClass: ShuffleRecoveryAdoptedReadFailureClass): Unit = {
+    val mapIndex = if (id.mapId >= 0L && id.mapId <= Int.MaxValue.toLong) {
+      id.mapId.toInt
+    } else {
+      -1
+    }
     val observed = ShuffleRecoveryObservedFetchFailure(
       recovered.localBindingGeneration,
       recovered.binding.bindingId,
-      id.mapId.toInt,
+      mapIndex,
       id.reduceId,
       failureClass)
     observedFailures.compute(id.shuffleId, (_, previous) => {
