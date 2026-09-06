@@ -19,7 +19,8 @@ package org.apache.spark.scheduler
 
 import scala.collection.mutable.HashSet
 
-import org.apache.spark.{MapOutputTrackerMaster, PipelinedShuffleDependency, ShuffleDependency}
+import org.apache.spark.{MapOutputTrackerMaster, PipelinedShuffleDependency, ShuffleDependency,
+  ShuffleRecoverySchedulerAdoption}
 import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.util.CallSite
 
@@ -125,6 +126,12 @@ private[spark] class ShuffleMapStage(
     if (isPipelined) {
       (0 until numPartitions).filterNot(pipelinedCompletedPartitions.contains)
     } else {
+      // DAGScheduler calls this method immediately before task submission. Any recovery candidate
+      // has already completed external preparation; this transaction is therefore bounded to
+      // scheduler-local fencing, resolver registration, and tracker mutation. If it loses the race
+      // to ordinary execution, the normal missing-partition query below remains authoritative.
+      ShuffleRecoverySchedulerAdoption.beforeFindMissingPartitions(
+        mapOutputTrackerMaster, shuffleDep, numPartitions)
       mapOutputTrackerMaster
         .findMissingPartitions(shuffleDep.shuffleId)
         .getOrElse(0 until numPartitions)
