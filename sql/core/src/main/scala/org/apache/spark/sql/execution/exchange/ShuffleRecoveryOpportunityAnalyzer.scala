@@ -614,7 +614,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     require(executionId != null && executionId.nonEmpty, "execution id must be non-empty")
 
     val summaries = buildSummaries(plan, rules, runtimeState)
-    exchangeOccurrences(plan).zipWithIndex.map { case (occurrence, ordinal) =>
+    exchangeOccurrences(plan, rules).zipWithIndex.map { case (occurrence, ordinal) =>
       classifyExchange(occurrence, executionId, ordinal.toLong, rules, runtimeState, summaries)
     }
   }
@@ -689,14 +689,14 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       val (plan, expanded) = stack.remove(stack.length - 1)
       if (expanded) {
         if (!summaries.containsKey(plan)) {
-          val childSummaries = effectiveChildren(plan).map(child => summaries.get(child.plan))
+          val childSummaries = effectiveChildren(plan, rules).map(child => summaries.get(child.plan))
           summaries.put(plan, summarizePlan(plan, childSummaries, rules, runtimeState))
           states.put(plan, 2.toByte)
         }
       } else if (!states.containsKey(plan)) {
         states.put(plan, 1.toByte)
         stack += ((plan, true))
-        val children = effectiveChildren(plan)
+        val children = effectiveChildren(plan, rules)
         var index = children.length - 1
         while (index >= 0) {
           if (!states.containsKey(children(index).plan)) {
@@ -714,7 +714,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       childSummaries: Seq[PlanSummary],
       rules: ShuffleRecoveryEligibilityRules,
       runtimeState: ShuffleRecoveryRuntimeState): PlanSummary = {
-    val children = effectiveChildren(plan)
+    val children = effectiveChildren(plan, rules)
     val localFlags = planFlags(plan)
     val expressionSummary = plan match {
       case exchange: ShuffleExchangeExec =>
@@ -1013,7 +1013,9 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       adaptivePlan = plan.isInstanceOf[AdaptiveSparkPlanExec])
   }
 
-  private def exchangeOccurrences(plan: SparkPlan): Seq[ExchangeOccurrence] = {
+  private def exchangeOccurrences(
+      plan: SparkPlan,
+      rules: ShuffleRecoveryEligibilityRules): Seq[ExchangeOccurrence] = {
     val result = mutable.ArrayBuffer.empty[ExchangeOccurrence]
     val stack = mutable.ArrayBuffer(
       TraversalFrame(plan, Nil, ShuffleRecoveryObservationFlags()))
@@ -1030,7 +1032,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       }
 
       val inheritedFlags = frame.ancestorFlags.merge(ancestorObservationFlags(frame.plan))
-      val children = effectiveChildren(frame.plan)
+      val children = effectiveChildren(frame.plan, rules)
       var index = children.length - 1
       while (index >= 0) {
         val child = children(index)
@@ -1045,7 +1047,9 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     if (pathReversed.isEmpty) "root" else pathReversed.reverseIterator.mkString(".")
   }
 
-  private def effectiveChildren(plan: SparkPlan): Seq[ChildRef] = plan match {
+  private def effectiveChildren(
+      plan: SparkPlan,
+      rules: ShuffleRecoveryEligibilityRules): Seq[ChildRef] = plan match {
     case adaptive: AdaptiveSparkPlanExec => Seq(ChildRef("c0", adaptive.executedPlan))
     case stage: QueryStageExec => Seq(ChildRef("c0", stage.plan))
     case reused: ReusedExchangeExec => Seq(ChildRef("c0", reused.child))
@@ -1053,10 +1057,62 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       val children = other.children.zipWithIndex.map { case (child, index) =>
         ChildRef(s"c$index", child)
       }
-      val subqueries = other.subqueries.zipWithIndex.map { case (subquery, index) =>
-        ChildRef(s"s$index", subquery)
+      val expressionRoots = other match {
+        case exchange: ShuffleExchangeExec =>
+          observePartitioning(exchange.outputPartitioning).expressionRoots
+        case _ if isStructuralWrapper(other) => Nil
+        case _ if !rules.allowedOperatorClassNames.contains(other.getClass.getName) => Nil
+        case _ => other.expressions
+      }
+      val subqueries = trustedSubqueryPlans(expressionRoots, rules).zipWithIndex.map {
+        case (subquery, index) => ChildRef(s"s$index", subquery)
       }
       children ++ subqueries
+  }
+
+  private def trustedSubqueryPlans(
+      roots: Seq[Expression],
+      rules: ShuffleRecoveryEligibilityRules): Seq[SparkPlan] = {
+    val result = mutable.ArrayBuffer.empty[SparkPlan]
+    if (roots.size > maxExpressionNodes) {
+      return result.toSeq
+    }
+
+    val stack = mutable.ArrayBuffer.empty[ExpressionFrame]
+    roots.reverseIterator.foreach(root => stack += ExpressionFrame(root, 1))
+    var scheduledNodes = roots.size
+    var bounded = false
+
+    while (stack.nonEmpty && !bounded) {
+      val frame = stack.remove(stack.length - 1)
+      if (frame.depth > maxExpressionDepth) {
+        bounded = true
+      } else {
+        val expression = frame.expression
+        val trusted = rules.allowedExpressionClassNames.contains(expression.getClass.getName)
+        if (trusted) {
+          expression match {
+            case subquery: ExecSubqueryExpression if subquery.plan != null =>
+              result += subquery.plan
+            case _ =>
+          }
+          val children = expression.children
+          if (children.nonEmpty && frame.depth >= maxExpressionDepth) {
+            bounded = true
+          } else if (children.size > maxExpressionNodes - scheduledNodes) {
+            bounded = true
+          } else {
+            scheduledNodes += children.size
+            var index = children.length - 1
+            while (index >= 0) {
+              stack += ExpressionFrame(children(index), frame.depth + 1)
+              index -= 1
+            }
+          }
+        }
+      }
+    }
+    result.toSeq
   }
 
   private def isStructuralWrapper(plan: SparkPlan): Boolean = plan match {
