@@ -294,8 +294,9 @@ jobs:
           trap cleanup EXIT
           timeout --signal=TERM --kill-after=30s 45m \
             ./build/sbt -Phadoop-3 -Phive \
-              "set sql / Test / fork := true" \
-              "sql/testOnly org.apache.spark.shuffle.ShuffleRecoveryColdProcessSuite"
+              "project sql" \
+              "set Test / fork := true" \
+              "testOnly org.apache.spark.shuffle.ShuffleRecoveryColdProcessSuite"
 
       - name: Validate cold-process evidence
         shell: bash
