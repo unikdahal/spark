@@ -25,8 +25,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.{
-  Ascending, Attribute, BloomFilterMightContain, Coalesce, DynamicPruningExpression, ExprId,
-  Expression, Literal, PythonAggregate, PythonUDAF, PythonUDF, PythonUDTF, SortOrder,
+  Ascending, Attribute, BloomFilterMightContain, Coalesce, DynamicPruningExpression, Expression,
+  ExprId, Literal, PythonAggregate, PythonUDAF, PythonUDF, PythonUDTF, SortOrder,
   TranspiledPythonUDF, UnaryExpression, UnaryMinus, Unevaluable,
   UnresolvedPolymorphicPythonUDTF}
 import org.apache.spark.sql.catalyst.plans.physical.{
@@ -64,7 +64,8 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
   }
 
   private def carrierRules(carrier: ExpressionCarrierExec): ShuffleRecoveryEligibilityRules = {
-    rules.copy(allowedOperatorClassNames = rules.allowedOperatorClassNames + carrier.getClass.getName)
+    rules.copy(
+      allowedOperatorClassNames = rules.allowedOperatorClassNames + carrier.getClass.getName)
   }
 
   private def deepExpression(depth: Int): Expression = {
@@ -298,7 +299,8 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
         evalType = 0,
         udfDeterministic = true,
         resolveElementMetadata = (_, _) =>
-          throw new AssertionError("Python UDTF analysis must not run in opportunity analysis")),
+          throw new IllegalStateException(
+            "Python UDTF analysis must not run in opportunity analysis")),
       TranspiledPythonUDF(
         name = "test_transpiled",
         pythonUDFExpr = pythonUdf,
@@ -583,18 +585,23 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
             "Window",
             WindowPresent,
             () => analyze(hashExchange(window)).head,
-            () => analyze(hashExchange(window), analyzerRules = rules.copy(allowWindow = true)).head),
+            () => analyze(
+              hashExchange(window),
+              analyzerRules = rules.copy(allowWindow = true)).head),
           RuleCase(
             "Expand",
             ExpandPresent,
             () => analyze(hashExchange(expand)).head,
-            () => analyze(hashExchange(expand), analyzerRules = rules.copy(allowExpand = true)).head),
+            () => analyze(
+              hashExchange(expand),
+              analyzerRules = rules.copy(allowExpand = true)).head),
           RuleCase(
             "cache scan",
             CacheScanPresent,
             () => analyze(hashExchange(cacheScan), analyzerRules = cacheRules).head,
             () => analyze(
-              hashExchange(cacheScan), analyzerRules = cacheRules.copy(allowCacheScan = true)).head),
+              hashExchange(cacheScan),
+              analyzerRules = cacheRules.copy(allowCacheScan = true)).head),
           RuleCase(
             "Python/Arrow",
             PythonOrArrowPresent,
@@ -949,24 +956,26 @@ class ShuffleRecoveryOpportunityAnalyzerSuite extends SharedSparkSession {
 
   private case class HostileUnknownExpression() extends Expression with Unevaluable {
     override lazy val deterministic: Boolean = {
-      throw new AssertionError("deterministic must not be invoked for an unknown expression")
+      throw new IllegalStateException(
+        "deterministic must not be invoked for an unknown expression")
     }
 
     override def children: Seq[Expression] = {
-      throw new AssertionError("children must not be invoked for an unknown expression")
+      throw new IllegalStateException("children must not be invoked for an unknown expression")
     }
 
     override def dataType: DataType = {
-      throw new AssertionError("dataType must not be invoked for an unknown expression")
+      throw new IllegalStateException("dataType must not be invoked for an unknown expression")
     }
 
     override def nullable: Boolean = {
-      throw new AssertionError("nullable must not be invoked for an unknown expression")
+      throw new IllegalStateException("nullable must not be invoked for an unknown expression")
     }
 
     override protected def withNewChildrenInternal(
         newChildren: IndexedSeq[Expression]): HostileUnknownExpression = {
-      throw new AssertionError("unknown expression must not be rewritten by opportunity analysis")
+      throw new IllegalStateException(
+        "unknown expression must not be rewritten by opportunity analysis")
     }
   }
 
