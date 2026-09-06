@@ -42,9 +42,10 @@ private[spark] final case class ShuffleRecoveryFetchFailureInvalidated(
  * Per-driver state for the feasibility scheduler-adoption transaction.
  *
  * External recovery work ends in [[offerPrepared]] before the DAGScheduler can see the result.
- * The event-loop transaction itself only checks local fencing state, installs a prebuilt fetch
- * binding, atomically swaps a complete tracker status, records provenance, and bumps the tracker
- * epoch. It never calls a provider, filesystem, future, blocking queue, or other external service.
+ * Scheduler-visible operations consume only local immutable state. Provider reads classify failure
+ * on shuffle fetch threads and atomically clear the complete adopted tracker registration before
+ * Spark's ordinary FetchFailed event reaches the scheduler. Durable retirement and unbind work is
+ * queued off the scheduler thread.
  */
 private[spark] final class ShuffleRecoverySchedulerAdoptionState(
     resolver: ShuffleRecoveryIndexShuffleBlockResolver) extends Logging {
@@ -102,12 +103,14 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       val incarnation: ShuffleRecoveryManifestIncarnation,
       val retirer: Option[ShuffleRecoveryIncarnationRetirer],
       val releaseQueued: AtomicBoolean,
-      val retirementQueued: AtomicBoolean)
+      val retirementQueued: AtomicBoolean,
+      val wholeStageRetryPending: AtomicBoolean = new AtomicBoolean(true))
 
   private val pending = new ConcurrentHashMap[Int, Decision]()
   private val adopted = new ConcurrentHashMap[Int, Adopted]()
   private val invalidated = new ConcurrentHashMap[Int, Invalidated]()
   private val nextBindingGeneration = new AtomicLong(0L)
+  private val closed = new AtomicBoolean(false)
   private val releaseThreadId = new AtomicInteger(0)
   private val releaseExecutor = new ThreadPoolExecutor(
     1,
@@ -138,7 +141,9 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       dependency: ShuffleDependency[_, _, _],
       mapperCount: Int,
       reducerCount: Int): Either[String, Unit] = {
-    if (manager == null || reservation == null || dependency == null) {
+    if (closed.get()) {
+      Left("scheduler adoption state is closed")
+    } else if (manager == null || reservation == null || dependency == null) {
       Left("scheduler adoption reservation contains a null field")
     } else if (reservation.targetShuffleId != dependency.shuffleId ||
         mapperCount != dependency.rdd.partitions.length ||
@@ -176,6 +181,12 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       location: BlockManagerId,
       retirer: Option[ShuffleRecoveryIncarnationRetirer]): Either[String, Unit] = {
     ShuffleRecoveryExternalCallGuard.assertAllowed("shuffle recovery scheduler preparation")
+    if (closed.get()) {
+      if (prepared != null && provider != null && prepared.binding != null) {
+        safeRelease(provider, prepared.binding)
+      }
+      return Left("scheduler adoption state is closed")
+    }
     if (prepared == null || provider == null || location == null || prepared.reservation == null ||
         prepared.binding == null || prepared.maps == null || retirer == null) {
       return Left("prepared scheduler adoption contains a null field")
@@ -245,12 +256,12 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       incarnation,
       retirer,
       statuses)
-    if (!preparing.manager.isCurrent(prepared.reservation) ||
+    if (closed.get() || !preparing.manager.isCurrent(prepared.reservation) ||
         !pending.replace(targetShuffleId, preparing, ready)) {
       pending.remove(targetShuffleId, ready)
       safeRelease(provider, prepared.binding)
       Left("ordinary execution or a newer recovery decision won during preparation")
-    } else if (!preparing.manager.isCurrent(prepared.reservation)) {
+    } else if (closed.get() || !preparing.manager.isCurrent(prepared.reservation)) {
       pending.remove(targetShuffleId, ready)
       safeRelease(provider, prepared.binding)
       Left("prepared scheduler adoption became stale before publication")
@@ -264,7 +275,7 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       tracker: MapOutputTrackerMaster,
       dependency: ShuffleDependency[_, _, _],
       numPartitions: Int): Boolean = {
-    if (tracker == null || dependency == null || numPartitions < 0) {
+    if (closed.get() || tracker == null || dependency == null || numPartitions < 0) {
       return false
     }
     val shuffleId = dependency.shuffleId
@@ -307,10 +318,37 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
   }
 
   /**
-   * Invalidates an adopted binding without performing external recovery I/O on the scheduler.
+   * Handles provider-side evidence before Spark's FetchFailed reaches the DAGScheduler.
    *
-   * The binding becomes unusable before the tracker swap. The swap replaces the complete adopted
-   * status object with an empty status, so no fresh map completion can be accepted alongside A.
+   * This path is invoked from the shuffle fetch thread after the provider has already classified
+   * the failure. It performs only local state changes: the old fetch binding becomes unusable, the
+   * complete adopted tracker status is replaced with a completely empty status in one CAS, and the
+   * tracker epoch advances. Retirement and unbind work is merely queued here.
+   */
+  def invalidateObservedFetchFailure(
+      tracker: MapOutputTrackerMaster,
+      shuffleId: Int): ShuffleRecoveryFetchFailureAction = {
+    if (closed.get() || tracker == null || shuffleId < 0) {
+      return ShuffleRecoveryFetchFailureNotAdopted
+    }
+    val current = adopted.get(shuffleId)
+    if (current == null) {
+      val old = invalidated.get(shuffleId)
+      if (old != null) {
+        maybeQueueLateRetirement(shuffleId, old)
+        ShuffleRecoveryFetchFailureStale
+      } else {
+        ShuffleRecoveryFetchFailureNotAdopted
+      }
+    } else {
+      invalidateCurrent(tracker, shuffleId, current)
+    }
+  }
+
+  /**
+   * Scheduler-side stale-event classifier. The first observed provider failure normally performed
+   * the complete invalidation already; this method lets focused scheduler tests prove that a late
+   * event for the old synthetic location cannot acquire authority over fresh local output.
    */
   def handleFetchFailure(
       tracker: MapOutputTrackerMaster,
@@ -325,59 +363,33 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
     if (current == null) {
       val old = invalidated.get(shuffleId)
       if (old == null) {
-        return ShuffleRecoveryFetchFailureNotAdopted
-      }
-      maybeQueueLateRetirement(shuffleId, old)
-      if (blockManagerId == old.recoveredLocation || taskEpoch <= old.invalidatedAtEpoch) {
-        ShuffleRecoveryFetchFailureStale
-      } else {
         ShuffleRecoveryFetchFailureNotAdopted
+      } else {
+        maybeQueueLateRetirement(shuffleId, old)
+        if (blockManagerId == old.recoveredLocation || taskEpoch <= old.invalidatedAtEpoch) {
+          ShuffleRecoveryFetchFailureStale
+        } else {
+          ShuffleRecoveryFetchFailureNotAdopted
+        }
       }
     } else if (current.dependency ne dependency) {
       ShuffleRecoveryFetchFailureNotAdopted
-    } else if (!adopted.remove(shuffleId, current)) {
-      handleFetchFailure(tracker, dependency, blockManagerId, taskEpoch)
     } else {
-      val observed = matchingObservedFailure(shuffleId, current)
-      val failureClass = observed.map(_.failureClass)
-        .getOrElse(ShuffleRecoveryAdoptedUnavailable)
-
-      // Make provider reads fail before changing tracker visibility. No provider/store call occurs.
-      resolver.invalidateRecoveredBinding(
-        shuffleId, current.binding, current.localBindingGeneration)
-
-      val replacement = new ShuffleStatus(current.mapperCount, current.reducerCount)
-      val trackerCurrent = tracker.shuffleStatuses.get(shuffleId).orNull
-      val trackerCleared = if (trackerCurrent eq current.trackerStatus) {
-        if (tracker.shuffleStatuses.replace(shuffleId, current.trackerStatus, replacement)) {
-          current.trackerStatus.invalidateSerializedMapOutputStatusCache()
-          current.trackerStatus.invalidateSerializedMergeOutputStatusCache()
-          tracker.incrementEpoch()
-          true
-        } else {
-          false
-        }
-      } else {
-        trackerCurrent != null && trackerCurrent.numAvailableMapOutputs == 0
-      }
-      val invalidatedAtEpoch = tracker.getEpoch
-      val old = new Invalidated(
-        current.provider,
-        current.binding,
-        current.localBindingGeneration,
-        current.recoveredLocation,
-        invalidatedAtEpoch,
-        current.incarnation,
-        current.retirer,
-        current.releaseQueued,
-        current.retirementQueued)
-      invalidated.put(shuffleId, old)
-      releaseAsync(current.provider, current.binding, current.releaseQueued)
-      if (failureClass.authorizesRetirement) {
-        retireAsync(current.incarnation, current.retirer, current.retirementQueued)
-      }
-      ShuffleRecoveryFetchFailureInvalidated(trackerCleared, failureClass)
+      invalidateCurrent(tracker, shuffleId, current)
     }
+  }
+
+  /**
+   * Returns true once for an adopted binding that was completely invalidated.
+   *
+   * The existing Spark retry path uses the statically-indeterminate trigger to perform its
+   * conservative succeeding-stage rollback before a full map-stage retry. The prototype consumes
+   * this one-shot marker at that same trigger point; the computation itself remains deterministic,
+   * and failures of the subsequent all-fresh recomputation use ordinary Spark retry semantics.
+   */
+  def consumeWholeStageRetryRequirement(shuffleId: Int): Boolean = {
+    val old = invalidated.get(shuffleId)
+    old != null && old.wholeStageRetryPending.compareAndSet(true, false)
   }
 
   def isAdopted(shuffleId: Int): Boolean = adopted.containsKey(shuffleId)
@@ -408,6 +420,9 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
    * Invalidates all local recovery decisions and releases aliases without touching healthy data.
    */
   def close(): Unit = {
+    if (!closed.compareAndSet(false, true)) {
+      return
+    }
     val managers = new java.util.HashSet[ShuffleRecoveryReservationManager]()
     val pendingIterator = pending.entrySet().iterator()
     while (pendingIterator.hasNext) {
@@ -438,7 +453,7 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       maybeQueueLateRetirement(entry.getKey, value)
       releaseAsync(value.provider, value.binding, value.releaseQueued)
       invalidated.remove(entry.getKey, value)
-      resolver.clearObservedFetchFailure(entry.getKey)
+      resolver.clearRecoveryState(entry.getKey)
     }
     val managerIterator = managers.iterator()
     while (managerIterator.hasNext) {
@@ -447,10 +462,75 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
     releaseExecutor.shutdown()
   }
 
+  private def invalidateCurrent(
+      tracker: MapOutputTrackerMaster,
+      shuffleId: Int,
+      current: Adopted): ShuffleRecoveryFetchFailureAction = {
+    if (!adopted.remove(shuffleId, current)) {
+      return invalidateObservedFetchFailure(tracker, shuffleId)
+    }
+
+    val observed = matchingObservedFailure(shuffleId, current)
+    val failureClass = observed.map(_.failureClass)
+      .getOrElse(ShuffleRecoveryAdoptedUnavailable)
+
+    // Make reads from A fail before changing tracker visibility. This is local and non-blocking.
+    resolver.invalidateRecoveredBinding(
+      shuffleId, current.binding, current.localBindingGeneration)
+
+    val replacement = new ShuffleStatus(current.mapperCount, current.reducerCount)
+    val trackerCurrent = tracker.shuffleStatuses.get(shuffleId).orNull
+    val trackerCleared = if (trackerCurrent eq current.trackerStatus) {
+      if (tracker.shuffleStatuses.replace(shuffleId, current.trackerStatus, replacement)) {
+        current.trackerStatus.invalidateSerializedMapOutputStatusCache()
+        current.trackerStatus.invalidateSerializedMergeOutputStatusCache()
+        tracker.incrementEpoch()
+        true
+      } else {
+        val raced = tracker.shuffleStatuses.get(shuffleId).orNull
+        raced != null && raced.numAvailableMapOutputs == 0
+      }
+    } else {
+      trackerCurrent != null && trackerCurrent.numAvailableMapOutputs == 0
+    }
+
+    if (!trackerCleared) {
+      // Another complete tracker state won before this failure could clear A. Do not overwrite it;
+      // the synthetic recovered location ensures Spark's later per-map unregister cannot match a
+      // fresh local MapStatus. This event is stale with respect to the winning tracker state.
+      resolver.clearRecoveryState(shuffleId)
+      safeRelease(current.provider, current.binding)
+      return ShuffleRecoveryFetchFailureStale
+    }
+
+    if (closed.get()) {
+      resolver.clearRecoveryState(shuffleId)
+      safeRelease(current.provider, current.binding)
+      return ShuffleRecoveryFetchFailureStale
+    }
+
+    val old = new Invalidated(
+      current.provider,
+      current.binding,
+      current.localBindingGeneration,
+      current.recoveredLocation,
+      tracker.getEpoch,
+      current.incarnation,
+      current.retirer,
+      current.releaseQueued,
+      current.retirementQueued)
+    invalidated.put(shuffleId, old)
+    releaseAsync(current.provider, current.binding, current.releaseQueued)
+    if (failureClass.authorizesRetirement) {
+      retireAsync(current.incarnation, current.retirer, current.retirementQueued)
+    }
+    ShuffleRecoveryFetchFailureInvalidated(trackerCleared = true, failureClass)
+  }
+
   private def commitReady(tracker: MapOutputTrackerMaster, ready: Ready): Boolean = {
     val shuffleId = ready.dependency.shuffleId
     val currentStatus = tracker.shuffleStatuses.get(shuffleId).orNull
-    if (currentStatus == null || currentStatus.numAvailableMapOutputs != 0) {
+    if (closed.get() || currentStatus == null || currentStatus.numAvailableMapOutputs != 0) {
       ready.manager.ordinaryExecutionWon(ready.reservation.materializationId)
       if (pending.remove(shuffleId, ready)) {
         releaseAsync(ready.provider, ready.binding, new AtomicBoolean(false))
@@ -471,9 +551,8 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       ready.manager.consumeIfCurrent(ready.reservation) {
         val stillCurrent = pending.get(shuffleId) eq ready
         val trackerCurrent = tracker.shuffleStatuses.get(shuffleId).orNull
-        if (!stillCurrent || (trackerCurrent ne currentStatus) ||
-            trackerCurrent.numAvailableMapOutputs != 0 ||
-            adopted.containsKey(shuffleId)) {
+        if (closed.get() || !stillCurrent || (trackerCurrent ne currentStatus) ||
+            trackerCurrent.numAvailableMapOutputs != 0 || adopted.containsKey(shuffleId)) {
           false
         } else if (!resolver.installRecoveredBinding(
             shuffleId,
@@ -646,7 +725,8 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
         } catch {
           case _: RejectedExecutionException =>
             queued.set(false)
-            logWarning("Shuffle recovery retirement queue is unavailable; retirement remains pending")
+            logWarning(
+              "Shuffle recovery retirement queue is unavailable; retirement remains pending")
         }
       }
     }
@@ -682,6 +762,10 @@ private[spark] object ShuffleRecoverySchedulerAdoption {
       taskEpoch: Long): ShuffleRecoveryFetchFailureAction = {
     state.map(_.handleFetchFailure(tracker, dependency, blockManagerId, taskEpoch))
       .getOrElse(ShuffleRecoveryFetchFailureNotAdopted)
+  }
+
+  def consumeWholeStageRetryRequirement(shuffleId: Int): Boolean = {
+    state.exists(_.consumeWholeStageRetryRequirement(shuffleId))
   }
 
   def currentState: Option[ShuffleRecoverySchedulerAdoptionState] = state
