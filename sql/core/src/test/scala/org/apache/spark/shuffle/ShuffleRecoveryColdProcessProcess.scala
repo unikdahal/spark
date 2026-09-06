@@ -17,7 +17,7 @@
 
 package org.apache.spark.shuffle
 
-import java.io.{IOException, InputStream, OutputStream}
+import java.io.{InputStream, IOException, OutputStream}
 import java.nio.ByteBuffer
 import java.nio.charset.StandardCharsets
 import java.nio.file.{Files, Path, Paths, StandardOpenOption}
@@ -56,6 +56,33 @@ object ShuffleRecoveryColdProcessProcess {
   private val EmptyReads = ShuffleRecoveryReadMetrics(0L, 0L, 0L, 0L)
 
   private final case class ResultSummary(rowCount: Long, digest: String)
+
+  private final case class EvidenceContext(
+      role: String,
+      scenarioValue: Scenario,
+      control: String,
+      testedCommit: String,
+      identity: ShuffleRecoveryFeasibilityIdentity,
+      group: String)
+
+  private final case class EvidenceShuffle(
+      generation: Long,
+      publishingGeneration: Long,
+      originShuffleId: Int,
+      currentShuffleId: Int,
+      listener: TargetTaskListener,
+      adopted: Boolean,
+      incarnation: String,
+      reads: ShuffleRecoveryReadMetrics)
+
+  private final case class EvidenceMetrics(
+      emptyBlocks: Long,
+      nonEmptyBlocks: Long,
+      physicalBytes: Long,
+      maxBlockBytes: Long,
+      result: ResultSummary,
+      started: Long,
+      note: String)
 
   private final case class ProviderSummary(
       artifacts: Vector[ShuffleRecoveryMapArtifact],
@@ -158,27 +185,30 @@ object ShuffleRecoveryColdProcessProcess {
       writeEvidence(
         evidencePath,
         buildEvidence(
-          role = "baseline",
-          scenarioValue,
-          control = "none",
-          testedCommit,
-          identity,
-          group,
-          generation = 0L,
-          publishingGeneration = 0L,
-          originShuffleId = exchange.shuffleId,
-          currentShuffleId = exchange.shuffleId,
-          listener,
-          adopted = false,
-          incarnation = "",
-          EmptyReads,
-          emptyBlocks = 0L,
-          nonEmptyBlocks = 0L,
-          physicalBytes = 0L,
-          maxBlockBytes = 0L,
-          result,
-          started,
-          note = "recovery-disabled semantic reference"))
+          EvidenceContext(
+            role = "baseline",
+            scenarioValue,
+            control = "none",
+            testedCommit,
+            identity,
+            group),
+          EvidenceShuffle(
+            generation = 0L,
+            publishingGeneration = 0L,
+            originShuffleId = exchange.shuffleId,
+            currentShuffleId = exchange.shuffleId,
+            listener,
+            adopted = false,
+            incarnation = "",
+            EmptyReads),
+          EvidenceMetrics(
+            emptyBlocks = 0L,
+            nonEmptyBlocks = 0L,
+            physicalBytes = 0L,
+            maxBlockBytes = 0L,
+            result,
+            started,
+            note = "recovery-disabled semantic reference")))
     } finally {
       stopSpark(spark)
     }
@@ -233,27 +263,30 @@ object ShuffleRecoveryColdProcessProcess {
       writeEvidence(
         evidencePath,
         buildEvidence(
-          role = "producer",
-          scenarioValue,
-          control = "none",
-          testedCommit,
-          identity,
-          group,
-          generation = ProviderGeneration,
-          publishingGeneration = ProviderGeneration,
-          originShuffleId = exchange.shuffleId,
-          currentShuffleId = exchange.shuffleId,
-          listener,
-          adopted = false,
-          incarnation = Incarnation,
-          EmptyReads,
-          summary.emptyBlocks,
-          summary.nonEmptyBlocks,
-          summary.physicalBytes,
-          summary.maxBlockBytes,
-          result,
-          started,
-          note = "immutable provider and manifest committed"))
+          EvidenceContext(
+            role = "producer",
+            scenarioValue,
+            control = "none",
+            testedCommit,
+            identity,
+            group),
+          EvidenceShuffle(
+            generation = ProviderGeneration,
+            publishingGeneration = ProviderGeneration,
+            originShuffleId = exchange.shuffleId,
+            currentShuffleId = exchange.shuffleId,
+            listener,
+            adopted = false,
+            incarnation = Incarnation,
+            EmptyReads),
+          EvidenceMetrics(
+            summary.emptyBlocks,
+            summary.nonEmptyBlocks,
+            summary.physicalBytes,
+            summary.maxBlockBytes,
+            result,
+            started,
+            note = "immutable provider and manifest committed")))
 
       marker match {
         case Some(path) =>
@@ -338,27 +371,30 @@ object ShuffleRecoveryColdProcessProcess {
       writeEvidence(
         evidencePath,
         buildEvidence(
-          role = "replacement",
-          scenarioValue,
-          control,
-          testedCommit,
-          identity,
-          group,
-          generation = ReplacementGeneration,
-          publishingGeneration = if (adopted) ProviderGeneration else 0L,
-          originShuffleId = producer("originShuffleId").toInt,
-          currentShuffleId = exchange.shuffleId,
-          listener,
-          adopted,
-          incarnation = if (adopted) Incarnation else "",
-          reads,
-          emptyBlocks = producer("emptyBlocks").toLong,
-          nonEmptyBlocks = producer("nonEmptyBlocks").toLong,
-          physicalBytes = producer("physicalBytes").toLong,
-          maxBlockBytes = producer("maxBlockBytes").toLong,
-          result,
-          started,
-          note = replacementNote(control, adoptionOffered)))
+          EvidenceContext(
+            role = "replacement",
+            scenarioValue,
+            control,
+            testedCommit,
+            identity,
+            group),
+          EvidenceShuffle(
+            generation = ReplacementGeneration,
+            publishingGeneration = if (adopted) ProviderGeneration else 0L,
+            originShuffleId = producer("originShuffleId").toInt,
+            currentShuffleId = exchange.shuffleId,
+            listener,
+            adopted,
+            incarnation = if (adopted) Incarnation else "",
+            reads),
+          EvidenceMetrics(
+            emptyBlocks = producer("emptyBlocks").toLong,
+            nonEmptyBlocks = producer("nonEmptyBlocks").toLong,
+            physicalBytes = producer("physicalBytes").toLong,
+            maxBlockBytes = producer("maxBlockBytes").toLong,
+            result,
+            started,
+            note = replacementNote(control, adoptionOffered))))
     } finally {
       stopSpark(spark)
     }
@@ -877,57 +913,39 @@ object ShuffleRecoveryColdProcessProcess {
   }
 
   private def buildEvidence(
-      role: String,
-      scenarioValue: Scenario,
-      control: String,
-      testedCommit: String,
-      identity: ShuffleRecoveryFeasibilityIdentity,
-      group: String,
-      generation: Long,
-      publishingGeneration: Long,
-      originShuffleId: Int,
-      currentShuffleId: Int,
-      listener: TargetTaskListener,
-      adopted: Boolean,
-      incarnation: String,
-      reads: ShuffleRecoveryReadMetrics,
-      emptyBlocks: Long,
-      nonEmptyBlocks: Long,
-      physicalBytes: Long,
-      maxBlockBytes: Long,
-      result: ResultSummary,
-      started: Long,
-      note: String): Evidence = {
+      context: EvidenceContext,
+      shuffle: EvidenceShuffle,
+      metrics: EvidenceMetrics): Evidence = {
     Evidence(Vector(
-      role,
-      scenarioValue.name,
-      control,
+      context.role,
+      context.scenarioValue.name,
+      context.control,
       FrozenBaseline,
-      testedCommit,
-      identity.sparkCompatibilityId,
-      identity.providerCompatibilityId,
+      context.testedCommit,
+      context.identity.sparkCompatibilityId,
+      context.identity.providerCompatibilityId,
       "false",
-      group,
-      generation.toString,
-      publishingGeneration.toString,
-      originShuffleId.toString,
-      currentShuffleId.toString,
-      listener.stageIds,
-      listener.taskCount.toString,
-      adopted.toString,
-      incarnation,
-      reads.blockReads.toString,
-      reads.nonEmptyBlockReads.toString,
-      reads.emptyBlockReads.toString,
-      reads.bytesRead.toString,
-      emptyBlocks.toString,
-      nonEmptyBlocks.toString,
-      physicalBytes.toString,
-      maxBlockBytes.toString,
-      result.rowCount.toString,
-      result.digest,
-      elapsedMillis(started).toString,
-      note))
+      context.group,
+      shuffle.generation.toString,
+      shuffle.publishingGeneration.toString,
+      shuffle.originShuffleId.toString,
+      shuffle.currentShuffleId.toString,
+      shuffle.listener.stageIds,
+      shuffle.listener.taskCount.toString,
+      shuffle.adopted.toString,
+      shuffle.incarnation,
+      shuffle.reads.blockReads.toString,
+      shuffle.reads.nonEmptyBlockReads.toString,
+      shuffle.reads.emptyBlockReads.toString,
+      shuffle.reads.bytesRead.toString,
+      metrics.emptyBlocks.toString,
+      metrics.nonEmptyBlocks.toString,
+      metrics.physicalBytes.toString,
+      metrics.maxBlockBytes.toString,
+      metrics.result.rowCount.toString,
+      metrics.result.digest,
+      elapsedMillis(metrics.started).toString,
+      metrics.note))
   }
 
   private def replacementNote(control: String, offered: Boolean): String = {
