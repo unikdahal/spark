@@ -22,7 +22,8 @@ import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap}
 import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
-import org.apache.spark.{ShuffleRecoverySchedulerAdoptionState, SparkConf}
+import org.apache.spark.{MapOutputTrackerMaster, ShuffleRecoverySchedulerAdoptionState, SparkConf}
+import org.apache.spark.SparkEnv
 import org.apache.spark.network.buffer.{ManagedBuffer, NioManagedBuffer}
 import org.apache.spark.storage.{BlockId, ShuffleBlockBatchId, ShuffleBlockId}
 import org.apache.spark.util.collection.OpenHashSet
@@ -283,5 +284,17 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
         previous
       }
     })
+
+    // The reference resolver runs in the driver's BlockManager for this feasibility path. By
+    // invalidating here, the entire adopted tracker registration disappears before the ordinary
+    // FetchFailed event can observe or remove one map at a time. Executor-side environments do not
+    // have a MapOutputTrackerMaster and therefore cannot mutate driver recovery state.
+    Option(SparkEnv.get).foreach { env =>
+      env.mapOutputTracker match {
+        case tracker: MapOutputTrackerMaster =>
+          schedulerAdoption.invalidateObservedFetchFailure(tracker, id.shuffleId)
+        case _ =>
+      }
+    }
   }
 }
