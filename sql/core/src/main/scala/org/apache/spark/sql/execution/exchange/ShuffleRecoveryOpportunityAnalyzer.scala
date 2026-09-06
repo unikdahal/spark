@@ -23,7 +23,8 @@ import scala.collection.mutable
 import scala.util.control.NonFatal
 
 import org.apache.spark.internal.Logging
-import org.apache.spark.sql.catalyst.expressions.{DynamicPruningExpression, Expression}
+import org.apache.spark.sql.catalyst.expressions.{
+  DynamicPruningExpression, Expression, Nondeterministic, PythonFuncExpression}
 import org.apache.spark.sql.catalyst.plans.physical.{
   HashPartitioning, NullAwareHashPartitioning, Partitioning, RangePartitioning,
   RoundRobinPartitioning, SinglePartition, UnknownPartitioning}
@@ -524,6 +525,8 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       reasons: ReasonSummary,
       flags: ShuffleRecoveryObservationFlags)
 
+  private case class ExpressionFrame(expression: Expression, depth: Int)
+
   private case class ChildRef(label: String, plan: SparkPlan)
 
   private case class TraversalFrame(
@@ -544,18 +547,39 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       multiPartitionRoundRobin: Boolean,
       knownShape: Boolean)
 
+  // These bounds are intentionally far above normal Spark-generated expression shapes while
+  // preventing extension plans from making an observational listener perform unbounded work.
+  private[exchange] val maxExpressionNodes: Int = 4096
+  private[exchange] val maxExpressionDepth: Int = 256
+
   private val pythonOrArrowPlanClassNames = Set(
     "org.apache.spark.sql.execution.python.AggregateInPandasExec",
+    "org.apache.spark.sql.execution.python.ArrowAggregatePythonExec",
     "org.apache.spark.sql.execution.python.ArrowEvalPythonExec",
+    "org.apache.spark.sql.execution.python.ArrowEvalPythonUDTFExec",
+    "org.apache.spark.sql.execution.python.ArrowWindowPythonExec",
     "org.apache.spark.sql.execution.python.BatchEvalPythonExec",
+    "org.apache.spark.sql.execution.python.BatchEvalPythonUDTFExec",
     "org.apache.spark.sql.execution.python.CoGroupMapInPandasExec",
+    "org.apache.spark.sql.execution.python.FlatMapCoGroupsInArrowExec",
+    "org.apache.spark.sql.execution.python.FlatMapCoGroupsInBatchExec",
+    "org.apache.spark.sql.execution.python.FlatMapCoGroupsInPandasExec",
+    "org.apache.spark.sql.execution.python.FlatMapGroupsInArrowExec",
+    "org.apache.spark.sql.execution.python.FlatMapGroupsInBatchExec",
     "org.apache.spark.sql.execution.python.FlatMapGroupsInPandasExec",
+    "org.apache.spark.sql.execution.python.MapInArrowExec",
+    "org.apache.spark.sql.execution.python.MapInBatchExec",
     "org.apache.spark.sql.execution.python.MapInPandasExec",
+    "org.apache.spark.sql.execution.python.PythonIncrementalAggregateExec",
     "org.apache.spark.sql.execution.python.WindowInPandasExec")
 
   private val pythonOrArrowExpressionClassNames = Set(
+    "org.apache.spark.sql.catalyst.expressions.PythonAggregate",
+    "org.apache.spark.sql.catalyst.expressions.PythonUDAF",
     "org.apache.spark.sql.catalyst.expressions.PythonUDF",
-    "org.apache.spark.sql.catalyst.expressions.PythonUDAF")
+    "org.apache.spark.sql.catalyst.expressions.PythonUDTF",
+    "org.apache.spark.sql.catalyst.expressions.TranspiledPythonUDF",
+    "org.apache.spark.sql.catalyst.expressions.UnresolvedPolymorphicPythonUDTF")
 
   private val runtimeFilterExpressionClassNames = Set(
     "org.apache.spark.sql.catalyst.expressions.BloomFilterMightContain")
@@ -572,6 +596,14 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
 
   private val expandPlanClassNames = Set("org.apache.spark.sql.execution.ExpandExec")
 
+  private[exchange] def isPythonOrArrowPlanClassName(className: String): Boolean = {
+    pythonOrArrowPlanClassNames.contains(className)
+  }
+
+  private[exchange] def isPythonOrArrowExpressionClassName(className: String): Boolean = {
+    pythonOrArrowExpressionClassNames.contains(className)
+  }
+
   def analyze(
       plan: SparkPlan,
       executionId: String,
@@ -582,7 +614,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     require(executionId != null && executionId.nonEmpty, "execution id must be non-empty")
 
     val summaries = buildSummaries(plan, rules, runtimeState)
-    exchangeOccurrences(plan).zipWithIndex.map { case (occurrence, ordinal) =>
+    exchangeOccurrences(plan, rules).zipWithIndex.map { case (occurrence, ordinal) =>
       classifyExchange(occurrence, executionId, ordinal.toLong, rules, runtimeState, summaries)
     }
   }
@@ -657,14 +689,16 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       val (plan, expanded) = stack.remove(stack.length - 1)
       if (expanded) {
         if (!summaries.containsKey(plan)) {
-          val childSummaries = effectiveChildren(plan).map(child => summaries.get(child.plan))
+          val childSummaries = effectiveChildren(plan, rules).map { child =>
+            summaries.get(child.plan)
+          }
           summaries.put(plan, summarizePlan(plan, childSummaries, rules, runtimeState))
           states.put(plan, 2.toByte)
         }
       } else if (!states.containsKey(plan)) {
         states.put(plan, 1.toByte)
         stack += ((plan, true))
-        val children = effectiveChildren(plan)
+        val children = effectiveChildren(plan, rules)
         var index = children.length - 1
         while (index >= 0) {
           if (!states.containsKey(children(index).plan)) {
@@ -682,7 +716,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       childSummaries: Seq[PlanSummary],
       rules: ShuffleRecoveryEligibilityRules,
       runtimeState: ShuffleRecoveryRuntimeState): PlanSummary = {
-    val children = effectiveChildren(plan)
+    val children = effectiveChildren(plan, rules)
     val localFlags = planFlags(plan)
     val expressionSummary = plan match {
       case exchange: ShuffleExchangeExec =>
@@ -690,6 +724,9 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
           observePartitioning(exchange.outputPartitioning).expressionRoots,
           rules)
       case _ if isStructuralWrapper(plan) =>
+        ExpressionSummary(ReasonSummary.Empty, ShuffleRecoveryObservationFlags())
+      case _ if !rules.allowedOperatorClassNames.contains(plan.getClass.getName) =>
+        // Unknown operator semantics are rejected by class before consulting their expressions.
         ExpressionSummary(ReasonSummary.Empty, ShuffleRecoveryObservationFlags())
       case _ => summarizeExpressions(plan.expressions, rules)
     }
@@ -849,7 +886,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     val className = plan.getClass.getName
     val reasons = mutable.ArrayBuffer.empty[ShuffleRecoveryMissReason]
 
-    if (pythonOrArrowPlanClassNames.contains(className) && !rules.allowPythonOrArrow) {
+    if (isPythonOrArrowPlanClassName(className) && !rules.allowPythonOrArrow) {
       reasons += PythonOrArrowPresent
     }
     if (windowPlanClassNames.contains(className) && !rules.allowWindow) {
@@ -877,38 +914,72 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
   private def summarizeExpressions(
       roots: Seq[Expression],
       rules: ShuffleRecoveryEligibilityRules): ExpressionSummary = {
-    val stack = mutable.ArrayBuffer.empty[Expression]
-    roots.reverseIterator.foreach(stack += _)
     val reasons = mutable.ArrayBuffer.empty[ShuffleRecoveryMissReason]
     var flags = ShuffleRecoveryObservationFlags()
 
-    // Expression.deterministic recursively visits descendants. Check it once per top-level root,
-    // then use the iterative walk below for class/category validation to avoid quadratic recursion.
-    if (roots.exists(root => !root.deterministic)) {
-      reasons += NonDeterministic
+    if (roots.size > maxExpressionNodes) {
+      reasons += DeterminismUnproven
+      return ExpressionSummary(ReasonSummary.from(reasons.toSeq), flags)
     }
 
-    while (stack.nonEmpty) {
-      val expression = stack.remove(stack.length - 1)
-      val className = expression.getClass.getName
-      val isDpp = expression.isInstanceOf[DynamicPruningExpression]
-      val isSubquery = expression.isInstanceOf[ExecSubqueryExpression]
-      val isRuntimeFilter = runtimeFilterExpressionClassNames.contains(className)
-      val isPythonOrArrow = pythonOrArrowExpressionClassNames.contains(className)
+    val stack = mutable.ArrayBuffer.empty[ExpressionFrame]
+    roots.reverseIterator.foreach(root => stack += ExpressionFrame(root, 1))
+    var scheduledNodes = roots.size
+    var bounded = false
 
-      flags = flags.merge(ShuffleRecoveryObservationFlags(
-        dynamicPruning = isDpp,
-        runtimeFilter = isRuntimeFilter,
-        subquery = isSubquery,
-        pythonOrArrow = isPythonOrArrow))
+    while (stack.nonEmpty && !bounded) {
+      val frame = stack.remove(stack.length - 1)
+      if (frame.depth > maxExpressionDepth) {
+        reasons += DeterminismUnproven
+        bounded = true
+      } else {
+        val expression = frame.expression
+        val className = expression.getClass.getName
+        val trusted = rules.allowedExpressionClassNames.contains(className)
+        val isDpp = expression.isInstanceOf[DynamicPruningExpression]
+        val isSubquery = expression.isInstanceOf[ExecSubqueryExpression]
+        val isRuntimeFilter = runtimeFilterExpressionClassNames.contains(className)
+        val isPythonOrArrow =
+          isPythonOrArrowExpressionClassName(className) ||
+            expression.isInstanceOf[PythonFuncExpression]
+        val intrinsicallyNonDeterministic = expression.isInstanceOf[Nondeterministic] ||
+          (trusted && expression.isInstanceOf[PythonFuncExpression] &&
+            !expression.asInstanceOf[PythonFuncExpression].udfDeterministic)
 
-      if (isPythonOrArrow && !rules.allowPythonOrArrow) reasons += PythonOrArrowPresent
-      if (isDpp && !rules.allowDynamicPruning) reasons += DynamicPruningPresent
-      if (isRuntimeFilter && !rules.allowRuntimeFilters) reasons += RuntimeFilterPresent
-      if (isSubquery && !rules.allowSubqueries) reasons += SubqueryPresent
-      if (!rules.allowedExpressionClassNames.contains(className)) reasons += UnsupportedExpression
+        flags = flags.merge(ShuffleRecoveryObservationFlags(
+          dynamicPruning = isDpp,
+          runtimeFilter = isRuntimeFilter,
+          subquery = isSubquery,
+          pythonOrArrow = isPythonOrArrow))
 
-      expression.children.reverseIterator.foreach(stack += _)
+        if (intrinsicallyNonDeterministic) reasons += NonDeterministic
+        if (isPythonOrArrow && !rules.allowPythonOrArrow) reasons += PythonOrArrowPresent
+        if (isDpp && !rules.allowDynamicPruning) reasons += DynamicPruningPresent
+        if (isRuntimeFilter && !rules.allowRuntimeFilters) reasons += RuntimeFilterPresent
+        if (isSubquery && !rules.allowSubqueries) reasons += SubqueryPresent
+
+        if (!trusted) {
+          // Class identity is the trust boundary. Do not call children, deterministic, dataType, or
+          // any other overridable semantic accessor merely to enrich an unsupported observation.
+          reasons += UnsupportedExpression
+        } else {
+          val children = expression.children
+          if (children.nonEmpty && frame.depth >= maxExpressionDepth) {
+            reasons += DeterminismUnproven
+            bounded = true
+          } else if (children.size > maxExpressionNodes - scheduledNodes) {
+            reasons += DeterminismUnproven
+            bounded = true
+          } else {
+            scheduledNodes += children.size
+            var index = children.length - 1
+            while (index >= 0) {
+              stack += ExpressionFrame(children(index), frame.depth + 1)
+              index -= 1
+            }
+          }
+        }
+      }
     }
 
     ExpressionSummary(ReasonSummary.from(reasons.toSeq), flags)
@@ -931,7 +1002,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       expand = expandPlanClassNames.contains(className),
       cacheScan = cacheScanPlanClassNames.contains(className),
       adaptivePartitionSpecs = adaptiveReadPlanClassNames.contains(className),
-      pythonOrArrow = pythonOrArrowPlanClassNames.contains(className),
+      pythonOrArrow = isPythonOrArrowPlanClassName(className),
       reusedExchange = plan.isInstanceOf[ReusedExchangeExec],
       adaptivePlan = plan.isInstanceOf[AdaptiveSparkPlanExec])
   }
@@ -944,7 +1015,9 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       adaptivePlan = plan.isInstanceOf[AdaptiveSparkPlanExec])
   }
 
-  private def exchangeOccurrences(plan: SparkPlan): Seq[ExchangeOccurrence] = {
+  private def exchangeOccurrences(
+      plan: SparkPlan,
+      rules: ShuffleRecoveryEligibilityRules): Seq[ExchangeOccurrence] = {
     val result = mutable.ArrayBuffer.empty[ExchangeOccurrence]
     val stack = mutable.ArrayBuffer(
       TraversalFrame(plan, Nil, ShuffleRecoveryObservationFlags()))
@@ -961,7 +1034,7 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       }
 
       val inheritedFlags = frame.ancestorFlags.merge(ancestorObservationFlags(frame.plan))
-      val children = effectiveChildren(frame.plan)
+      val children = effectiveChildren(frame.plan, rules)
       var index = children.length - 1
       while (index >= 0) {
         val child = children(index)
@@ -976,7 +1049,9 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
     if (pathReversed.isEmpty) "root" else pathReversed.reverseIterator.mkString(".")
   }
 
-  private def effectiveChildren(plan: SparkPlan): Seq[ChildRef] = plan match {
+  private def effectiveChildren(
+      plan: SparkPlan,
+      rules: ShuffleRecoveryEligibilityRules): Seq[ChildRef] = plan match {
     case adaptive: AdaptiveSparkPlanExec => Seq(ChildRef("c0", adaptive.executedPlan))
     case stage: QueryStageExec => Seq(ChildRef("c0", stage.plan))
     case reused: ReusedExchangeExec => Seq(ChildRef("c0", reused.child))
@@ -984,10 +1059,62 @@ private[sql] object ShuffleRecoveryOpportunityAnalyzer {
       val children = other.children.zipWithIndex.map { case (child, index) =>
         ChildRef(s"c$index", child)
       }
-      val subqueries = other.subqueries.zipWithIndex.map { case (subquery, index) =>
-        ChildRef(s"s$index", subquery)
+      val expressionRoots = other match {
+        case exchange: ShuffleExchangeExec =>
+          observePartitioning(exchange.outputPartitioning).expressionRoots
+        case _ if isStructuralWrapper(other) => Nil
+        case _ if !rules.allowedOperatorClassNames.contains(other.getClass.getName) => Nil
+        case _ => other.expressions
+      }
+      val subqueries = trustedSubqueryPlans(expressionRoots, rules).zipWithIndex.map {
+        case (subquery, index) => ChildRef(s"s$index", subquery)
       }
       children ++ subqueries
+  }
+
+  private def trustedSubqueryPlans(
+      roots: Seq[Expression],
+      rules: ShuffleRecoveryEligibilityRules): Seq[SparkPlan] = {
+    val result = mutable.ArrayBuffer.empty[SparkPlan]
+    if (roots.size > maxExpressionNodes) {
+      return result.toSeq
+    }
+
+    val stack = mutable.ArrayBuffer.empty[ExpressionFrame]
+    roots.reverseIterator.foreach(root => stack += ExpressionFrame(root, 1))
+    var scheduledNodes = roots.size
+    var bounded = false
+
+    while (stack.nonEmpty && !bounded) {
+      val frame = stack.remove(stack.length - 1)
+      if (frame.depth > maxExpressionDepth) {
+        bounded = true
+      } else {
+        val expression = frame.expression
+        val trusted = rules.allowedExpressionClassNames.contains(expression.getClass.getName)
+        if (trusted) {
+          expression match {
+            case subquery: ExecSubqueryExpression if subquery.plan != null =>
+              result += subquery.plan
+            case _ =>
+          }
+          val children = expression.children
+          if (children.nonEmpty && frame.depth >= maxExpressionDepth) {
+            bounded = true
+          } else if (children.size > maxExpressionNodes - scheduledNodes) {
+            bounded = true
+          } else {
+            scheduledNodes += children.size
+            var index = children.length - 1
+            while (index >= 0) {
+              stack += ExpressionFrame(children(index), frame.depth + 1)
+              index -= 1
+            }
+          }
+        }
+      }
+    }
+    result.toSeq
   }
 
   private def isStructuralWrapper(plan: SparkPlan): Boolean = plan match {
