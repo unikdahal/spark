@@ -20,6 +20,7 @@ package org.apache.spark.scheduler
 import scala.collection.mutable.HashSet
 
 import org.apache.spark.{MapOutputTrackerMaster, PipelinedShuffleDependency, ShuffleDependency}
+import org.apache.spark.ShuffleRecoverySchedulerAdoption
 import org.apache.spark.rdd.{DeterministicLevel, RDD}
 import org.apache.spark.util.CallSite
 
@@ -125,6 +126,13 @@ private[spark] class ShuffleMapStage(
     if (isPipelined) {
       (0 until numPartitions).filterNot(pipelinedCompletedPartitions.contains)
     } else {
+      // A prepared adoption is installed at the same local point where the scheduler is about to
+      // decide which map partitions to launch. The hook is deliberately local-only: all manifest,
+      // provider, filesystem, and validation work completed before the DAGScheduler can reach it.
+      ShuffleRecoverySchedulerAdoption.beforeFindMissingPartitions(
+        mapOutputTrackerMaster,
+        shuffleDep,
+        numPartitions)
       mapOutputTrackerMaster
         .findMissingPartitions(shuffleDep.shuffleId)
         .getOrElse(0 until numPartitions)
