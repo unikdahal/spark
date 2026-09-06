@@ -32,7 +32,9 @@ class ShuffleRecoveryColdProcessSuite extends SparkFunSuite {
 
   private val ChildTimeoutSeconds = 180L
   private val AbruptMarkerTimeoutSeconds = 120L
-  private val TestedCommit = sys.env.getOrElse("GITHUB_SHA", "local")
+  private val TestedCommit = sys.env.getOrElse(
+    "SPARK_SHUFFLE_RECOVERY_TESTED_COMMIT",
+    sys.env.getOrElse("GITHUB_SHA", "local"))
 
   test("cold independent JVMs adopt exact provider blocks and negative controls recompute") {
     val evidenceBase = sys.env.get("SPARK_SHUFFLE_RECOVERY_COLD_PROCESS_EVIDENCE_DIR")
@@ -162,14 +164,18 @@ class ShuffleRecoveryColdProcessSuite extends SparkFunSuite {
       producer,
       control)
     val log = evidence.resolveSibling(evidence.getFileName.toString + ".log")
+    val threadDump = evidence.resolveSibling(evidence.getFileName.toString + ".threads.log")
     val process = startProcess(command, root)
     val drainer = drainProcess(process, log)
     val finished = process.waitFor(ChildTimeoutSeconds, TimeUnit.SECONDS)
     if (!finished) {
+      captureThreadDump(process, threadDump)
       terminate(process)
     }
     drainer.join(TimeUnit.SECONDS.toMillis(30))
-    assert(finished, s"child timed out: ${command.mkString(" ")}; log=$log")
+    assert(
+      finished,
+      s"child timed out: ${command.mkString(" ")}; log=$log; threadDump=$threadDump")
     assert(process.exitValue() == 0, s"child failed with ${process.exitValue()}; log=$log")
     assert(Files.isRegularFile(evidence), s"child produced no evidence: $evidence")
   }
@@ -276,6 +282,24 @@ class ShuffleRecoveryColdProcessSuite extends SparkFunSuite {
     thread.setDaemon(true)
     thread.start()
     thread
+  }
+
+  private def captureThreadDump(process: Process, target: Path): Unit = {
+    val jcmd = Paths.get(System.getProperty("java.home"), "bin", "jcmd")
+    if (process.isAlive && Files.isExecutable(jcmd)) {
+      createParentDirectories(target)
+      val dump = new ProcessBuilder(
+        jcmd.toString,
+        process.pid().toString,
+        "Thread.print")
+        .redirectErrorStream(true)
+        .redirectOutput(target.toFile)
+        .start()
+      if (!dump.waitFor(20, TimeUnit.SECONDS)) {
+        dump.destroyForcibly()
+        dump.waitFor(5, TimeUnit.SECONDS)
+      }
+    }
   }
 
   private def waitForMarker(
