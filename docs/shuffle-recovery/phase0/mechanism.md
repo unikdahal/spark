@@ -71,7 +71,7 @@ fsync; conflicting bytes cannot replace a committed immutable name.
 
 Provider claims return typed outcomes rather than throwing unstructured scheduler-facing failures.
 Manifest/provider data remains untrusted until a single validation boundary has checked the group,
-generation, full identity, provider compatibility, mapper/reducer shape, current target shuffle id,
+generation, full identity, provider compatibility, mapper/reducer shape, current shuffle id,
 handle ordering/counts, lengths, bounds, and provider descriptors.
 
 Mutable input is copied/owned at the trust boundary. Durable metadata never deserializes or injects
@@ -131,7 +131,7 @@ For the currently adopted binding, the failure path:
 5. queues release and, only when authorized, exact-incarnation retirement off the scheduler thread.
 
 Fresh output is never mixed with surviving adopted maps. A retry after invalidation recomputes the
-entire shuffle map stage.
+entire shuffle map stage. This is a whole fresh map-stage recomputation.
 
 Late callbacks/events name the old synthetic location and binding generation, so they cannot clear a
 newly installed successor or fresh local map status. Duplicate callbacks are idempotently fenced.
