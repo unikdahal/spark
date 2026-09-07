@@ -143,6 +143,41 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       targetShuffleId: Int): Option[ShuffleRecoveryObservedFetchFailure] =
     Option(observedFailures.get(targetShuffleId))
 
+  /**
+   * Accepts one already-classified provider callback and applies the same generation/binding fence
+   * used by the synchronous read path. This narrow package-private seam is also used by deterministic
+   * race tests; a delayed callback cannot gain authority over a newer binding because scheduler
+   * invalidation revalidates both the local generation and binding id before mutating state.
+   */
+  private[shuffle] def recordObservedFailure(
+      targetShuffleId: Int,
+      observed: ShuffleRecoveryObservedFetchFailure): Unit = {
+    if (targetShuffleId < 0 || observed == null || observed.localBindingGeneration <= 0L ||
+        observed.bindingId == null) {
+      return
+    }
+    observedFailures.compute(targetShuffleId, (_, previous) => {
+      if (previous == null ||
+          observed.localBindingGeneration > previous.localBindingGeneration ||
+          (observed.localBindingGeneration == previous.localBindingGeneration &&
+            previous.bindingId == observed.bindingId &&
+            !previous.failureClass.authorizesRetirement &&
+            observed.failureClass.authorizesRetirement)) {
+        observed
+      } else {
+        previous
+      }
+    })
+
+    Option(SparkEnv.get).foreach { env =>
+      env.mapOutputTracker match {
+        case tracker: MapOutputTrackerMaster =>
+          schedulerAdoption.invalidateObservedFetchFailure(tracker, targetShuffleId)
+        case _ =>
+      }
+    }
+  }
+
   private[spark] def clearRecoveryState(targetShuffleId: Int): Unit = {
     observedFailures.remove(targetShuffleId)
     recoveredReadCounters.remove(targetShuffleId)
@@ -270,34 +305,13 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
     } else {
       -1
     }
-    val observed = ShuffleRecoveryObservedFetchFailure(
-      recovered.localBindingGeneration,
-      recovered.binding.bindingId,
-      mapIndex,
-      id.reduceId,
-      failureClass)
-    observedFailures.compute(id.shuffleId, (_, previous) => {
-      if (previous == null ||
-          recovered.localBindingGeneration > previous.localBindingGeneration ||
-          (recovered.localBindingGeneration == previous.localBindingGeneration &&
-            previous.bindingId == recovered.binding.bindingId &&
-            !previous.failureClass.authorizesRetirement && failureClass.authorizesRetirement)) {
-        observed
-      } else {
-        previous
-      }
-    })
-
-    // The reference resolver runs in the driver's BlockManager for this feasibility path. By
-    // invalidating here, the entire adopted tracker registration disappears before the ordinary
-    // FetchFailed event can observe or remove one map at a time. Executor-side environments do not
-    // have a MapOutputTrackerMaster and therefore cannot mutate driver recovery state.
-    Option(SparkEnv.get).foreach { env =>
-      env.mapOutputTracker match {
-        case tracker: MapOutputTrackerMaster =>
-          schedulerAdoption.invalidateObservedFetchFailure(tracker, id.shuffleId)
-        case _ =>
-      }
-    }
+    recordObservedFailure(
+      id.shuffleId,
+      ShuffleRecoveryObservedFetchFailure(
+        recovered.localBindingGeneration,
+        recovered.binding.bindingId,
+        mapIndex,
+        id.reduceId,
+        failureClass))
   }
 }
