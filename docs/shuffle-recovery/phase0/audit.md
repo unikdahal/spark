@@ -33,7 +33,12 @@ an explicit full-gate Core job rather than weakening or replacing the existing f
 - Observed source support remains separate from counterfactual exact-token capability.
 - The report does not convert excluded/reused physical work into weighted opportunity.
 - The 18 unweighted final-plan observations remain visible; the frozen gate is not relabeled PASS.
-- The 20% target was not changed after observing the 19.4% correlated exact-source result.
+- The preregistered 20% threshold applies to reusable completed shuffle-map task time at the
+  declared failure distribution. Its current projection is 36.8%, but the formal gate is N/A
+  because the preregistered accounting rule refuses PASS/FAIL while any gate observation is
+  unweighted.
+- The 19.4% correlated exact-source task-time value is a scope-curve eligibility measurement, not
+  the value-gate numerator. Neither number is substituted for the other after observing results.
 - Non-determinate, DPP, unsupported-expression, adaptive-partition, and determinism-unproven misses
   remain distinct root causes rather than being silently broadened into eligibility.
 
@@ -141,7 +146,8 @@ proceeding to Phase 1.
 ## Final decision check
 
 Mechanism correctness conditions are supported by the accumulated tests and cold-process evidence.
-The opportunity requirement for an unconditional GO is not met under the preregistered rule.
+The opportunity requirement for an unconditional GO is not met under the preregistered rule: the
+formal value-gate result is N/A, not PASS, because denominator accounting is incomplete.
 Therefore the only supported decision is:
 
 **MECHANISM_FEASIBLE / VALUE_GATE_NOT_MET**
