@@ -58,21 +58,21 @@ class ShuffleRecoverySchedulerAdoptionSuite extends SparkFunSuite with LocalSpar
     def allow(): Unit = proceed.countDown()
   }
 
-  private final case class Harness(
-      conf: SparkConf,
-      root: Path,
-      tracker: MapOutputTrackerMaster,
-      dependency: ShuffleDependency[Int, Int, Int],
-      resolver: ShuffleRecoveryIndexShuffleBlockResolver,
-      state: ShuffleRecoverySchedulerAdoptionState,
-      claimProvider: ReferenceShuffleRecoveryClaimProvider,
-      claimRequest: ShuffleRecoveryClaimRequest,
-      binding: ShuffleRecoveryBinding,
-      oldLocation: BlockManagerId,
-      localBindingGeneration: Long,
-      retirer: RecordingRetirer,
-      mapperCount: Int,
-      reducerCount: Int)
+  private final class Harness(
+      val conf: SparkConf,
+      val root: Path,
+      val tracker: MapOutputTrackerMaster,
+      val dependency: ShuffleDependency[Int, Int, Int],
+      val resolver: ShuffleRecoveryIndexShuffleBlockResolver,
+      val state: ShuffleRecoverySchedulerAdoptionState,
+      val claimProvider: ReferenceShuffleRecoveryClaimProvider,
+      val claimRequest: ShuffleRecoveryClaimRequest,
+      val binding: ShuffleRecoveryBinding,
+      val oldLocation: BlockManagerId,
+      val localBindingGeneration: Long,
+      val retirer: RecordingRetirer,
+      val mapperCount: Int,
+      val reducerCount: Int)
 
   test("concurrent reducer callbacks clear every adopted map and fence stale A") {
     val retirer = new RecordingRetirer(block = true)
@@ -445,7 +445,7 @@ class ShuffleRecoverySchedulerAdoptionSuite extends SparkFunSuite with LocalSpar
     val prefix = "shuffle-recovery-"
     assert(oldLocation.executorId.startsWith(prefix))
     val localBindingGeneration = oldLocation.executorId.substring(prefix.length).toLong
-    val harness = Harness(
+    val harness = new Harness(
       conf,
       root,
       tracker,
