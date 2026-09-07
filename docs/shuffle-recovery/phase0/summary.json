@@ -4,7 +4,11 @@
   "decision": "MECHANISM_FEASIBLE_VALUE_GATE_NOT_MET",
   "frozenBaseline": "2a7cfea06ba135cf0ddc62902eb0daf5a835c672",
   "integrationStartHead": "b7179691629718a35d7db322396aa910a60efb03",
-  "finalCandidateHead": "PENDING_FINAL_GATE",
+  "candidateIdentification": {
+    "repositoryRef": "pull request #40 head containing this file",
+    "finalHeadRecord": "pull request #40, its exact-head full Actions run, and Issue #10 closeout",
+    "reason": "Embedding the containing commit SHA in this file would require an additional commit and change that SHA."
+  },
   "opportunity": {
     "corpus": "spark-in-tree-tpc-evidence-v2",
     "syntheticSupplement": "spark-controlled-synthetic-evidence-v1",
@@ -89,10 +93,9 @@
     "literalTotalHistoryTargetSatisfied": false,
     "reason": "Previously merged evidence/audit/scheduler follow-up squash commits remain in the integration lineage. This report does not destructively rewrite exact-head evidence history."
   },
-  "finalGate": {
-    "actionsRunId": null,
-    "conclusion": "PENDING",
-    "headSha": "PENDING_FINAL_GATE",
-    "artifactIds": []
+  "finalGateRecord": {
+    "requiredMode": "full",
+    "requiredHead": "exact pull request #40 head containing this summary",
+    "recordLocation": "pull request #40 and Issue #10 closeout"
   }
 }
