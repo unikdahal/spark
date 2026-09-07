@@ -278,7 +278,10 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       failureClass)
     observedFailures.compute(id.shuffleId, (_, previous) => {
       if (previous == null ||
-          (!previous.failureClass.authorizesRetirement && failureClass.authorizesRetirement)) {
+          recovered.localBindingGeneration > previous.localBindingGeneration ||
+          (recovered.localBindingGeneration == previous.localBindingGeneration &&
+            previous.bindingId == recovered.binding.bindingId &&
+            !previous.failureClass.authorizesRetirement && failureClass.authorizesRetirement)) {
         observed
       } else {
         previous
