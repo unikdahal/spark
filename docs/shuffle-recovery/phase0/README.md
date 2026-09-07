@@ -18,8 +18,9 @@ The final evidence PR was cut from integration head:
 
 The squash commit produced by this report cannot be embedded in its own contents without creating
 an additional post-freeze commit. The final squash SHA is therefore recorded in the merged PR and
-Issue #10 closeout; `summary.json` records the exact pre-merge candidate head used by the final CI
-gate.
+Issue #10 closeout. `summary.json` identifies the freeze candidate as the head of PR #40 containing
+that summary; the PR's exact-head Actions run records the concrete tested SHA without requiring a
+post-gate source change.
 
 ## What Phase 0 asked
 
@@ -62,14 +63,21 @@ the v2 corpus id. This historical failure is intentionally disclosed rather than
 | Exact-source eligible exchange count | 35.6% |
 | Exact-source eligible shuffle-write bytes | 39.5% |
 | Exact-source eligible completed map task time | **19.4%** |
-| Frozen value threshold | >=20.0% |
+| Failure-distribution reusable task-time projection | **36.8%** |
+| Frozen value threshold | >=20.0% at the declared failure distribution |
 | Formal frozen value-gate result | **N/A** |
-| Failure-distribution projection | 36.8% |
 
-The formal value result is N/A because the preregistered report refuses to label the gate PASS or
-FAIL while gate-rule observations remain explicitly unweighted. That policy was frozen before the
-result was observed. The correlated exact-source estimate is 19.4%, which is below the 20% target;
-there is no preregistered revised corpus/scope that permits a post-hoc pass.
+The preregistered 20% value gate applies to reusable completed shuffle-map task time at the declared
+failure distribution. The measured projection is 36.8%, but the formal result is N/A because the
+preregistered accounting rule refuses to label the gate PASS or FAIL while any gate-rule
+observations remain explicitly unweighted. There are 18 such observations. N/A therefore does not
+satisfy the GO requirement.
+
+The 19.4% value is a different measurement: it is the correlated exact-source scope-curve ratio over
+weighted completed exchanges. It is reported because eligibility breadth matters, but it is **not**
+the preregistered failure-distribution gate numerator and is not substituted for that gate after the
+fact. There is no preregistered revised corpus/scope that permits the N/A result to be relabelled
+PASS.
 
 ### Failure-point completed/reusable work
 
@@ -217,8 +225,8 @@ non-destructive.
 | A -> B healing and later adoption | cold-process adopted-failure/healing proof |
 | Attempt cleanup preserves group artifacts | `ReferenceShuffleProviderSuite` winner/cleanup test |
 
-The final exact-head Actions run and job ids are recorded in `summary.json` and the PR after the
-candidate is frozen.
+The final exact-head Actions run and job ids are recorded on PR #40 and in the Issue #10 closeout so
+that recording those self-referential run identifiers does not mutate the tested source head.
 
 ## Reproduction
 
@@ -242,6 +250,7 @@ Cold independent-JVM proof:
 rm -rf sql/core/target/shuffle-recovery-phase0/cold-process
 mkdir -p sql/core/target/shuffle-recovery-phase0/cold-process
 SPARK_SHUFFLE_RECOVERY_COLD_PROCESS_EVIDENCE_DIR="$PWD/sql/core/target/shuffle-recovery-phase0/cold-process" \
+  SPARK_SHUFFLE_RECOVERY_TESTED_COMMIT="$(git rev-parse HEAD)" \
   ./build/sbt -Phadoop-3 -Phive \
   "set sql / Test / fork := true" \
   "sql/testOnly org.apache.spark.shuffle.ShuffleRecoveryColdProcessSuite"
