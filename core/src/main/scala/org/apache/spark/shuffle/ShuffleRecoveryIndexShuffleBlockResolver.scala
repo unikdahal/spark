@@ -145,9 +145,10 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
 
   /**
    * Accepts one already-classified provider callback and applies the same generation/binding fence
-   * used by the synchronous read path. This narrow package-private seam is also used by deterministic
-   * race tests; a delayed callback cannot gain authority over a newer binding because scheduler
-   * invalidation revalidates both the local generation and binding id before mutating state.
+   * used by the synchronous read path. This narrow package-private seam is also used by
+   * deterministic race tests; a delayed callback cannot gain authority over a newer binding because
+   * scheduler invalidation revalidates both the local generation and binding id before mutating
+   * state.
    */
   private[shuffle] def recordObservedFailure(
       targetShuffleId: Int,
