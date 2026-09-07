@@ -41,7 +41,8 @@ import org.apache.spark.storage.ShuffleBlockId
  *
  *   1. generation 1 publishes A;
  *   2. generation 2 claims A, removes one already-bound provider data file before fetch, proves
- *      whole-shuffle fallback selected every mapper, waits for exact A retirement, then publishes B;
+ *      whole-shuffle fallback selected every mapper, waits for exact A retirement, then
+ *      publishes B;
  *   3. generation 3 reconstructs the query in a fresh JVM and adopts B with zero map tasks.
  *
  * The destructive mutation is deliberately after claim/validation and before the first fetch, so
@@ -116,7 +117,8 @@ private[shuffle] object ShuffleRecoveryAdoptedFailureColdProcessProof {
     }
     drainer.join(TimeUnit.SECONDS.toMillis(30))
     require(finished, s"$mode child timed out; log=$log")
-    require(process.exitValue() == 0, s"$mode child failed with ${process.exitValue()}; log=$log")
+    require(process.exitValue() == 0,
+      s"$mode child failed with ${process.exitValue()}; log=$log")
     require(Files.isRegularFile(evidence), s"$mode child produced no evidence: $evidence")
   }
 
@@ -202,7 +204,9 @@ object ShuffleRecoveryAdoptedFailureColdProcess {
 
     def taskCount: Long = targetTasks.get()
 
-    def partitions: Vector[Int] = targetPartitions.asScala.iterator.map(_.intValue()).toVector.sorted
+    def partitions: Vector[Int] = {
+      targetPartitions.asScala.iterator.map(_.intValue()).toVector.sorted
+    }
   }
 
   def main(args: Array[String]): Unit = {
@@ -285,8 +289,11 @@ object ShuffleRecoveryAdoptedFailureColdProcess {
       // data file only now so the first provider fetch has authoritative Missing evidence.
       val providerA = ReferenceShuffleProvider.open(
         providerRoot(root), group, ProviderA, IncarnationA, spark.sparkContext.conf)
-      val missingData = providerA.committedMapDirectory(0).resolve(ReferenceShuffleProvider.DataFileName)
-      require(Files.deleteIfExists(missingData), s"failed to remove bound provider data: $missingData")
+      val missingData = providerA.committedMapDirectory(0)
+        .resolve(ReferenceShuffleProvider.DataFileName)
+      require(
+        Files.deleteIfExists(missingData),
+        s"failed to remove bound provider data: $missingData")
 
       val result = collectResult(query)
       drainListeners(spark)
@@ -346,7 +353,9 @@ object ShuffleRecoveryAdoptedFailureColdProcess {
       drainListeners(spark)
       require(result.digest == expected("resultDigest"))
       require(ShuffleRecoverySchedulerAdoption.isAdopted(exchange.shuffleId))
-      require(listener.taskCount == 0L, s"healed successor launched ${listener.taskCount} map tasks")
+      require(
+        listener.taskCount == 0L,
+        s"healed successor launched ${listener.taskCount} map tasks")
 
       val identity = identityFor(exchange)
       val selected = new ShuffleRecoveryManifestStore(manifestRoot(root))
