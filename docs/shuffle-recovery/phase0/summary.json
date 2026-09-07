@@ -29,9 +29,9 @@
     "exactSourceEligibleBytesPct": 39.5,
     "exactSourceEligibleCompletedTaskTimePct": 19.4,
     "preregisteredValueThresholdPct": 20.0,
-    "formalValueGateResult": "N/A",
     "failureDistributionProjectionPct": 36.8,
-    "gateExplanation": "The preregistered report refuses PASS/FAIL while 18 gate-rule observations remain explicitly unweighted; the correlated exact-source estimate is 19.4%, below the 20% target, and no revised target was preregistered before observing the data."
+    "formalValueGateResult": "N/A",
+    "gateExplanation": "The preregistered 20% gate applies to reusable completed shuffle-map task time at the declared failure distribution. Its measured projection is 36.8%, but the preregistered report forces the formal result to N/A while 18 gate-rule observations remain explicitly unweighted. The 19.4% value is the correlated exact-source scope-curve eligibility ratio, not the gate numerator. N/A does not satisfy the GO requirement, and no revised target was preregistered before observing the data."
   },
   "mechanism": {
     "latestPreFreezeActionsRunId": 34070755581,
