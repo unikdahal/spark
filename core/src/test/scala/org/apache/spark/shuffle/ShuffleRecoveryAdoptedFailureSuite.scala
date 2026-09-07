@@ -91,7 +91,7 @@ class ShuffleRecoveryAdoptedFailureSuite extends SparkFunSuite {
       val result = new ShuffleRecoveryManifestRetirer(root).retireExact(
         ShuffleRecoveryManifestIncarnation(
           a.recoveryGroup,
-          generation = 0L,
+          0L,
           a.incarnationId,
           a.identity.digest))
       assert(result == ShuffleRecoveryIncarnationRetirementRefused)
@@ -116,9 +116,9 @@ class ShuffleRecoveryAdoptedFailureSuite extends SparkFunSuite {
       incarnation: String): ShuffleRecoveryManifest = {
     ShuffleRecoveryManifest(
       recoveryGroup = "group",
-      generation,
+      generation = generation,
       incarnationId = incarnation,
-      identity,
+      identity = identity,
       mapperCount = 0,
       reducerCount = 1,
       mapArtifacts = Vector.empty,
