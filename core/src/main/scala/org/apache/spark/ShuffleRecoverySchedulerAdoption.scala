@@ -111,6 +111,7 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
   private val invalidated = new ConcurrentHashMap[Int, Invalidated]()
   private val nextBindingGeneration = new AtomicLong(0L)
   private val closed = new AtomicBoolean(false)
+  private val invalidationLock = new Object
   private val releaseThreadId = new AtomicInteger(0)
   private val releaseExecutor = new ThreadPoolExecutor(
     1,
@@ -327,21 +328,26 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
    */
   def invalidateObservedFetchFailure(
       tracker: MapOutputTrackerMaster,
-      shuffleId: Int): ShuffleRecoveryFetchFailureAction = {
+      shuffleId: Int): ShuffleRecoveryFetchFailureAction = invalidationLock.synchronized {
     if (closed.get() || tracker == null || shuffleId < 0) {
-      return ShuffleRecoveryFetchFailureNotAdopted
-    }
-    val current = adopted.get(shuffleId)
-    if (current == null) {
-      val old = invalidated.get(shuffleId)
-      if (old != null) {
-        maybeQueueLateRetirement(shuffleId, old)
+      ShuffleRecoveryFetchFailureNotAdopted
+    } else {
+      val current = adopted.get(shuffleId)
+      if (current == null) {
+        val old = invalidated.get(shuffleId)
+        if (old != null) {
+          maybeQueueLateRetirement(shuffleId, old)
+          ShuffleRecoveryFetchFailureStale
+        } else {
+          ShuffleRecoveryFetchFailureNotAdopted
+        }
+      } else if (matchingObservedFailure(shuffleId, current).isEmpty) {
+        // A delayed fetch callback from an older local binding generation must never invalidate
+        // the currently adopted successor.
         ShuffleRecoveryFetchFailureStale
       } else {
-        ShuffleRecoveryFetchFailureNotAdopted
+        invalidateCurrent(tracker, shuffleId, current)
       }
-    } else {
-      invalidateCurrent(tracker, shuffleId, current)
     }
   }
 
@@ -354,28 +360,34 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       tracker: MapOutputTrackerMaster,
       dependency: ShuffleDependency[_, _, _],
       blockManagerId: BlockManagerId,
-      taskEpoch: Long): ShuffleRecoveryFetchFailureAction = {
+      taskEpoch: Long): ShuffleRecoveryFetchFailureAction = invalidationLock.synchronized {
     if (tracker == null || dependency == null || taskEpoch < 0L) {
-      return ShuffleRecoveryFetchFailureNotAdopted
-    }
-    val shuffleId = dependency.shuffleId
-    val current = adopted.get(shuffleId)
-    if (current == null) {
-      val old = invalidated.get(shuffleId)
-      if (old == null) {
-        ShuffleRecoveryFetchFailureNotAdopted
-      } else {
-        maybeQueueLateRetirement(shuffleId, old)
-        if (blockManagerId == old.recoveredLocation || taskEpoch <= old.invalidatedAtEpoch) {
-          ShuffleRecoveryFetchFailureStale
-        } else {
-          ShuffleRecoveryFetchFailureNotAdopted
-        }
-      }
-    } else if (current.dependency ne dependency) {
       ShuffleRecoveryFetchFailureNotAdopted
     } else {
-      invalidateCurrent(tracker, shuffleId, current)
+      val shuffleId = dependency.shuffleId
+      val current = adopted.get(shuffleId)
+      if (current == null) {
+        val old = invalidated.get(shuffleId)
+        if (old == null) {
+          ShuffleRecoveryFetchFailureNotAdopted
+        } else {
+          maybeQueueLateRetirement(shuffleId, old)
+          if (blockManagerId == old.recoveredLocation || taskEpoch <= old.invalidatedAtEpoch) {
+            ShuffleRecoveryFetchFailureStale
+          } else {
+            ShuffleRecoveryFetchFailureNotAdopted
+          }
+        }
+      } else if (current.dependency ne dependency) {
+        ShuffleRecoveryFetchFailureNotAdopted
+      } else if (blockManagerId != current.recoveredLocation) {
+        // Synthetic recovered locations are generation-specific. A failure naming any other
+        // location belongs to an older recovery binding or ordinary execution and cannot mutate
+        // the current adopted registration.
+        ShuffleRecoveryFetchFailureStale
+      } else {
+        invalidateCurrent(tracker, shuffleId, current)
+      }
     }
   }
 
@@ -499,13 +511,13 @@ private[spark] final class ShuffleRecoverySchedulerAdoptionState(
       // the synthetic recovered location ensures Spark's later per-map unregister cannot match a
       // fresh local MapStatus. This event is stale with respect to the winning tracker state.
       resolver.clearRecoveryState(shuffleId)
-      safeRelease(current.provider, current.binding)
+      releaseAsync(current.provider, current.binding, current.releaseQueued)
       return ShuffleRecoveryFetchFailureStale
     }
 
     if (closed.get()) {
       resolver.clearRecoveryState(shuffleId)
-      safeRelease(current.provider, current.binding)
+      releaseAsync(current.provider, current.binding, current.releaseQueued)
       return ShuffleRecoveryFetchFailureStale
     }
 
