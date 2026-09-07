@@ -165,7 +165,8 @@ private[spark] class ShuffleMapStage(
       // submitMissingTasks evaluates isStaticallyIndeterminate before asking for this sequence.
       // Once it reaches this all-missing selection, the conservative rollback decision has been
       // preserved and the fresh stage handoff is committed. Later failures of the recomputed
-      // ordinary shuffle must use normal Spark retry semantics, so clear only the stage-local latch.
+      // ordinary shuffle must use normal Spark retry semantics, so clear only the stage-local
+      // latch.
       if (recoveryWholeStageRetryRequired && missing.size == numPartitions) {
         recoveryWholeStageRetryRequired = false
       }
