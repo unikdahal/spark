@@ -82,6 +82,17 @@ private[spark] class ShuffleMapStage(
    */
   private[this] val pipelinedCompletedPartitions = new HashSet[Int]
 
+  /**
+   * Event-loop-local latch for an adopted shuffle's one required conservative rollback.
+   *
+   * The recovery state owns the cross-thread invalidation fence and offers a one-shot marker after
+   * it has atomically cleared the complete adopted tracker status. A general scheduler query must
+   * not be able to consume that marker and make a later FetchFailed miss the rollback. Once this
+   * stage observes the marker, retain it locally until findMissingPartitions selects the complete
+   * all-map fresh retry. Calls to isStaticallyIndeterminate in between are therefore idempotent.
+   */
+  private[this] var recoveryWholeStageRetryRequired = false
+
   /** Record a successful map task's partition as completed (pipelined stages only). */
   private[scheduler] def addPipelinedCompletedPartition(partitionId: Int): Unit = {
     pipelinedCompletedPartitions += partitionId
@@ -147,18 +158,38 @@ private[spark] class ShuffleMapStage(
         mapOutputTrackerMaster,
         shuffleDep,
         numPartitions)
-      mapOutputTrackerMaster
+      val missing = mapOutputTrackerMaster
         .findMissingPartitions(shuffleDep.shuffleId)
         .getOrElse(0 until numPartitions)
+
+      // submitMissingTasks evaluates isStaticallyIndeterminate before asking for this sequence.
+      // Once it reaches this all-missing selection, the conservative rollback decision has been
+      // preserved and the fresh stage handoff is committed. Later failures of the recomputed
+      // ordinary shuffle must use normal Spark retry semantics, so clear only the stage-local
+      // latch.
+      if (recoveryWholeStageRetryRequired && missing.size == numPartitions) {
+        recoveryWholeStageRetryRequired = false
+      }
+      missing
     }
   }
 
   /**
-   * Whether the stage is statically declared as indeterminate based on the RDD's
-   * outputDeterministicLevel property. This is known at RDD creation time.
+   * Whether the stage needs the scheduler's conservative whole-stage rollback path.
+   *
+   * Normally this is a static RDD property. An adopted shuffle adds one deliberately narrow case:
+   * after the complete recovered registration has already been invalidated, the next FetchFailed
+   * must use the same existing rollback machinery so succeeding active consumers cannot retain
+   * state derived from the old binding. Capture the recovery state's one-shot marker into a local
+   * latch so unrelated scheduler queries cannot consume it before that rollback decision.
    */
   def isStaticallyIndeterminate: Boolean = {
-    rdd.outputDeterministicLevel == DeterministicLevel.INDETERMINATE
+    if (!recoveryWholeStageRetryRequired) {
+      recoveryWholeStageRetryRequired =
+        ShuffleRecoverySchedulerAdoption.consumeWholeStageRetryRequirement(shuffleDep.shuffleId)
+    }
+    rdd.outputDeterministicLevel == DeterministicLevel.INDETERMINATE ||
+      recoveryWholeStageRetryRequired
   }
 
   /**

@@ -132,6 +132,55 @@ private[spark] final class ReferenceShuffleRecoveryClaimProvider(
     active.provider.openMap(mapIndex)
   }
 
+  /**
+   * Opens one map for an adopted fetch and classifies failure using the exact validated snapshot.
+   *
+   * This method runs on the shuffle-read path, never on the scheduler event loop. A generic I/O
+   * failure is deliberately classified as unavailable unless a fresh examination proves that the
+   * immutable winner, data, or exact index is missing or has changed.
+   */
+  private[shuffle] def openBoundMapForFetch(
+      binding: ShuffleRecoveryBinding,
+      mapIndex: Int,
+      expected: ShuffleRecoveryPreparedMap): ShuffleRecoveryBoundMapReadResult = {
+    ShuffleRecoveryExternalCallGuard.assertAllowed("shuffle recovery adopted map fetch")
+    if (binding == null || expected == null || mapIndex < 0 || expected.mapIndex != mapIndex) {
+      return ShuffleRecoveryBoundMapFailed(ShuffleRecoveryAdoptedUnavailable)
+    }
+    val active = activeBindings.get(binding.bindingId)
+    if (active == null || active.binding != binding) {
+      return ShuffleRecoveryBoundMapFailed(ShuffleRecoveryAdoptedUnavailable)
+    }
+
+    validateRuntimeArtifact(active.provider, expected) match {
+      case Some(failureClass) => return ShuffleRecoveryBoundMapFailed(failureClass)
+      case None =>
+    }
+
+    val resolved = try {
+      active.provider.openMap(mapIndex)
+    } catch {
+      case _: AccessDeniedException =>
+        return ShuffleRecoveryBoundMapFailed(ShuffleRecoveryAdoptedUnavailable)
+      case _: NoSuchFileException =>
+        return ShuffleRecoveryBoundMapFailed(ShuffleRecoveryAdoptedMissing)
+      case _: IOException =>
+        val failureClass = validateRuntimeArtifact(active.provider, expected)
+          .getOrElse(ShuffleRecoveryAdoptedUnavailable)
+        return ShuffleRecoveryBoundMapFailed(failureClass)
+      case NonFatal(_) =>
+        return ShuffleRecoveryBoundMapFailed(ShuffleRecoveryAdoptedUnavailable)
+    }
+
+    if (resolved.numReducers <= 0 ||
+        resolved.dataLength != expected.dataLength ||
+        resolved.indexBytes != expected.indexLength) {
+      ShuffleRecoveryBoundMapFailed(ShuffleRecoveryAdoptedCorrupt)
+    } else {
+      ShuffleRecoveryBoundMapOpened(resolved)
+    }
+  }
+
   private def openExistingProvider(
       request: ShuffleRecoveryClaimRequest):
       Either[ShuffleRecoveryClaimResult, ReferenceShuffleProvider] = {
@@ -214,6 +263,64 @@ private[spark] final class ReferenceShuffleRecoveryClaimProvider(
       }
     }
     if (unavailable) ShuffleRecoveryClaimUnavailable else ShuffleRecoveryClaimCorrupt
+  }
+
+  private def validateRuntimeArtifact(
+      provider: ReferenceShuffleProvider,
+      expected: ShuffleRecoveryPreparedMap):
+      Option[ShuffleRecoveryAdoptedReadFailureClass] = {
+    val mapDirectory = provider.committedMapDirectory(expected.mapIndex)
+    val winner = mapDirectory.resolveSibling(s"map-${expected.mapIndex}.winner")
+    val ready = mapDirectory.resolve(ReferenceShuffleProvider.ReadyFileName)
+    val data = mapDirectory.resolve(ReferenceShuffleProvider.DataFileName)
+    val index = mapDirectory.resolve(ReferenceShuffleProvider.IndexFileName)
+
+    runtimePathFailure(mapDirectory, expectDirectory = true) match {
+      case Some(failureClass) => return Some(failureClass)
+      case None =>
+    }
+    Seq(winner, ready, data, index).foreach { path =>
+      runtimePathFailure(path, expectDirectory = false) match {
+        case Some(failureClass) => return Some(failureClass)
+        case None =>
+      }
+    }
+
+    try {
+      val winnerSize = Files.size(winner)
+      if (winnerSize <= 0L || winnerSize > MaxWinnerHandleBytes) {
+        return Some(ShuffleRecoveryAdoptedCorrupt)
+      }
+      val winnerHandle = new String(Files.readAllBytes(winner), StandardCharsets.UTF_8).trim
+      if (winnerHandle != expected.providerHandle ||
+          Files.size(data) != expected.dataLength ||
+          Files.size(index) != expected.indexLength ||
+          Files.size(ready) != 1L) {
+        return Some(ShuffleRecoveryAdoptedCorrupt)
+      }
+      val digest = toHex(digestExactIndex(index, expected.indexLength))
+      if (digest != expected.exactIndexDigest) {
+        Some(ShuffleRecoveryAdoptedCorrupt)
+      } else {
+        None
+      }
+    } catch {
+      case _: NoSuchFileException => Some(ShuffleRecoveryAdoptedMissing)
+      case _: AccessDeniedException => Some(ShuffleRecoveryAdoptedUnavailable)
+      case _: IOException => Some(ShuffleRecoveryAdoptedUnavailable)
+      case NonFatal(_) => Some(ShuffleRecoveryAdoptedUnavailable)
+    }
+  }
+
+  private def runtimePathFailure(
+      path: Path,
+      expectDirectory: Boolean): Option[ShuffleRecoveryAdoptedReadFailureClass] = {
+    validateExistingPath(path, expectDirectory) match {
+      case Some(ShuffleRecoveryClaimMissing) => Some(ShuffleRecoveryAdoptedMissing)
+      case Some(ShuffleRecoveryClaimCorrupt) => Some(ShuffleRecoveryAdoptedCorrupt)
+      case Some(_) => Some(ShuffleRecoveryAdoptedUnavailable)
+      case None => None
+    }
   }
 
   private def validateRequest(request: ShuffleRecoveryClaimRequest): Option[String] = {
@@ -377,6 +484,14 @@ private[spark] final class ReferenceShuffleRecoveryClaimProvider(
       in.close()
     }
     digest.digest()
+  }
+
+  private def toHex(bytes: Array[Byte]): String = {
+    val builder = new StringBuilder(bytes.length * 2)
+    bytes.foreach { value =>
+      builder.append(f"${value & 0xff}%02x")
+    }
+    builder.result()
   }
 }
 

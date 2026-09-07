@@ -20,9 +20,10 @@ package org.apache.spark.shuffle
 import java.io.IOException
 import java.nio.ByteBuffer
 import java.util.concurrent.{ConcurrentHashMap, ConcurrentMap}
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.{AtomicBoolean, AtomicLong}
 
-import org.apache.spark.{ShuffleRecoverySchedulerAdoptionState, SparkConf}
+import org.apache.spark.{MapOutputTrackerMaster, ShuffleRecoverySchedulerAdoptionState, SparkConf}
+import org.apache.spark.SparkEnv
 import org.apache.spark.network.buffer.{ManagedBuffer, NioManagedBuffer}
 import org.apache.spark.storage.{BlockId, ShuffleBlockBatchId, ShuffleBlockId}
 import org.apache.spark.util.collection.OpenHashSet
@@ -50,7 +51,11 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       val provider: ReferenceShuffleRecoveryClaimProvider,
       val binding: ShuffleRecoveryBinding,
       val mapperCount: Int,
-      val reducerCount: Int)
+      val reducerCount: Int,
+      val localBindingGeneration: Long,
+      val maps: Vector[ShuffleRecoveryPreparedMap]) {
+    val usable = new AtomicBoolean(true)
+  }
 
   private final class RecoveredReadCounters {
     val blockReads = new AtomicLong(0L)
@@ -61,6 +66,8 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
 
   private val recoveredBindings = new ConcurrentHashMap[Int, RecoveredReadBinding]()
   private val recoveredReadCounters = new ConcurrentHashMap[Int, RecoveredReadCounters]()
+  private val observedFailures =
+    new ConcurrentHashMap[Int, ShuffleRecoveryObservedFetchFailure]()
 
   private[spark] val schedulerAdoption = new ShuffleRecoverySchedulerAdoptionState(this)
 
@@ -69,22 +76,52 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       provider: ReferenceShuffleRecoveryClaimProvider,
       binding: ShuffleRecoveryBinding,
       mapperCount: Int,
-      reducerCount: Int): Boolean = {
-    if (targetShuffleId < 0 || provider == null || binding == null ||
-        binding.targetShuffleId != targetShuffleId || mapperCount < 0 || reducerCount <= 0) {
+      reducerCount: Int,
+      localBindingGeneration: Long,
+      maps: Vector[ShuffleRecoveryPreparedMap]): Boolean = {
+    if (targetShuffleId < 0 || provider == null || binding == null || maps == null ||
+        binding.targetShuffleId != targetShuffleId || mapperCount < 0 || reducerCount <= 0 ||
+        localBindingGeneration <= 0L || maps.size != mapperCount ||
+        maps.indices.exists(index => maps(index) == null || maps(index).mapIndex != index)) {
       false
     } else {
-      val candidate = new RecoveredReadBinding(provider, binding, mapperCount, reducerCount)
+      val candidate = new RecoveredReadBinding(
+        provider,
+        binding,
+        mapperCount,
+        reducerCount,
+        localBindingGeneration,
+        maps)
       val existing = recoveredBindings.putIfAbsent(targetShuffleId, candidate)
       val installed = existing == null ||
         ((existing.provider eq provider) &&
           existing.binding == binding &&
           existing.mapperCount == mapperCount &&
-          existing.reducerCount == reducerCount)
+          existing.reducerCount == reducerCount &&
+          existing.localBindingGeneration == localBindingGeneration)
       if (installed) {
+        observedFailures.remove(targetShuffleId)
         recoveredReadCounters.putIfAbsent(targetShuffleId, new RecoveredReadCounters)
       }
       installed
+    }
+  }
+
+  private[spark] def invalidateRecoveredBinding(
+      targetShuffleId: Int,
+      binding: ShuffleRecoveryBinding,
+      localBindingGeneration: Long): Boolean = {
+    if (binding == null || localBindingGeneration <= 0L) {
+      false
+    } else {
+      val existing = recoveredBindings.get(targetShuffleId)
+      if (existing != null && existing.binding == binding &&
+          existing.localBindingGeneration == localBindingGeneration) {
+        existing.usable.set(false)
+        recoveredBindings.remove(targetShuffleId, existing)
+      } else {
+        false
+      }
     }
   }
 
@@ -95,13 +132,62 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       val existing = recoveredBindings.get(targetShuffleId)
       if (existing != null && existing.binding == binding &&
           recoveredBindings.remove(targetShuffleId, existing)) {
+        existing.usable.set(false)
         recoveredReadCounters.remove(targetShuffleId)
+        observedFailures.remove(targetShuffleId)
       }
     }
   }
 
+  private[spark] def observedFetchFailure(
+      targetShuffleId: Int): Option[ShuffleRecoveryObservedFetchFailure] =
+    Option(observedFailures.get(targetShuffleId))
+
+  /**
+   * Accepts one already-classified provider callback and applies the same generation/binding fence
+   * used by the synchronous read path. This narrow package-private seam is also used by
+   * deterministic race tests; a delayed callback cannot gain authority over a newer binding because
+   * scheduler invalidation revalidates both the local generation and binding id before mutating
+   * state.
+   */
+  private[shuffle] def recordObservedFailure(
+      targetShuffleId: Int,
+      observed: ShuffleRecoveryObservedFetchFailure): Unit = {
+    if (targetShuffleId < 0 || observed == null || observed.localBindingGeneration <= 0L ||
+        observed.bindingId == null) {
+      return
+    }
+    observedFailures.compute(targetShuffleId, (_, previous) => {
+      if (previous == null ||
+          observed.localBindingGeneration > previous.localBindingGeneration ||
+          (observed.localBindingGeneration == previous.localBindingGeneration &&
+            previous.bindingId == observed.bindingId &&
+            !previous.failureClass.authorizesRetirement &&
+            observed.failureClass.authorizesRetirement)) {
+        observed
+      } else {
+        previous
+      }
+    })
+
+    Option(SparkEnv.get).foreach { env =>
+      env.mapOutputTracker match {
+        case tracker: MapOutputTrackerMaster =>
+          schedulerAdoption.invalidateObservedFetchFailure(tracker, targetShuffleId)
+        case _ =>
+      }
+    }
+  }
+
+  private[spark] def clearRecoveryState(targetShuffleId: Int): Unit = {
+    observedFailures.remove(targetShuffleId)
+    recoveredReadCounters.remove(targetShuffleId)
+  }
+
   private[spark] def isRecovered(targetShuffleId: Int): Boolean =
     recoveredBindings.containsKey(targetShuffleId)
+
+  private[spark] def recoveredBindingCount: Int = recoveredBindings.size()
 
   private[spark] def recoveredReadMetrics(targetShuffleId: Int): ShuffleRecoveryReadMetrics = {
     val counters = recoveredReadCounters.get(targetShuffleId)
@@ -132,29 +218,7 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
         if (recovered == null) {
           super.getBlockData(blockId, dirs)
         } else {
-          if (id.mapId < 0L || id.mapId > Int.MaxValue.toLong) {
-            throw new IOException("recovered shuffle map id is outside the supported range")
-          }
-          val mapIndex = id.mapId.toInt
-          if (mapIndex >= recovered.mapperCount ||
-              id.reduceId < 0 || id.reduceId >= recovered.reducerCount) {
-            throw new IOException("recovered shuffle block coordinates are outside the binding")
-          }
-          val resolved = recovered.provider.openBoundMap(recovered.binding, mapIndex)
-          val metadata = resolved.blockMetadata(id.reduceId)
-          val counters = recoveredReadCounters.get(id.shuffleId)
-          if (counters != null) {
-            counters.blockReads.incrementAndGet()
-            if (metadata.isEmpty) {
-              counters.emptyBlockReads.incrementAndGet()
-            } else {
-              counters.nonEmptyBlockReads.incrementAndGet()
-              counters.bytesRead.addAndGet(metadata.length)
-            }
-          }
-          resolved.getBlockData(id.reduceId).getOrElse {
-            new NioManagedBuffer(ByteBuffer.allocate(0))
-          }
+          readRecoveredBlock(id, recovered)
         }
 
       case batch: ShuffleBlockBatchId if recoveredBindings.containsKey(batch.shuffleId) =>
@@ -165,5 +229,90 @@ private[spark] final class ShuffleRecoveryIndexShuffleBlockResolver(
       case _ =>
         super.getBlockData(blockId, dirs)
     }
+  }
+
+  private def readRecoveredBlock(
+      id: ShuffleBlockId,
+      recovered: RecoveredReadBinding): ManagedBuffer = {
+    if (!recovered.usable.get()) {
+      recordFailure(id, recovered, ShuffleRecoveryAdoptedUnavailable)
+      throw new IOException("recovered shuffle binding was invalidated before fetch")
+    }
+    if (id.mapId < 0L || id.mapId > Int.MaxValue.toLong) {
+      recordFailure(id, recovered, ShuffleRecoveryAdoptedUnavailable)
+      throw new IOException("recovered shuffle map id is outside the supported range")
+    }
+    val mapIndex = id.mapId.toInt
+    if (mapIndex >= recovered.mapperCount ||
+        id.reduceId < 0 || id.reduceId >= recovered.reducerCount) {
+      recordFailure(id, recovered, ShuffleRecoveryAdoptedUnavailable)
+      throw new IOException("recovered shuffle block coordinates are outside the binding")
+    }
+
+    val resolved = recovered.provider.openBoundMapForFetch(
+      recovered.binding, mapIndex, recovered.maps(mapIndex)) match {
+      case ShuffleRecoveryBoundMapOpened(value) => value
+      case ShuffleRecoveryBoundMapFailed(failureClass) =>
+        recordFailure(id, recovered, failureClass)
+        throw new IOException(s"adopted shuffle provider read failed: $failureClass")
+    }
+    if (resolved.numReducers != recovered.reducerCount) {
+      recordFailure(id, recovered, ShuffleRecoveryAdoptedCorrupt)
+      throw new IOException("adopted shuffle reducer shape changed after validation")
+    }
+
+    val metadata = try {
+      resolved.blockMetadata(id.reduceId)
+    } catch {
+      case _: IllegalArgumentException =>
+        recordFailure(id, recovered, ShuffleRecoveryAdoptedCorrupt)
+        throw new IOException("adopted shuffle block metadata is corrupt")
+    }
+    if (metadata.offset < 0L || metadata.length < 0L ||
+        metadata.offset > resolved.dataLength ||
+        metadata.length > resolved.dataLength - metadata.offset) {
+      recordFailure(id, recovered, ShuffleRecoveryAdoptedCorrupt)
+      throw new IOException("adopted shuffle block range is corrupt")
+    }
+
+    // Invalidation wins over a read that started earlier. A task that already received a buffer is
+    // fenced at scheduler completion; one still inside this resolver is prevented from receiving A.
+    if (!recovered.usable.get()) {
+      recordFailure(id, recovered, ShuffleRecoveryAdoptedUnavailable)
+      throw new IOException("recovered shuffle binding was invalidated during fetch")
+    }
+
+    val counters = recoveredReadCounters.get(id.shuffleId)
+    if (counters != null) {
+      counters.blockReads.incrementAndGet()
+      if (metadata.isEmpty) {
+        counters.emptyBlockReads.incrementAndGet()
+      } else {
+        counters.nonEmptyBlockReads.incrementAndGet()
+        counters.bytesRead.addAndGet(metadata.length)
+      }
+    }
+    resolved.getBlockData(id.reduceId).getOrElse {
+      new NioManagedBuffer(ByteBuffer.allocate(0))
+    }
+  }
+
+  private def recordFailure(
+      id: ShuffleBlockId,
+      recovered: RecoveredReadBinding,
+      failureClass: ShuffleRecoveryAdoptedReadFailureClass): Unit = {
+    val mapIndex = if (id.mapId >= 0L && id.mapId <= Int.MaxValue.toLong) {
+      id.mapId.toInt
+    } else {
+      -1
+    }
+    recordObservedFailure(
+      id.shuffleId,
+      ShuffleRecoveryObservedFetchFailure(
+        recovered.localBindingGeneration,
+        recovered.binding.bindingId,
+        mapIndex,
+        id.reduceId,
+        failureClass))
   }
 }

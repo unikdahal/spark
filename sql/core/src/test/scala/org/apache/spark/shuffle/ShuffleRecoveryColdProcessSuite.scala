@@ -60,6 +60,13 @@ class ShuffleRecoveryColdProcessSuite extends SparkFunSuite {
     }
   }
 
+  test("cold independent JVMs fully recompute failed adoption and heal with successor") {
+    val evidenceBase = sys.env.get("SPARK_SHUFFLE_RECOVERY_COLD_PROCESS_EVIDENCE_DIR")
+      .map(Paths.get(_))
+      .getOrElse(Files.createTempDirectory("shuffle-recovery-cold-evidence-"))
+    ShuffleRecoveryAdoptedFailureColdProcessProof.run(TestedCommit, evidenceBase)
+  }
+
   private def runHappy(
       root: Path,
       evidenceRun: Path,
