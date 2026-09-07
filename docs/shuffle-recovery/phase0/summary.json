@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "phase": "0",
+  "decision": "MECHANISM_FEASIBLE_VALUE_GATE_NOT_MET",
+  "frozenBaseline": "2a7cfea06ba135cf0ddc62902eb0daf5a835c672",
+  "integrationStartHead": "b7179691629718a35d7db322396aa910a60efb03",
+  "finalCandidateHead": "PENDING_FINAL_GATE",
+  "opportunity": {
+    "corpus": "spark-in-tree-tpc-evidence-v2",
+    "syntheticSupplement": "spark-controlled-synthetic-evidence-v1",
+    "failureDistribution": "equal-four-points-v2",
+    "actionsRunId": 33963836467,
+    "artifactId": 9969032965,
+    "artifactDigest": "sha256:15bb5b3c2ebfbfa565c95163c9a2644cd9a147971f39c62d23583a84f6090013",
+    "sqlExecutions": 108,
+    "observedExchanges": 1082,
+    "materiallyCompletedStages": 763,
+    "correlatedStages": 757,
+    "unweightedObservations": 18,
+    "excludedReusedObservations": 307,
+    "completedTaskTimeCorrelationCoveragePct": 99.6,
+    "correlationQualityThresholdPct": 95.0,
+    "correlationQualityResult": "PASS",
+    "exactSourceEligibleCountPct": 35.6,
+    "exactSourceEligibleBytesPct": 39.5,
+    "exactSourceEligibleCompletedTaskTimePct": 19.4,
+    "preregisteredValueThresholdPct": 20.0,
+    "formalValueGateResult": "N/A",
+    "failureDistributionProjectionPct": 36.8,
+    "gateExplanation": "The preregistered report refuses PASS/FAIL while 18 gate-rule observations remain explicitly unweighted; the correlated exact-source estimate is 19.4%, below the 20% target, and no revised target was preregistered before observing the data."
+  },
+  "mechanism": {
+    "latestPreFreezeActionsRunId": 34070755581,
+    "actionsRunConclusion": "success",
+    "actionsHeadSha": "62eebca9513704c36a5b883c9c5aa943ac031385",
+    "coldProcessArtifactId": 10000661195,
+    "coldProcessArtifactDigest": "sha256:85a0a7ed05794cd85f709d322f99c94908f18f92774310f7c89aa8d43366ba78",
+    "referenceProviderArtifactId": 10000519422,
+    "referenceProviderArtifactDigest": "sha256:a60e11081d1af4f6421501de4bc34b39585b0766be224dd15fab2a29369db5b0",
+    "historicalTestedCommitLabel": "pull_request_event_GITHUB_SHA_not_checked_out_head",
+    "coldScenarios": [
+      {"scenario":"sparse","mapTasks":0,"providerReads":30,"providerBytes":1152,"emptyBlocks":226,"nonEmptyBlocks":30,"adopted":true},
+      {"scenario":"empty","mapTasks":0,"providerReads":0,"providerBytes":0,"emptyBlocks":8,"nonEmptyBlocks":0,"adopted":true},
+      {"scenario":"adjacent","mapTasks":0,"providerReads":2,"providerBytes":72,"emptyBlocks":14,"nonEmptyBlocks":2,"adopted":true},
+      {"scenario":"skewed","mapTasks":0,"providerReads":13,"providerBytes":200000,"emptyBlocks":51,"nonEmptyBlocks":13,"adopted":true},
+      {"scenario":"small","mapTasks":0,"providerReads":1,"providerBytes":36,"emptyBlocks":3,"nonEmptyBlocks":1,"adopted":true},
+      {"scenario":"large","mapTasks":0,"providerReads":4,"providerBytes":9438048,"emptyBlocks":4,"nonEmptyBlocks":4,"adopted":true},
+      {"scenario":"wide","mapTasks":0,"providerReads":424,"providerBytes":31200,"emptyBlocks":347,"nonEmptyBlocks":424,"adopted":true}
+    ],
+    "negativeControls": ["disabled","group-diff","generation-not-later","source-token","provider-compat","manifest-absent","digest-collision","artifact-missing","claim-unavailable","reservation-stale"],
+    "healing": {
+      "producerGeneration": 1,
+      "producerMapperCount": 4,
+      "failureRetiredA": true,
+      "failureFreshMapTaskCount": 8,
+      "failureMapPartitions": [0,1,2,3],
+      "publishedSuccessorGeneration": 2,
+      "laterAdopted": true,
+      "laterMapTaskCount": 0,
+      "resultDigest": "cab933c34e91d8996e117e0086994011b009680dc1df45779ecce63507842c01"
+    }
+  },
+  "representation": {
+    "referenceProviderIndex": {
+      "withChecksumsBytesPerMap": "40 + 16R",
+      "complexity": "O(M*R)",
+      "examples": [
+        {"maps":0,"reducers":1,"totalIndexBytes":0,"bytesReadPerMapOpen":0},
+        {"maps":1,"reducers":1,"totalIndexBytes":56,"bytesReadPerMapOpen":56},
+        {"maps":4,"reducers":128,"totalIndexBytes":8352,"bytesReadPerMapOpen":2088},
+        {"maps":2,"reducers":4096,"totalIndexBytes":131152,"bytesReadPerMapOpen":65576}
+      ]
+    },
+    "manifest": {
+      "maxEncodedBytes": 4194304,
+      "shape": "O(M+R) descriptors plus optional reducer aggregates"
+    },
+    "replacementDriverLengthVectors": {
+      "rawLongPayloadBytes": "8*M*R",
+      "complexity": "O(M*R)",
+      "excludes": "JVM array/object and retained MapStatus implementation overhead"
+    },
+    "schedulerInstall": "M local addMapOutput operations, one resolver binding install, one tracker CAS, one epoch increment; external reads happen before scheduler consumption"
+  },
+  "history": {
+    "preReportRevListCount": 12,
+    "sequentialImplementationIssuesBeforeReport": 8,
+    "expectedSequentialCountAfterReport": 9,
+    "literalTotalHistoryTargetSatisfied": false,
+    "reason": "Previously merged evidence/audit/scheduler follow-up squash commits remain in the integration lineage. This report does not destructively rewrite exact-head evidence history."
+  },
+  "finalGate": {
+    "actionsRunId": null,
+    "conclusion": "PENDING",
+    "headSha": "PENDING_FINAL_GATE",
+    "artifactIds": []
+  }
+}
