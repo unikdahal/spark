@@ -1,0 +1,313 @@
+{
+  "schemaVersion": 2,
+  "specId": "shuffle-recovery-value-experiment-v2",
+  "supersedes": {
+    "specId": "shuffle-recovery-value-experiment-v1",
+    "document": "value-experiment-v1.md",
+    "machineContract": "value-experiment-v1.json",
+    "reason": "Prospective repair of arm-dependent publication failure landmarks before any primary restart or overhead measurements."
+  },
+  "workloadScopeDocument": "workload-scope-v1.md",
+  "costModelDocument": "cost-model-v1.md",
+  "lineage": {
+    "upstreamBaseline": "2a7cfea06ba135cf0ddc62902eb0daf5a835c672",
+    "v1ExperimentalBase": "5f773c4669d06af57216b09748ec7d168412ad3c",
+    "v2IntegrationBase": "f907fd51066407ec3f599b846485b4ad027df7c1",
+    "frozenPhase0Evidence": "7888d1e26d32e69694083e367ee6a92b28277c48"
+  },
+  "measurementHistory": {
+    "primaryRestartMeasurementsObservedBeforeV2": false,
+    "primaryOverheadMeasurementsObservedBeforeV2": false,
+    "realSourceProviderValueCampaignExecutedBeforeV2": false,
+    "newBenchmarkRunForV2Revision": false,
+    "historicalEvidencePreserved": true,
+    "note": "v1 remains published unchanged. Historical Phase 0 opportunity evidence is not restart-speedup evidence and does not select v2 injection offsets."
+  },
+  "provenance": {
+    "profileKind": "explicit-scenario",
+    "realTraceWeights": false,
+    "datasetGeneratorVersion": "decision-support-generator-v1",
+    "historicalPilotActionsRun": 33963836467,
+    "historicalPilotArtifactId": 9969032965,
+    "historicalPilotArtifactSha256": "15bb5b3c2ebfbfa565c95163c9a2644cd9a147971f39c62d23583a84f6090013",
+    "historicalPilotUse": "context only; it does not select v2 primary injection offsets or contribute to restart, overhead, confidence, or economics results"
+  },
+  "targetDeployment": {
+    "orchestrator": "Kubernetes batch application relaunch",
+    "source": "Apache Iceberg tables pinned to explicit snapshot ids",
+    "shuffleProvider": "Apache Celeborn real durable remote-shuffle candidate",
+    "driver": {"vCpu": 4, "memoryGiB": 16},
+    "executors": {"count": 32, "vCpuEach": 8, "memoryGiBEach": 32},
+    "networkGbpsPerWorker": 10,
+    "factInputScaleGiB": [16, 64, 256, 512],
+    "nominalFactInputGiB": 256,
+    "dimensionSnapshotGiB": 8,
+    "dimensionRows": 16777216,
+    "dimensionStoragePaddingBytesPerRow": 512,
+    "inputSizeToleranceFraction": 0.02,
+    "artifactRetentionHours": 2,
+    "conditionalDriverFailureRate": 0.01,
+    "primaryQueryAttemptsPerHour": 20
+  },
+  "producerGrammar": {
+    "maxAdoptedExchangesPerQuery": 1,
+    "allowed": [
+      "certified immutable snapshot scan",
+      "optional reviewed deterministic projection",
+      "optional reviewed deterministic filter",
+      "hash partitioning",
+      "single partitioning"
+    ],
+    "excludedBelowProducer": [
+      "join",
+      "partial aggregate",
+      "final aggregate",
+      "window",
+      "runtime filter",
+      "subquery",
+      "Python/UDF/native expression"
+    ],
+    "queryExcluded": [
+      "writes",
+      "streaming",
+      "incremental external result delivery",
+      "partial-map reuse",
+      "unsupported expressions",
+      "runtime-dependent scans",
+      "sampled range partitioning"
+    ]
+  },
+  "cohort": [
+    {"id": "W01", "weight": 0.20, "shape": "scan/filter/project -> hash exchange -> tenant-partitioned Window -> small result reduction"},
+    {"id": "W02", "weight": 0.15, "shape": "scan/filter/project -> hash exchange -> dimension-partitioned Window -> small result reduction"},
+    {"id": "S01", "weight": 0.10, "shape": "selective scan/filter/project -> single-partition exchange -> global Window -> small result reduction"},
+    {"id": "J01", "weight": 0.25, "shape": "fact scan/filter/project -> hash exchange -> sort-merge join -> global aggregate"},
+    {"id": "J02", "weight": 0.20, "shape": "fact scan/filter/project -> hash exchange -> sort-merge join -> later fresh aggregate shuffle"},
+    {"id": "E01", "weight": 0.10, "shape": "sparse scan/filter/project -> hash exchange -> Window, stressing empty blocks"}
+  ],
+  "primaryInputScales": [
+    {"id": "I16", "weight": 0.25, "factGiB": 16, "mapperMin": 96, "mapperMax": 160, "hashReducers": 200, "singleReducers": 1},
+    {"id": "I64", "weight": 0.25, "factGiB": 64, "mapperMin": 384, "mapperMax": 640, "hashReducers": 200, "singleReducers": 1},
+    {"id": "I256", "weight": 0.25, "factGiB": 256, "mapperMin": 1536, "mapperMax": 2560, "hashReducers": 200, "singleReducers": 1},
+    {"id": "I512", "weight": 0.25, "factGiB": 512, "mapperMin": 3072, "mapperMax": 5120, "hashReducers": 200, "singleReducers": 1}
+  ],
+  "primaryPlanPolicy": {
+    "aqe": "tested Spark default; do not override in primary campaign",
+    "shufflePartitions": "tested Spark default of 200; do not override in primary campaign",
+    "broadcastThresholds": "tested Spark defaults; do not override in primary campaign",
+    "forcedPlanSettings": "mechanism-only and excluded from primary aggregate gates"
+  },
+  "mechanismOnlyShapes": [
+    {"maps": 8192, "reducers": 1024},
+    {"maps": 4096, "reducers": 2048}
+  ],
+  "failureSchedule": {
+    "selectionPrinciple": "Primary failure intervention is a fixed elapsed-time offset from controller query start. Offsets are derived only from independent failure-free ordinary runs with recovery disabled and are then frozen before any primary restart timing.",
+    "requiredFrozenArtifact": "primary-failure-schedule-v2.json",
+    "requiredFrozenArtifactRowCount": 24,
+    "artifactMustExistBeforePrimaryTiming": true,
+    "calibrationArm": "integrated candidate with recovery disabled",
+    "calibrationFailureInjection": false,
+    "calibrationRunsPerWorkloadScale": 5,
+    "calibrationCellCount": 24,
+    "calibrationAttemptCount": 120,
+    "calibrationExecutionOrder": "deterministically shuffled across workload/input-scale cells",
+    "calibrationRandomizationSeed": 557001,
+    "calibrationUsesRestartTiming": false,
+    "requiredOrdinaryObservables": [
+      "target producer ShuffleMapStage completion elapsed from controller query start",
+      "correct result verification elapsed from controller query start"
+    ],
+    "diagnosticOrdinaryObservables": [
+      "material downstream stage completion elapsed times from controller query start when present",
+      "material downstream stage submission elapsed times from controller query start when present"
+    ],
+    "offsetRounding": "nearest integer millisecond, ties to even",
+    "failurePoints": [
+      {"id": "F0", "weight": 0.25, "name": "pre-producer-elapsed", "offsetFormula": "0.5 * P, where P is median(target producer completion elapsed ms)", "intent": "represent an early failure that can occur before any reusable producer output exists"},
+      {"id": "F1", "weight": 0.30, "name": "producer-boundary-elapsed", "offsetFormula": "P", "intent": "sample the producer/publication race without waiting for publication"},
+      {"id": "F2", "weight": 0.30, "name": "post-producer-middle-elapsed", "offsetFormula": "P + 0.50 * (Q - P), where Q is median(correct result verification elapsed ms)", "intent": "sample the middle of the independently observed ordinary post-producer tail"},
+      {"id": "F3", "weight": 0.15, "name": "post-producer-late-elapsed", "offsetFormula": "P + 0.85 * (Q - P)", "intent": "sample a late ordinary elapsed point while remaining strictly before the calibration median result boundary"}
+    ],
+    "freezeValidityRules": [
+      "all five calibration runs for every workload/input-scale cell expose producer completion and correct-result verification",
+      "P is strictly positive and Q is strictly greater than P",
+      "the four rounded offsets are strictly positive and strictly increasing",
+      "downstream stage timestamps are diagnostic only and cannot select or move an offset",
+      "no publication, provider-visibility, reuse-success, or recovery-only event contributes to any offset"
+    ],
+    "requiredArtifactRowFields": [
+      "workloadId",
+      "inputScaleId",
+      "five calibration attempt ids",
+      "producer completion elapsed ms for every calibration attempt",
+      "correct-result verification elapsed ms for every calibration attempt",
+      "diagnostic downstream stage elapsed timestamps when present",
+      "P and Q medians",
+      "rounded F0/F1/F2/F3 offsets",
+      "controller/build/deployment/source snapshot/provider/cluster identity",
+      "complete artifact digest"
+    ],
+    "invalidCalibrationRule": "Do not start primary timing. Retain the failed dry-run evidence and create a new prospective campaign version or replace only a predeclared external harness-fault attempt with a new attempt id.",
+    "postFreezeMutationRule": "Any offset or schedule-row change after primary timing begins requires a new prospective campaign version; weights are never redistributed."
+  },
+  "controllerIntervention": {
+    "queryStart": "controller monotonic timestamp captured immediately before submitting the query action",
+    "activeQueryInjectionRule": "for both arms, if correct result has not already been verified, issue the driver-termination command when monotonic elapsed time reaches the frozen workload/input-scale/failure-point offset",
+    "completedQueryRule": "if correct result has already been verified before the frozen offset, do not terminate solely for measurement; classify CORRECT_RESULT_BEFORE_SCHEDULED_FAILURE with zero residual",
+    "waitForPublication": false,
+    "waitForSparkStageEventInPrimaryTrial": false,
+    "synchronousProviderCheckAtInjection": false,
+    "maxAbsoluteInjectionTimingErrorMs": 500,
+    "timingViolation": "HARNESS_INVALID_CONTROLLER_TIMING; retain raw record and allow replacement only with a new attempt id under the fixed harness-fault rule",
+    "sameScheduleRequiredForPair": true,
+    "sameOffsetRequiredForPair": true,
+    "noArmSpecificTranslation": true
+  },
+  "primaryTrialAccounting": {
+    "producerCompletion": "derived after the run from ordinary Spark event timestamps; it never gates injection",
+    "publicationStateAtInjection": {
+      "source": "asynchronous publication/provider audit telemetry timestamped independently of the injection path",
+      "allowedValues": [
+        "VISIBLE_BEFORE_INJECTION",
+        "NOT_VISIBLE_BEFORE_INJECTION",
+        "PUBLICATION_FAILED_BEFORE_INJECTION",
+        "PUBLICATION_STATE_UNKNOWN",
+        "RECOVERY_DISABLED_NOT_APPLICABLE"
+      ],
+      "lateOrFailedPublication": "remains a recovery miss or observed recovery outcome in the registered cohort; never drop or reschedule the trial",
+      "publicationRace": "classify by telemetry event timestamp relative to actual injection-command timestamp; do not synchronously query or wait at the failure boundary"
+    },
+    "earlyFailureBeforeProducerCompletion": "explicitly retained; recovery has no reusable output and must miss/fall back if ordinary correctness permits",
+    "naturalCorrectResultBeforeInjection": {
+      "classification": "CORRECT_RESULT_BEFORE_SCHEDULED_FAILURE",
+      "replacement": false,
+      "terminationCommandIssued": false,
+      "residualFailureToCorrectResultMs": 0,
+      "scenarioWeightRedistribution": false,
+      "reporting": "report count and registered scenario mass by arm, workload, scale, and failure point"
+    },
+    "postFailureResidualMetric": "if CORRECT_RESULT_BEFORE_SCHEDULED_FAILURE then 0, otherwise max(0, correct-result verification monotonic time - actual injection-command monotonic time)",
+    "publicationOutcomeNeverControlsCohortMembership": true
+  },
+  "mechanismControls": {
+    "publicationBoundaryControlsFromV1": [
+      {"id": "M0", "derivedFrom": "v1 F0", "rule": "producer completed while durable publication is not yet visible", "primaryScenarioWeight": 0.0},
+      {"id": "M1", "derivedFrom": "v1 F1", "rule": "durable publication visible before a downstream material stage completes", "primaryScenarioWeight": 0.0}
+    ],
+    "use": "optional mechanism diagnostics only; they may use recovery-specific hooks but cannot replace or enter the primary deployment-value failure distribution, overhead gates, or economics"
+  },
+  "resourceLimits": {
+    "manifestBytes": 4194304,
+    "driverRecoveryMetadataBytes": 33554432,
+    "providerDiscoveryBytes": 8388608,
+    "providerIndexBytes": 536870912,
+    "candidateIncarnations": 4,
+    "lookupDeadlineMs": 3000,
+    "prepareDeadlineMs": 10000,
+    "metadataPageBytes": 1048576,
+    "metadataPages": 256,
+    "concurrentProviderReads": 128,
+    "artifactBytes": 549755813888,
+    "artifactGiBHours": 1024
+  },
+  "restartTrialPolicy": {
+    "pairedRepetitionsPerCell": 12,
+    "registeredCellCount": 96,
+    "allApplicablePairCount": 1152,
+    "allApplicableTimedAttemptCount": 2304,
+    "cellDimensions": ["cohort id", "input scale", "failure point"],
+    "randomizationSeed": 557003,
+    "hardTimeoutSeconds": 1800,
+    "outlierDeletion": "none",
+    "cacheWarmth": "natural backend warmth; no manual cache flush in primary campaign",
+    "misses": "included in recovery arm",
+    "recoveryTimeoutWhenControlCorrect": "use observed control residual and score recovery residual as 1800 seconds",
+    "controlFailureWhenRecoveryCorrect": "score both residuals as 1800 seconds for zero speedup credit; retain actual recovery observation separately and count control failure against reliability",
+    "bothFail": "score both residuals as 1800 seconds for zero speedup credit and count against reliability",
+    "maxControlFailureFractionForPass": 0.01,
+    "scenarioMassPerCell": "workload weight * failure-point weight * input-scale weight",
+    "pairing": "same frozen failure schedule row, source snapshots, input scale, cluster shape, and controller semantics; six control-first and six recovery-first pairs per complete cell"
+  },
+  "restartStatistics": {
+    "aggregateMetric": "1 - weighted_sum(recovery post-failure residual ms) / weighted_sum(control post-failure residual ms)",
+    "zeroResidualRule": "correct result before scheduled injection contributes a zero residual without replacement or weight redistribution",
+    "zeroAggregateControlDenominator": "INDETERMINATE",
+    "confidence": "paired stratified bootstrap over the 12 scored pairs within every fixed workload/input-scale/failure-point cell; never resample workload identities",
+    "confidenceLevel": 0.95,
+    "bootstrapResamples": 10000,
+    "bootstrapSeed": 55003,
+    "scenarioComposition": "fixed workload weights * fixed failure-point weights * fixed 0.25 input-scale weights",
+    "iidUnit": "paired repetition within a fixed cell; never physical exchange, map, reducer, or block"
+  },
+  "overheadExperiments": [
+    {"id": "OH_DISABLED", "comparison": "recovery-disabled integrated candidate vs frozen upstream baseline on the same no-failure backend", "gateUpper95Max": 0.01, "cellDimensions": ["cohort id", "input scale"], "registeredCellCount": 24, "pairedRepetitionsPerCell": 12, "pairCount": 288, "timedAttemptCount": 576, "randomizationSeed": 557101, "bootstrapSeed": 55101},
+    {"id": "OH_ALL_MISS", "comparison": "recovery-enabled integrated candidate with naturally absent/incompatible candidates vs the same integrated candidate with recovery disabled", "gateUpper95Max": 0.05, "cellDimensions": ["cohort id", "input scale"], "registeredCellCount": 24, "pairedRepetitionsPerCell": 12, "pairCount": 288, "timedAttemptCount": 576, "randomizationSeed": 557102, "bootstrapSeed": 55102},
+    {"id": "OH_PUBLICATION", "comparison": "recovery-enabled integrated candidate with publication enabled and no injected failure vs the same integrated candidate with recovery disabled", "publicationOutcomePolicy": "retain every publication-arm timed outcome, including successful, late, failed, or state-unknown publication; publication outcome never determines pair inclusion or replacement", "gateUpper95Max": 0.05, "cellDimensions": ["cohort id", "input scale"], "registeredCellCount": 24, "pairedRepetitionsPerCell": 12, "pairCount": 288, "timedAttemptCount": 576, "randomizationSeed": 557103, "bootstrapSeed": 55103}
+  ],
+  "overheadPolicy": {
+    "failureInjection": false,
+    "totalRegisteredCellsAcrossThreeComparisons": 72,
+    "totalPairsAcrossThreeComparisons": 864,
+    "totalTimedAttemptsAcrossThreeComparisons": 1728,
+    "pairOrder": "six reference-first and six treatment-first pairs per complete cell using the comparison-specific seed",
+    "cacheWarmth": "same natural-backend-warmth policy as primary campaign",
+    "outlierDeletion": "none",
+    "hardTimeoutSeconds": 1800,
+    "nonHarnessTimeoutOrFailure": "the affected overhead comparison is INDETERMINATE; retain the raw pair and do not replace it",
+    "wrongResult": "the campaign cannot PASS; retain the raw pair and correctness evidence",
+    "harnessFaultReplacement": "only a predeclared external harness fault may be replaced, the invalid raw record remains published, and the replacement receives a new attempt id",
+    "metric": "weighted_sum(treatment no-failure runtime ms) / weighted_sum(reference no-failure runtime ms) - 1",
+    "weights": "fixed workload weight * fixed 0.25 input-scale weight",
+    "confidence": "comparison-specific paired stratified bootstrap over 12 pairs within each workload/input-scale cell with fixed scenario composition",
+    "confidenceLevel": 0.95,
+    "bootstrapResamples": 10000,
+    "upperBound": "95th percentile of the bootstrap overhead distribution",
+    "publicationComparisonInterpretation": "OH_PUBLICATION measures the cost of enabling and attempting publication. Publication success rate and any successful-publication subset are descriptive only; the <=5% gate uses every registered publication-arm outcome.",
+    "restartExperimentCountsExcluded": true
+  },
+  "gates": {
+    "restartImprovementPointEstimateMin": 0.20,
+    "restartImprovementLower95Comparison": ">",
+    "restartImprovementLower95Threshold": 0.0,
+    "disabledOverheadUpper95Max": 0.01,
+    "allMissOverheadUpper95Max": 0.05,
+    "publicationNoFailureOverheadUpper95Max": 0.05,
+    "positiveDeploymentEconomics": true,
+    "economicsLower95Comparison": ">",
+    "economicsLower95Threshold": 0.0,
+    "wrongResultAllowed": false
+  },
+  "costModel": {
+    "unit": "scenario USD",
+    "rates": {"vCpuHour": 0.04, "memoryGiBHour": 0.005, "durableStorageGiBHour": 0.00004, "incrementalProviderReadGiB": 0.01, "incrementalProviderWriteGiB": 0.01},
+    "publicationAccounting": "charge only bytes and service work introduced by recovery publication; ordinary shuffle writes are reported separately and are not double-counted",
+    "failureProbabilityUse": "the registered 1.0% query-attempt driver-failure rate is applied to the full frozen failure-opportunity distribution, including pre-producer and zero-impact completed-before-injection outcomes; no survivor-only probability is substituted",
+    "greenfield": {
+      "providerWorkers": {"count": 8, "vCpuEach": 8, "memoryGiBEach": 32},
+      "controlPlane": {"count": 3, "vCpuEach": 2, "memoryGiBEach": 4},
+      "reservedDiskGiB": 24576,
+      "operationsUsdPerHour": 1.0,
+      "fixedUsdPerHour": 6.12304,
+      "fixedUsdPerQueryAtRegisteredArrivalRate": 0.306152
+    },
+    "greenfieldDurableStorageIntroductionReportedSeparately": true,
+    "notes": "Planning assumptions only; not vendor quotes. Existing-provider and greenfield introduction economics are separate decisions."
+  },
+  "changeControl": {
+    "v1FilesRemainUnchanged": true,
+    "v2PrimaryTimingMayStartOnlyAfterFrozenFailureScheduleArtifactExists": true,
+    "materialChangesAfterPrimaryTimingRequireNewVersion": [
+      "SQL corpus or source-scale admission rules",
+      "workload, failure-point, or input-scale weights",
+      "dry-run schedule derivation rules or frozen offsets",
+      "timeout, scoring, completion-before-injection, or missing-data treatment",
+      "AQE/default-plan policy",
+      "cache-warmth or outlier policy",
+      "resource limits",
+      "confidence methods or seeds",
+      "value, overhead, or economics thresholds",
+      "scenario cost rates or greenfield footprint/arrival rate"
+    ]
+  }
+}

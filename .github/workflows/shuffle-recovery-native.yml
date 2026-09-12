@@ -1,0 +1,146 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Native shuffle recovery proof
+
+on:
+  push:
+    tags: ['shuffle-recovery-native/**']
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: native-shuffle-recovery
+  cancel-in-progress: false
+
+jobs:
+  dependencies:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - dependency: celeborn
+            seed_artifact: '10158122470'
+            seed_sha256: 7fea87e72bea23a2a46febd40907e2569132cc29d09be510bc7e17ab61e18a31
+          - dependency: iceberg
+            seed_artifact: '10156433451'
+            seed_sha256: 1f27a2e3a2cb29a9d63d7baa5e3827c3f0d1e666dda9c849324ec3728c4a0131
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v6
+        with: {persist-credentials: false}
+      - uses: actions/setup-java@v5
+        with: {distribution: zulu, java-version: 17}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: native-dependencies-${{ matrix.dependency }}-${{ runner.os }}-${{ hashFiles('dev/shuffle-recovery/celeborn-native-spike/build-dependencies.sh') }}
+          restore-keys: native-dependencies-${{ matrix.dependency }}-${{ runner.os }}-
+      - uses: actions/cache@v5
+        id: built
+        with:
+          path: |
+            ${{ runner.temp }}/deps/*.tgz
+            ${{ runner.temp }}/deps/*.jar
+            ${{ runner.temp }}/deps/*.commit
+            ${{ runner.temp }}/deps/*.sha256
+            ${{ runner.temp }}/deps/*.origin
+            ${{ runner.temp }}/deps/*.log
+          key: native-built-${{ matrix.dependency }}-${{ runner.os }}-${{ runner.arch }}-zulu17-${{ hashFiles('dev/shuffle-recovery/celeborn-native-spike/build-dependencies.sh') }}
+      - name: Bootstrap from exact previously validated dependency artifacts
+        if: steps.built.outputs.cache-hit != 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/deps/seed"
+          gh api 'repos/unikdahal/spark/actions/artifacts/${{ matrix.seed_artifact }}/zip' > "$RUNNER_TEMP/seed.zip"
+          printf '%s  %s\n' '${{ matrix.seed_sha256 }}' "$RUNNER_TEMP/seed.zip" | sha256sum -c -
+          unzip -q "$RUNNER_TEMP/seed.zip" -d "$RUNNER_TEMP/deps/seed"
+          printf '%s\n' '${{ matrix.seed_sha256 }}' > "$RUNNER_TEMP/deps/seed/.verified"
+      - name: Build pinned provider or source
+        if: steps.built.outputs.cache-hit != 'true'
+        env:
+          NATIVE_DEPENDENCY_SEED: ${{ runner.temp }}/deps/seed
+        run: bash dev/shuffle-recovery/celeborn-native-spike/build-dependencies.sh "$RUNNER_TEMP/deps" '${{ matrix.dependency }}'
+      - name: Verify source-built artifact checksum
+        run: cd "$RUNNER_TEMP/deps" && sha256sum -c '${{ matrix.dependency }}.sha256'
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-${{ matrix.dependency }}
+          path: |
+            ${{ runner.temp }}/deps/*.tgz
+            ${{ runner.temp }}/deps/*.jar
+            ${{ runner.temp }}/deps/*.commit
+            ${{ runner.temp }}/deps/*.sha256
+            ${{ runner.temp }}/deps/*.origin
+            ${{ runner.temp }}/deps/*.log
+          if-no-files-found: error
+  proof:
+    needs: dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+        with: {persist-credentials: false}
+      - uses: actions/setup-java@v5
+        with: {distribution: zulu, java-version: 17}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.sbt
+            ~/.cache/coursier
+            build/apache-maven-*
+            build/*.jar
+          key: native-spark-${{ runner.os }}-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}
+          restore-keys: shuffle-recovery-experimental-sql-${{ runner.os }}-
+      - uses: actions/cache/restore@v5
+        id: compiled
+        with:
+          path: '**/target'
+          key: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-${{ github.sha }}
+          restore-keys: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-
+      - uses: actions/download-artifact@v8
+        with: {pattern: 'native-*', path: '${{ runner.temp }}/deps', merge-multiple: true}
+      - name: Run native cold-process proof
+        run: |
+          (cd "$RUNNER_TEMP/deps" && sha256sum -c celeborn.sha256 iceberg.sha256)
+          tar -C "$RUNNER_TEMP/deps" -xzf "$RUNNER_TEMP/deps/celeborn-dist.tgz"
+          export CELEBORN_HOME="$RUNNER_TEMP/deps/dist"
+          export ICEBERG_RUNTIME_JAR="$RUNNER_TEMP/deps/iceberg-runtime.jar"
+          export CELEBORN_RUNTIME_JAR="$(find "$CELEBORN_HOME/spark" -name '*.jar' -print -quit)"
+          python3 dev/shuffle-recovery/celeborn-native-spike/services.py "$RUNNER_TEMP/native-proof"
+      - uses: actions/cache/save@v5
+        if: always() && steps.compiled.outputs.cache-hit != 'true'
+        with:
+          path: '**/target'
+          key: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-${{ github.sha }}
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-proof-evidence
+          path: |
+            ${{ runner.temp }}/native-proof
+            **/target/test-reports/*ShuffleRecovery*.xml
+          if-no-files-found: error

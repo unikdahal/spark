@@ -1,0 +1,440 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+name: Shuffle recovery experimental
+
+on:
+  pull_request:
+    branches: [spip/shuffle-recovery-experimental]
+  push:
+    branches: [spip/poc-owned-end-to-end]
+    tags:
+      - 'shuffle-recovery-ci/full/*'
+      - 'shuffle-recovery-ci/evidence/*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: shuffle-recovery-experimental-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: true
+
+env:
+  INTEGRATION_BRANCH: spip/shuffle-recovery-experimental
+
+jobs:
+  preflight:
+    name: Exact candidate and focused routing
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+      standalone_repository: ${{ steps.base.outputs.standalone_repository }}
+      candidate_sha: ${{ steps.candidate.outputs.sha }}
+      validation_mode: ${{ steps.scope.outputs.validation_mode }}
+      workflow_build: ${{ steps.scope.outputs.workflow_build }}
+      scala: ${{ steps.scope.outputs.scala }}
+      java: ${{ steps.scope.outputs.java }}
+      identity_source: ${{ steps.scope.outputs.identity_source }}
+      provider: ${{ steps.scope.outputs.provider_publication_discovery }}
+      attempt: ${{ steps.scope.outputs.attempt_lifecycle }}
+      scheduler: ${{ steps.scope.outputs.scheduler_tracker_reader_aqe_invalidation }}
+      harness: ${{ steps.scope.outputs.harness }}
+      run_style: ${{ steps.scope.outputs.run_style }}
+      run_license: ${{ steps.scope.outputs.run_license }}
+      run_core: ${{ steps.scope.outputs.run_core }}
+      run_sql: ${{ steps.scope.outputs.run_sql }}
+      run_harness: ${{ steps.scope.outputs.run_harness }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Resolve exact candidate
+        id: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          bash .github/scripts/shuffle-recovery-ci-evidence.sh \
+            resolve-mode "${GITHUB_EVENT_NAME}" "${GITHUB_REF_NAME}" "${actual}" >> "${GITHUB_OUTPUT}"
+          echo "sha=${actual}" >> "${GITHUB_OUTPUT}"
+      - name: Determine current integration base
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(git rev-parse HEAD)"
+          # The cleaned PoC repository intentionally contains only its candidate branch. In that
+          # layout there is no separate integration branch to compare against, so the root commit
+          # itself is the immutable base and full validation is selected below.
+          if git ls-remote --exit-code --heads origin "${INTEGRATION_BRANCH}" >/dev/null 2>&1; then
+            git fetch --no-tags origin "${INTEGRATION_BRANCH}:refs/remotes/origin/${INTEGRATION_BRANCH}"
+            head="$(git rev-parse "refs/remotes/origin/${INTEGRATION_BRANCH}")"
+            git merge-base --is-ancestor "${head}" HEAD || {
+              echo "candidate does not contain current experimental integration head ${head}" >&2
+              exit 1
+            }
+            base="$(git merge-base HEAD "refs/remotes/origin/${INTEGRATION_BRANCH}")"
+            [[ "${base}" == "${head}" ]] || exit 1
+            echo "sha=${base}" >> "${GITHUB_OUTPUT}"
+            echo "standalone_repository=false" >> "${GITHUB_OUTPUT}"
+          else
+            echo "integration branch ${INTEGRATION_BRANCH} is absent; validating this root commit " \
+              "as a standalone repository"
+            echo "sha=${actual}" >> "${GITHUB_OUTPUT}"
+            echo "standalone_repository=true" >> "${GITHUB_OUTPUT}"
+          fi
+      - name: Validate patch and routing contract
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${BASE_SHA}" != "$(git rev-parse HEAD)" ]]; then
+            git diff --check "${BASE_SHA}...HEAD"
+          fi
+          bash -n .github/scripts/shuffle-recovery-ci-*.sh
+          bash .github/scripts/shuffle-recovery-ci-scope-test.sh
+      - name: Route affected boundaries
+        id: scope
+        shell: bash
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          MODE: ${{ steps.candidate.outputs.validation_mode }}
+          STANDALONE_REPOSITORY: ${{ steps.base.outputs.standalone_repository }}
+        run: |
+          set -euo pipefail
+          evidence="${RUNNER_TEMP}/shuffle-recovery-preflight"
+          mkdir -p "${evidence}"
+          if [[ "${BASE_SHA}" == "$(git rev-parse HEAD)" ]]; then
+            : > "${evidence}/changed-paths.txt"
+          else
+            git diff --name-only "${BASE_SHA}...HEAD" | sed '/^$/d' > \
+              "${evidence}/changed-paths.txt"
+          fi
+          mapfile -t paths < "${evidence}/changed-paths.txt"
+          mode="${MODE}"
+          if [[ "${STANDALONE_REPOSITORY}" == true ]]; then
+            mode=full
+          fi
+          bash .github/scripts/shuffle-recovery-ci-scope.sh "${mode}" "${paths[@]}" > \
+            "${evidence}/route.env"
+          cat "${evidence}/route.env" >> "${GITHUB_OUTPUT}"
+          {
+            echo "candidate_kind=experimental-tree"
+            echo "candidate_sha=${{ steps.candidate.outputs.sha }}"
+            echo "integration_base_sha=${BASE_SHA}"
+            echo "validation_mode=${mode}"
+            echo "standalone_repository=${STANDALONE_REPOSITORY}"
+            echo "event=${GITHUB_EVENT_NAME}"
+            echo "event_ref=${GITHUB_REF}"
+            echo "workflow_run_id=${GITHUB_RUN_ID}"
+            cat "${evidence}/route.env"
+          } > "${evidence}/provenance.env"
+          {
+            echo "git diff --check ${BASE_SHA}...HEAD (when a comparison base exists)"
+            echo "bash -n .github/scripts/shuffle-recovery-ci-*.sh"
+            echo "bash .github/scripts/shuffle-recovery-ci-scope-test.sh"
+          } > "${evidence}/commands.txt"
+          {
+            echo "sbt_build_properties_sha256=$(sha256sum project/build.properties | awk '{print $1}')"
+            echo "root_pom_sha256=$(sha256sum pom.xml | awk '{print $1}')"
+            sed 's/^/build_property=/' project/build.properties
+          } > "${evidence}/dependencies.txt"
+          bash .github/scripts/shuffle-recovery-ci-evidence.sh checksum-tree "${evidence}"
+          cat "${evidence}/route.env" >> "${GITHUB_STEP_SUMMARY}"
+      - name: Upload preflight evidence
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-experimental-preflight-${{ github.run_id }}
+          path: ${{ runner.temp }}/shuffle-recovery-preflight
+          if-no-files-found: error
+
+  quality:
+    name: Lint and license gates
+    needs: preflight
+    if: needs.preflight.outputs.run_style == 'true' || needs.preflight.outputs.run_license == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    outputs:
+      lint: ${{ steps.status.outputs.lint }}
+      license: ${{ steps.status.outputs.license }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.candidate_sha }}
+      - uses: actions/setup-java@v5
+        with: {distribution: zulu, java-version: 17}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+            ~/.cache/coursier
+          key: shuffle-recovery-experimental-quality-${{ runner.os }}-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties', 'build/sbt') }}
+          restore-keys: shuffle-recovery-experimental-quality-${{ runner.os }}-
+      - name: Run quality checks
+        id: run
+        continue-on-error: true
+        env:
+          CANDIDATE_SHA: ${{ needs.preflight.outputs.candidate_sha }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+          VALIDATION_MODE: ${{ needs.preflight.outputs.validation_mode }}
+          RUN_STYLE: ${{ needs.preflight.outputs.run_style }}
+          RUN_LICENSE: ${{ needs.preflight.outputs.run_license }}
+          SCALA_CHANGED: ${{ needs.preflight.outputs.scala }}
+          JAVA_CHANGED: ${{ needs.preflight.outputs.java }}
+          WORKFLOW_BUILD: ${{ needs.preflight.outputs.workflow_build }}
+          EVIDENCE_DIR: ${{ runner.temp }}/shuffle-recovery-quality
+        run: bash .github/scripts/shuffle-recovery-ci-quality.sh
+      - name: Export quality status
+        id: status
+        if: always()
+        shell: bash
+        run: |
+          file="${RUNNER_TEMP}/shuffle-recovery-quality/status.env"
+          if [[ -s "${file}" ]]; then cat "${file}" >> "${GITHUB_OUTPUT}"; else echo 'lint=missing' >> "${GITHUB_OUTPUT}"; echo 'license=missing' >> "${GITHUB_OUTPUT}"; fi
+      - name: Upload quality evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-experimental-quality-${{ github.run_id }}
+          path: ${{ runner.temp }}/shuffle-recovery-quality
+          if-no-files-found: error
+      - name: Enforce quality gate
+        if: always()
+        run: test '${{ steps.run.outcome }}' = success
+
+  core:
+    name: Focused Core recovery boundary
+    needs: preflight
+    if: needs.preflight.outputs.run_core == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 110
+    outputs:
+      compilation: ${{ steps.status.outputs.compilation }}
+      tests: ${{ steps.status.outputs.tests }}
+      proof: ${{ steps.status.outputs.proof }}
+    steps:
+      - uses: actions/checkout@v6
+        with: {fetch-depth: 0, persist-credentials: false, ref: '${{ needs.preflight.outputs.candidate_sha }}'}
+      - uses: actions/setup-java@v5
+        with: {distribution: zulu, java-version: 17}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+            ~/.cache/coursier
+          key: shuffle-recovery-experimental-core-${{ runner.os }}-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties', 'build/sbt') }}
+          restore-keys: shuffle-recovery-experimental-core-${{ runner.os }}-
+      - name: Compile, test, and prove Core boundaries
+        id: run
+        continue-on-error: true
+        env:
+          CANDIDATE_SHA: ${{ needs.preflight.outputs.candidate_sha }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+          VALIDATION_MODE: ${{ needs.preflight.outputs.validation_mode }}
+          IDENTITY_SOURCE: ${{ needs.preflight.outputs.identity_source }}
+          PROVIDER: ${{ needs.preflight.outputs.provider }}
+          ATTEMPT: ${{ needs.preflight.outputs.attempt }}
+          SCHEDULER: ${{ needs.preflight.outputs.scheduler }}
+          HARNESS: ${{ needs.preflight.outputs.harness }}
+          EVIDENCE_DIR: ${{ runner.temp }}/shuffle-recovery-core
+        run: bash .github/scripts/shuffle-recovery-ci-module.sh core
+      - name: Export Core status
+        id: status
+        if: always()
+        run: |
+          file="${RUNNER_TEMP}/shuffle-recovery-core/status.env"
+          if [[ -s "${file}" ]]; then cat "${file}" >> "${GITHUB_OUTPUT}"; else printf 'compilation=missing\ntests=missing\nproof=missing\n' >> "${GITHUB_OUTPUT}"; fi
+      - name: Upload Core evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-experimental-core-${{ github.run_id }}
+          path: ${{ runner.temp }}/shuffle-recovery-core
+          if-no-files-found: error
+      - name: Enforce Core gate
+        if: always()
+        run: test '${{ steps.run.outcome }}' = success
+
+  sql:
+    name: Focused SQL, AQE and harness boundary
+    needs: preflight
+    if: needs.preflight.outputs.run_sql == 'true' || needs.preflight.outputs.run_harness == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 125
+    outputs:
+      compilation: ${{ steps.status.outputs.compilation }}
+      tests: ${{ steps.status.outputs.tests }}
+      proof: ${{ steps.status.outputs.proof }}
+    steps:
+      - uses: actions/checkout@v6
+        with: {fetch-depth: 0, persist-credentials: false, ref: '${{ needs.preflight.outputs.candidate_sha }}'}
+      - uses: actions/setup-java@v5
+        with: {distribution: zulu, java-version: 17}
+      - uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+            ~/.cache/coursier
+          key: shuffle-recovery-experimental-sql-${{ runner.os }}-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties', 'build/sbt') }}
+          restore-keys: shuffle-recovery-experimental-sql-${{ runner.os }}-
+      - name: Compile, test, and prove SQL/harness boundaries
+        id: run
+        continue-on-error: true
+        env:
+          CANDIDATE_SHA: ${{ needs.preflight.outputs.candidate_sha }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+          VALIDATION_MODE: ${{ needs.preflight.outputs.validation_mode }}
+          IDENTITY_SOURCE: ${{ needs.preflight.outputs.identity_source }}
+          PROVIDER: ${{ needs.preflight.outputs.provider }}
+          ATTEMPT: ${{ needs.preflight.outputs.attempt }}
+          SCHEDULER: ${{ needs.preflight.outputs.scheduler }}
+          HARNESS: ${{ needs.preflight.outputs.harness }}
+          SHARED_FILESYSTEM_PROOF: 'true'
+          EVIDENCE_DIR: ${{ runner.temp }}/shuffle-recovery-sql
+        run: bash .github/scripts/shuffle-recovery-ci-module.sh sql
+      - name: Export SQL status
+        id: status
+        if: always()
+        run: |
+          file="${RUNNER_TEMP}/shuffle-recovery-sql/status.env"
+          if [[ -s "${file}" ]]; then cat "${file}" >> "${GITHUB_OUTPUT}"; else printf 'compilation=missing\ntests=missing\nproof=missing\n' >> "${GITHUB_OUTPUT}"; fi
+      - name: Upload SQL evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-experimental-sql-${{ github.run_id }}
+          path: ${{ runner.temp }}/shuffle-recovery-sql
+          if-no-files-found: error
+      - name: Enforce SQL gate
+        if: always()
+        run: test '${{ steps.run.outcome }}' = success
+
+  gate:
+    name: Exact experimental candidate gate
+    needs: [preflight, quality, core, sql, iceberg-resolved-scan]
+    if: always() && needs.preflight.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with: {fetch-depth: 0, persist-credentials: false, ref: '${{ needs.preflight.outputs.candidate_sha }}'}
+      - name: Validate freshness and required evidence
+        id: run
+        continue-on-error: true
+        env:
+          CANDIDATE_SHA: ${{ needs.preflight.outputs.candidate_sha }}
+          BASE_SHA: ${{ needs.preflight.outputs.base_sha }}
+          VALIDATION_MODE: ${{ needs.preflight.outputs.validation_mode }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref || github.ref_name }}
+          EVIDENCE_DIR: ${{ runner.temp }}/shuffle-recovery-gate
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          EXPECT_QUALITY: ${{ needs.preflight.outputs.run_style == 'true' || needs.preflight.outputs.run_license == 'true' }}
+          STANDALONE_REPOSITORY: ${{ needs.preflight.outputs.standalone_repository }}
+          QUALITY_RESULT: ${{ needs.quality.result }}
+          QUALITY_LINT: ${{ needs.quality.outputs.lint }}
+          QUALITY_LICENSE: ${{ needs.quality.outputs.license }}
+          EXPECT_CORE: ${{ needs.preflight.outputs.run_core }}
+          CORE_RESULT: ${{ needs.core.result }}
+          CORE_COMPILATION: ${{ needs.core.outputs.compilation }}
+          CORE_TESTS: ${{ needs.core.outputs.tests }}
+          CORE_PROOF: ${{ needs.core.outputs.proof }}
+          EXPECT_SQL: ${{ needs.preflight.outputs.run_sql == 'true' || needs.preflight.outputs.run_harness == 'true' }}
+          SQL_RESULT: ${{ needs.sql.result }}
+          SQL_COMPILATION: ${{ needs.sql.outputs.compilation }}
+          SQL_TESTS: ${{ needs.sql.outputs.tests }}
+          SQL_PROOF: ${{ needs.sql.outputs.proof }}
+          ICEBERG_RESULT: ${{ needs.iceberg-resolved-scan.result }}
+        run: bash .github/scripts/shuffle-recovery-ci-gate.sh
+      - name: Upload final gate evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-experimental-gate-${{ github.run_id }}
+          path: ${{ runner.temp }}/shuffle-recovery-gate
+          if-no-files-found: error
+      - name: Enforce exact-candidate gate
+        if: always()
+        run: test '${{ steps.run.outcome }}' = success
+
+  iceberg-resolved-scan:
+    name: Pinned Iceberg Spark 4.2 source conformance (JDK 17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout requested head
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: zulu
+          java-version: 17
+
+      - name: Cache build dependencies
+        uses: actions/cache@v5
+        with:
+          path: |
+            build/apache-maven-*
+            build/*.jar
+            ~/.sbt
+            ~/.cache/coursier
+          key: shuffle-recovery-experimental-iceberg-${{ runner.os }}-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties', 'build/sbt') }}
+          restore-keys: |
+            shuffle-recovery-experimental-iceberg-${{ runner.os }}-
+            shuffle-recovery-build-${{ runner.os }}-
+
+      - name: Cache pinned source-built runtime
+        uses: actions/cache@v5
+        with:
+          path: ${{ runner.temp }}/shuffle-recovery-iceberg-runtime
+          key: shuffle-recovery-iceberg-runtime-${{ runner.os }}-${{ runner.arch }}-zulu17-${{ hashFiles('dev/shuffle-recovery/iceberg-source-spike/run.sh') }}
+
+      - name: Run pinned Iceberg resolved-scan conformance
+        env:
+          ICEBERG_RUNTIME_CACHE: ${{ runner.temp }}/shuffle-recovery-iceberg-runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash dev/shuffle-recovery/iceberg-source-spike/run.sh \
+            "${RUNNER_TEMP}/shuffle-recovery-iceberg-source-evidence.tsv"
+
+      - name: Upload resolved-scan evidence
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: shuffle-recovery-iceberg-source-evidence-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/shuffle-recovery-iceberg-source-evidence.tsv
+            ${{ runner.temp }}/shuffle-recovery-iceberg-source-evidence.tsv.cold
+          if-no-files-found: error

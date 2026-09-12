@@ -1,0 +1,266 @@
+{
+  "schemaVersion": 1,
+  "specId": "shuffle-recovery-value-experiment-v1",
+  "workloadScopeDocument": "workload-scope-v1.md",
+  "costModelDocument": "cost-model-v1.md",
+  "lineage": {
+    "upstreamBaseline": "2a7cfea06ba135cf0ddc62902eb0daf5a835c672",
+    "experimentalBase": "5f773c4669d06af57216b09748ec7d168412ad3c",
+    "frozenPhase0Evidence": "7888d1e26d32e69694083e367ee6a92b28277c48"
+  },
+  "provenance": {
+    "profileKind": "explicit-scenario",
+    "realTraceWeights": false,
+    "datasetGeneratorVersion": "decision-support-generator-v1",
+    "historicalPilotActionsRun": 33963836467,
+    "historicalPilotArtifactId": 9969032965,
+    "historicalPilotArtifactSha256": "15bb5b3c2ebfbfa565c95163c9a2644cd9a147971f39c62d23583a84f6090013",
+    "historicalPilotUse": "stage-relative failure-point selection only; no historical performance result contributes to the v1 effect estimate, weights, confidence interval, or economics"
+  },
+  "targetDeployment": {
+    "orchestrator": "Kubernetes batch application relaunch",
+    "source": "Apache Iceberg tables pinned to explicit snapshot ids",
+    "shuffleProvider": "Apache Celeborn real durable remote-shuffle candidate",
+    "driver": {
+      "vCpu": 4,
+      "memoryGiB": 16
+    },
+    "executors": {
+      "count": 32,
+      "vCpuEach": 8,
+      "memoryGiBEach": 32
+    },
+    "networkGbpsPerWorker": 10,
+    "factInputScaleGiB": [16, 64, 256, 512],
+    "nominalFactInputGiB": 256,
+    "dimensionSnapshotGiB": 8,
+    "dimensionRows": 16777216,
+    "dimensionStoragePaddingBytesPerRow": 512,
+    "inputSizeToleranceFraction": 0.02,
+    "artifactRetentionHours": 2,
+    "conditionalDriverFailureRate": 0.01,
+    "primaryQueryAttemptsPerHour": 20
+  },
+  "producerGrammar": {
+    "maxAdoptedExchangesPerQuery": 1,
+    "allowed": [
+      "certified immutable snapshot scan",
+      "optional reviewed deterministic projection",
+      "optional reviewed deterministic filter",
+      "hash partitioning",
+      "single partitioning"
+    ],
+    "excludedBelowProducer": [
+      "join",
+      "partial aggregate",
+      "final aggregate",
+      "window",
+      "runtime filter",
+      "subquery",
+      "Python/UDF/native expression"
+    ],
+    "queryExcluded": [
+      "writes",
+      "streaming",
+      "incremental external result delivery",
+      "partial-map reuse",
+      "unsupported expressions",
+      "runtime-dependent scans",
+      "sampled range partitioning"
+    ]
+  },
+  "cohort": [
+    {
+      "id": "W01",
+      "weight": 0.20,
+      "shape": "scan/filter/project -> hash exchange -> tenant-partitioned Window -> small result reduction"
+    },
+    {
+      "id": "W02",
+      "weight": 0.15,
+      "shape": "scan/filter/project -> hash exchange -> dimension-partitioned Window -> small result reduction"
+    },
+    {
+      "id": "S01",
+      "weight": 0.10,
+      "shape": "selective scan/filter/project -> single-partition exchange -> global Window -> small result reduction"
+    },
+    {
+      "id": "J01",
+      "weight": 0.25,
+      "shape": "fact scan/filter/project -> hash exchange -> sort-merge join -> global aggregate"
+    },
+    {
+      "id": "J02",
+      "weight": 0.20,
+      "shape": "fact scan/filter/project -> hash exchange -> sort-merge join -> later fresh aggregate shuffle"
+    },
+    {
+      "id": "E01",
+      "weight": 0.10,
+      "shape": "sparse scan/filter/project -> hash exchange -> Window, stressing empty blocks"
+    }
+  ],
+  "failurePoints": [
+    {
+      "id": "F0",
+      "weight": 0.25,
+      "name": "pre-publication",
+      "rule": "producer computation has completed but durable publication has not become visible"
+    },
+    {
+      "id": "F1",
+      "weight": 0.30,
+      "name": "post-publication-early",
+      "rule": "durable publication is visible before any downstream post-exchange stage completes"
+    },
+    {
+      "id": "F2",
+      "weight": 0.30,
+      "name": "post-publication-middle",
+      "rule": "first material downstream stage after the target exchange has completed"
+    },
+    {
+      "id": "F3",
+      "weight": 0.15,
+      "name": "post-publication-late",
+      "rule": "immediately before the final material downstream stage is launched"
+    }
+  ],
+  "primaryInputScales": [
+    {
+      "id": "I16",
+      "weight": 0.25,
+      "factGiB": 16,
+      "mapperMin": 96,
+      "mapperMax": 160,
+      "hashReducers": 200,
+      "singleReducers": 1
+    },
+    {
+      "id": "I64",
+      "weight": 0.25,
+      "factGiB": 64,
+      "mapperMin": 384,
+      "mapperMax": 640,
+      "hashReducers": 200,
+      "singleReducers": 1
+    },
+    {
+      "id": "I256",
+      "weight": 0.25,
+      "factGiB": 256,
+      "mapperMin": 1536,
+      "mapperMax": 2560,
+      "hashReducers": 200,
+      "singleReducers": 1
+    },
+    {
+      "id": "I512",
+      "weight": 0.25,
+      "factGiB": 512,
+      "mapperMin": 3072,
+      "mapperMax": 5120,
+      "hashReducers": 200,
+      "singleReducers": 1
+    }
+  ],
+  "primaryPlanPolicy": {
+    "aqe": "tested Spark default; do not override in primary campaign",
+    "shufflePartitions": "tested Spark default of 200; do not override in primary campaign",
+    "broadcastThresholds": "tested Spark defaults; do not override in primary campaign",
+    "forcedPlanSettings": "mechanism-only and excluded from primary aggregate gates"
+  },
+  "mechanismOnlyShapes": [
+    {
+      "maps": 8192,
+      "reducers": 1024
+    },
+    {
+      "maps": 4096,
+      "reducers": 2048
+    }
+  ],
+  "resourceLimits": {
+    "manifestBytes": 4194304,
+    "driverRecoveryMetadataBytes": 33554432,
+    "providerDiscoveryBytes": 8388608,
+    "providerIndexBytes": 536870912,
+    "candidateIncarnations": 4,
+    "lookupDeadlineMs": 3000,
+    "prepareDeadlineMs": 10000,
+    "metadataPageBytes": 1048576,
+    "metadataPages": 256,
+    "concurrentProviderReads": 128,
+    "artifactBytes": 549755813888,
+    "artifactGiBHours": 1024
+  },
+  "trialPolicy": {
+    "pairedRepetitionsPerCell": 12,
+    "registeredCellCount": 96,
+    "allApplicablePairCount": 1152,
+    "allApplicableTimedAttemptCount": 2304,
+    "cellDimensions": ["cohort id", "input scale", "failure point"],
+    "randomizationSeed": 557003,
+    "hardTimeoutSeconds": 1800,
+    "outlierDeletion": "none",
+    "cacheWarmth": "natural backend warmth; no manual cache flush in primary campaign",
+    "misses": "included in recovery arm",
+    "recoveryTimeoutWhenControlCorrect": "use observed control time and score recovery as 1800 seconds",
+    "controlFailureWhenRecoveryCorrect": "score both arms as 1800 seconds for zero speedup credit; retain actual recovery observation separately and count control failure against reliability",
+    "bothFail": "score both arms as 1800 seconds for zero speedup credit and count against reliability",
+    "maxControlFailureFractionForPass": 0.01,
+    "notApplicableScenarioMassIndeterminateThreshold": 0.05,
+    "scenarioMassPerCell": "workload weight * failure-point weight * input-scale weight"
+  },
+  "statistics": {
+    "aggregateMetric": "1 - weighted_sum(recovery failure-to-correct-result ms) / weighted_sum(control failure-to-correct-result ms)",
+    "confidence": "paired stratified bootstrap over the 12 scored pairs within every fixed workload/input-scale/failure-point cell; never resample workload identities",
+    "confidenceLevel": 0.95,
+    "bootstrapResamples": 10000,
+    "bootstrapSeed": 55003,
+    "scenarioComposition": "fixed workload weights * fixed failure-point weights * fixed 0.25 input-scale weights",
+    "iidUnit": "paired repetition within a fixed cell; never physical exchange, map, reducer, or block"
+  },
+  "gates": {
+    "restartImprovementPointEstimateMin": 0.20,
+    "restartImprovementLower95Comparison": ">",
+    "restartImprovementLower95Threshold": 0.0,
+    "disabledOverheadUpper95Max": 0.01,
+    "allMissOverheadUpper95Max": 0.05,
+    "publicationNoFailureOverheadUpper95Max": 0.05,
+    "positiveDeploymentEconomics": true,
+    "economicsLower95Comparison": ">",
+    "economicsLower95Threshold": 0.0,
+    "wrongResultAllowed": false
+  },
+  "costModel": {
+    "unit": "scenario USD",
+    "rates": {
+      "vCpuHour": 0.04,
+      "memoryGiBHour": 0.005,
+      "durableStorageGiBHour": 0.00004,
+      "incrementalProviderReadGiB": 0.01,
+      "incrementalProviderWriteGiB": 0.01
+    },
+    "publicationAccounting": "charge only bytes and service work introduced by recovery publication; ordinary shuffle writes are reported separately and are not double-counted",
+    "greenfield": {
+      "providerWorkers": {
+        "count": 8,
+        "vCpuEach": 8,
+        "memoryGiBEach": 32
+      },
+      "controlPlane": {
+        "count": 3,
+        "vCpuEach": 2,
+        "memoryGiBEach": 4
+      },
+      "reservedDiskGiB": 24576,
+      "operationsUsdPerHour": 1.0,
+      "fixedUsdPerHour": 6.12304,
+      "fixedUsdPerQueryAtRegisteredArrivalRate": 0.306152
+    },
+    "greenfieldDurableStorageIntroductionReportedSeparately": true,
+    "notes": "Planning assumptions only; not vendor quotes. Existing-provider and greenfield introduction economics are separate decisions."
+  }
+}
