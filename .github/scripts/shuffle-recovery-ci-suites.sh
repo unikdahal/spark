@@ -80,6 +80,7 @@ else
 
   if [[ "${scheduler_tracker_reader_aqe_invalidation}" == true ]]; then
     add_suite org.apache.spark.sql.execution.exchange.ShuffleRecoveryAdaptivePartitionRulesSuite
+    add_suite org.apache.spark.sql.execution.exchange.ShuffleRecoveryExchangePreparationSuite
   fi
 
   if [[ "${harness}" == true ]]; then

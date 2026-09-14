@@ -383,6 +383,14 @@ public final class ShuffleRecoveryIcebergSourceSpike {
         providerReadFormatId);
   }
 
+  /** Capture the source once; the returned factory certifies the final AQE exchange. */
+  public static Object canonicalInputFactory(Dataset<Row> dataset, String providerReadFormatId) {
+    Certificate certificate = requireCertified(certify(dataset));
+    return ShuffleRecoveryIcebergIdentityBridge.factory(
+        certificate.plannedScan, certificate.identityBytes, certificate.decompositionDigest,
+        certificate.mapperCount, providerReadFormatId);
+  }
+
   /**
    * Certifies an ordinary Spark-planned Dataset without independently resolving its table or
    * snapshot. Source-planning exceptions deliberately escape this method unchanged.
@@ -808,7 +816,7 @@ public final class ShuffleRecoveryIcebergSourceSpike {
 
   private static BatchScanExec findSingleBatchScan(SparkPlan root) {
     List<BatchScanExec> scans = new ArrayList<>();
-    collectBatchScans(root, scans);
+    collectBatchScans(ShuffleRecoveryIcebergIdentityBridge.physicalPlan(root), scans);
     return scans.size() == 1 ? scans.get(0) : null;
   }
 

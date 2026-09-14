@@ -59,3 +59,20 @@ with a fresh application/incarnation, and requires ordinary recomputation.
 Expiry during an already-open executor stream still requires additional evidence.
 Provider unit tests exercise independent claim release, exact expiry, clock
 wraparound and owner shutdown.
+
+## AQE coverage
+
+`SPARK_RECOVERY_AQE_MODE` selects `off` (the original control), `full` (AQE with
+uncoalesced reducers), or `coalesced` (AQE must actually combine reducer ranges).
+CI runs all three modes with the same positive, identity-miss and failure controls.
+Each mode owns separate services and storage. Initial/final plans and the actual
+adaptive read counts are saved beside each driver's evidence.
+
+AQE preparation attaches to the initial exchange as a driver-only tag and runs on
+the final exchange's shuffle preparation thread before map submission. The source
+certificate remains tied to the actual planned scan; the final producer is encoded
+again after stage rules. The harness lets AQE materialize its query stage and select
+readers instead of submitting the initial exchange's potentially obsolete dependency.
+
+These are added validation cases, not evidence of successful AQE recovery until their
+CI results pass. They cover full/coalesced readers, not skew or mapper-local reads.

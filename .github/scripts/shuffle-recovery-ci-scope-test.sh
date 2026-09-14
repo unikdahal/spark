@@ -154,6 +154,7 @@ all_sql_suites="$(bash "${suites}" sql true true true true true)"
 for required in \
   org.apache.spark.sql.execution.exchange.ShuffleRecoverySourceReadIdentitySuite \
   org.apache.spark.sql.execution.exchange.ShuffleRecoveryAdaptivePartitionRulesSuite \
+  org.apache.spark.sql.execution.exchange.ShuffleRecoveryExchangePreparationSuite \
   org.apache.spark.shuffle.ShuffleRecoveryColdProcessSuite; do
   if ! grep -Fxq "${required}" <<< "${all_sql_suites}"; then
     echo "SQL/harness boundary omitted required suite ${required}" >&2

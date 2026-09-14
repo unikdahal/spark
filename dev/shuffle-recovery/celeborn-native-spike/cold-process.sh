@@ -18,6 +18,9 @@
 
 set -euo pipefail
 
+export SPARK_RECOVERY_AQE_MODE="${SPARK_RECOVERY_AQE_MODE:-off}"
+case "$SPARK_RECOVERY_AQE_MODE" in off|full|coalesced) ;; *) exit 2 ;; esac
+
 : "${ICEBERG_RUNTIME_JAR:?source-built Iceberg runtime jar is required}"
 : "${CELEBORN_RUNTIME_JAR:?source-built Celeborn Spark 4 shaded jar is required}"
 : "${CELEBORN_RETAINED_ENDPOINT_FILE:?running standalone owner endpoint file is required}"
@@ -126,6 +129,7 @@ run_main owner-restart \
   "${entry} replacement ${restart_root} ${evidence_dir}/owner-restart.properties ${group}-restart owner-restart"
 
 python3 - "${evidence_dir}" <<'CHECK'
+import os
 import sys
 from pathlib import Path
 
@@ -142,6 +146,11 @@ for name in ("baseline", "producer", "replacement", "concurrent-a", "concurrent-
     assert process not in processes, "driver JVM was reused"
     processes.add(process)
     assert row["rowCount"] == "32", name
+    assert row["aqeMode"] == os.environ["SPARK_RECOVERY_AQE_MODE"], name
+    if row["aqeMode"] != "off":
+        assert row["adaptiveFinalPlan"] == "true", name
+    if row["aqeMode"] == "coalesced":
+        assert int(row["mergedReducerRangeCount"]) > 0, name
     records[name] = row
 baseline = records["baseline"]
 for name, row in records.items():
@@ -157,4 +166,5 @@ for name, row in records.items():
 assert (root / "snapshot-before.txt").read_text() != (
     root / "snapshot-after.txt").read_text()
 (root / "decision.txt").write_text("NATIVE_COLD_PROCESS_AND_ARTIFACT_LOSS_PASS\n")
+(root / "aqe-mode.txt").write_text(os.environ["SPARK_RECOVERY_AQE_MODE"] + "\n")
 CHECK

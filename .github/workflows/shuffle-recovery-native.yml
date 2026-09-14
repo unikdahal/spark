@@ -99,6 +99,10 @@ jobs:
           if-no-files-found: error
   proof:
     needs: dependencies
+    strategy:
+      fail-fast: false
+      matrix:
+        aqe: [off, full, coalesced]
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -119,11 +123,13 @@ jobs:
         id: compiled
         with:
           path: '**/target'
-          key: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-${{ github.sha }}
+          key: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-${{ github.sha }}-${{ matrix.aqe }}
           restore-keys: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-
       - uses: actions/download-artifact@v8
         with: {pattern: 'native-*', path: '${{ runner.temp }}/deps', merge-multiple: true}
       - name: Run native cold-process proof
+        env:
+          SPARK_RECOVERY_AQE_MODE: ${{ matrix.aqe }}
         run: |
           (cd "$RUNNER_TEMP/deps" && sha256sum -c celeborn.sha256 iceberg.sha256)
           tar -C "$RUNNER_TEMP/deps" -xzf "$RUNNER_TEMP/deps/celeborn-dist.tgz"
@@ -135,11 +141,11 @@ jobs:
         if: always() && steps.compiled.outputs.cache-hit != 'true'
         with:
           path: '**/target'
-          key: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-${{ github.sha }}
+          key: native-compiled-${{ runner.os }}-zulu17-${{ hashFiles('**/pom.xml', '**/plugins.sbt', 'project/build.properties') }}-${{ github.sha }}-${{ matrix.aqe }}
       - uses: actions/upload-artifact@v7
         if: always()
         with:
-          name: native-proof-evidence
+          name: native-proof-evidence-${{ matrix.aqe }}
           path: |
             ${{ runner.temp }}/native-proof
             **/target/test-reports/*ShuffleRecovery*.xml

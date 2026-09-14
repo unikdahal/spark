@@ -135,6 +135,9 @@ for path in "${paths[@]}"; do
     core/src/test/scala/org/apache/spark/scheduler/DAGSchedulerSuite.scala|\
     core/src/test/scala/org/apache/spark/shuffle/BlockStoreShuffleReaderSuite.scala|\
     sql/core/src/main/scala/org/apache/spark/sql/execution/adaptive/*|\
+    sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleExchangeExec.scala|\
+    sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryExchangePreparation.scala|\
+    sql/core/src/test/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryExchangePreparationSuite.scala|\
     sql/core/src/test/scala/org/apache/spark/sql/execution/adaptive/*|\
     sql/core/src/test/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryAdaptivePartitionRulesSuite.scala)
       scheduler_tracker_reader_aqe_invalidation=true

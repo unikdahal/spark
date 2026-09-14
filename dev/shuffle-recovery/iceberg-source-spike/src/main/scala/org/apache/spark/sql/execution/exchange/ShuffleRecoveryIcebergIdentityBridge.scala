@@ -21,10 +21,29 @@ import java.nio.ByteBuffer
 
 import org.apache.spark.shuffle.ShuffleRecoveryCanonicalInputs
 import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanExec
 import org.apache.spark.sql.execution.datasources.v2.BatchScanExec
 
 /** Out-of-tree conformance bridge; not a public connector API or automatic recovery hook. */
 object ShuffleRecoveryIcebergIdentityBridge {
+  def physicalPlan(root: SparkPlan): SparkPlan = root match {
+    case adaptive: AdaptiveSparkPlanExec => adaptive.executedPlan
+    case other => other
+  }
+
+  /** Keep the certified scan; validate and encode the actual exchange after AQE stage rules. */
+  def factory(
+      scan: BatchScanExec,
+      certificate: Array[Byte],
+      decompositionDigest: Array[Byte],
+      mapperCount: Int,
+      providerReadFormatId: String): SparkPlan => ShuffleRecoveryCanonicalInputs = {
+    val certificateCopy = certificate.clone()
+    val decompositionCopy = decompositionDigest.clone()
+    root => inputs(
+      root, scan, certificateCopy, decompositionCopy, mapperCount, providerReadFormatId)
+  }
+
   def identity(
       root: SparkPlan,
       scan: BatchScanExec,
@@ -43,7 +62,7 @@ object ShuffleRecoveryIcebergIdentityBridge {
       decompositionDigest: Array[Byte],
       mapperCount: Int,
       providerReadFormatId: String): ShuffleRecoveryCanonicalInputs = {
-    val exchanges = root.collect { case exchange: ShuffleExchangeExec => exchange }
+    val exchanges = physicalPlan(root).collect { case exchange: ShuffleExchangeExec => exchange }
     require(exchanges.size == 1, "expected exactly one real shuffle boundary")
     val exchange = exchanges.head
     require(exchange.child.collect { case batch: BatchScanExec => batch }

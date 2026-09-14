@@ -228,6 +228,7 @@ case class ShuffleExchangeExec(
     if (inputRDD.getNumPartitions == 0) {
       Future.successful(null)
     } else {
+      ShuffleRecoveryExchangePreparation.prepare(this)
       sparkContext.submitMapStage(shuffleDependency)
     }
   }
@@ -241,6 +242,11 @@ case class ShuffleExchangeExec(
   }
 
   override def runtimeStatistics: Statistics = {
+    if (ShuffleRecoverySchedulerAdoption.isAdopted(shuffleId)) {
+      // No maps ran in this application, so zero write metrics do not prove an empty result.
+      // Retained map-status sizes are scheduling estimates, not measured SQL output metrics.
+      return Statistics(conf.defaultSizeInBytes, None)
+    }
     val dataSize = metrics("dataSize").value
     val rowCount = metrics(SQLShuffleWriteMetricsReporter.SHUFFLE_RECORDS_WRITTEN).value
     Statistics(dataSize, Some(rowCount))

@@ -25,11 +25,12 @@ import org.apache.iceberg.spark.source.ShuffleRecoveryIcebergSourceSpike
 
 import org.apache.spark.shuffle.{ShuffleRecoveryCanonicalInputs, ShuffleRecoveryColdProcessSource, ShuffleRecoveryFeasibilityIdentity, ShuffleRecoveryIdentityInputs, ShuffleRecoveryStringValue}
 import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.execution.SparkPlan
 import org.apache.spark.sql.functions.{col, lit}
 
 /** Connector-specific test adapter; the normal Spark source roots have no Iceberg dependency. */
 class ShuffleRecoveryIcebergColdSource extends ShuffleRecoveryColdProcessSource {
-  private var prepared: Option[(ShuffleExchangeExec, ShuffleRecoveryCanonicalInputs)] = None
+  private var prepared: Option[SparkPlan => ShuffleRecoveryCanonicalInputs] = None
 
   private var providerFormat = ShuffleRecoveryFeasibilityIdentity.ProviderCompatibilityId
 
@@ -55,18 +56,17 @@ class ShuffleRecoveryIcebergColdSource extends ShuffleRecoveryColdProcessSource 
     val source = spark.table("cold.db.input")
     val producer = if (sys.env.get("SPARK_SHUFFLE_RECOVERY_TEST_PRODUCER_FILTER")
         .contains("true")) source.where(col("id") >= lit(0L)) else source
-    val query = producer.select(col("id"), col("id").as("k"), col("payload"))
-      .repartition(reducers, col("k"))
-      .select(col("id"), col("k"), col("payload"))
+    val projected = producer.select(col("id"), col("id").as("k"), col("payload"))
+    val partitioned = if (sys.env.get("SPARK_RECOVERY_AQE_MODE").contains("coalesced")) {
+      projected.repartition(col("k"))
+    } else {
+      projected.repartition(reducers, col("k"))
+    }
+    val query = partitioned.select(col("id"), col("k"), col("payload"))
     // Capture the planning event before inspecting the plan. Only this adapter instance keeps
     // the certificate; each replacement JVM independently resolves and certifies its read.
-    val inputs = ShuffleRecoveryIcebergSourceSpike.canonicalInputs(
-      query, providerFormat).asInstanceOf[ShuffleRecoveryCanonicalInputs]
-    val exchanges = query.queryExecution.executedPlan.collect {
-      case exchange: ShuffleExchangeExec => exchange
-    }
-    require(exchanges.size == 1, "Iceberg cold proof requires one exchange")
-    prepared = Some(exchanges.head -> inputs)
+    prepared = Some(ShuffleRecoveryIcebergSourceSpike.canonicalInputFactory(
+      query, providerFormat).asInstanceOf[SparkPlan => ShuffleRecoveryCanonicalInputs])
     query
   }
 
@@ -74,10 +74,10 @@ class ShuffleRecoveryIcebergColdSource extends ShuffleRecoveryColdProcessSource 
       exchange: ShuffleExchangeExec,
       sourceToken: String,
       providerReadFormatId: String): ShuffleRecoveryIdentityInputs = {
-    val (plannedExchange, inputs) = prepared.getOrElse {
+    val factory = prepared.getOrElse {
       throw new IllegalStateException("Iceberg query must be certified before identity lookup")
     }
-    require(plannedExchange eq exchange, "certificate belongs to another planned exchange")
+    val inputs = factory(exchange)
     require(inputs.computation.compatibility.providerReadFormatId == providerReadFormatId)
     // Preserve the harness's synthetic source-token control independently of real snapshot tests.
     ShuffleRecoveryCanonicalInputs(inputs.computation.copy(resolvedValues = Vector(

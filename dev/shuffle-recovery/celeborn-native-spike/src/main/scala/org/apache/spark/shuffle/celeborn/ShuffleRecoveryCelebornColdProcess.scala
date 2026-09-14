@@ -30,10 +30,21 @@ import org.apache.spark.scheduler._
 import org.apache.celeborn.client.ShuffleRecoveryDescriptorEvidence
 import org.apache.spark.shuffle._
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.execution.exchange.{ShuffleExchangeExec, ShuffleRecoveryIcebergColdSource}
+import org.apache.spark.sql.execution.{CoalescedPartitionSpec, SparkPlan}
+import org.apache.spark.sql.execution.adaptive.{AdaptiveSparkPlanExec, AQEShuffleReadExec, QueryStageExec}
+import org.apache.spark.sql.execution.exchange.{ShuffleExchangeExec, ShuffleRecoveryExchangePreparation, ShuffleRecoveryIcebergColdSource, ShuffleRecoveryIcebergIdentityBridge}
 
 /** Each invocation is one independent driver. The shell runner owns durable services and files. */
 object ShuffleRecoveryCelebornColdProcess {
+  private def planNodes(plan: SparkPlan): Seq[SparkPlan] = {
+    val children = plan match {
+      case adaptive: AdaptiveSparkPlanExec => Seq(adaptive.executedPlan)
+      case stage: QueryStageExec => Seq(stage.plan)
+      case other => other.children
+    }
+    plan +: children.flatMap(planNodes)
+  }
+
   private class TargetTasks(rddId: Int) extends SparkListener {
     private val stages = ConcurrentHashMap.newKeySet[Integer]()
     val count = new AtomicLong()
@@ -63,11 +74,18 @@ object ShuffleRecoveryCelebornColdProcess {
       "producer-filter", "artifact-loss", "concurrent", "lease-expiry", "owner-restart")
       .contains(control))
     require(role == "replacement" || control == "none")
+    val aqeMode = sys.env.getOrElse("SPARK_RECOVERY_AQE_MODE", "off")
+    require(Set("off", "full", "coalesced").contains(aqeMode), "unknown AQE proof mode")
+    val aqeEnabled = aqeMode != "off"
     val source = new ShuffleRecoveryIcebergColdSource
     val builder = SparkSession.builder().master("local[2]")
       .appName("celeborn-cold-" + role)
       .config("spark.ui.enabled", "false")
-      .config("spark.sql.adaptive.enabled", "false")
+      .config("spark.sql.adaptive.enabled", aqeEnabled.toString)
+      .config("spark.sql.shuffle.partitions", "4")
+      .config("spark.sql.adaptive.coalescePartitions.enabled", (aqeMode == "coalesced").toString)
+      .config("spark.sql.adaptive.coalescePartitions.parallelismFirst", "false")
+      .config("spark.sql.adaptive.coalescePartitions.minPartitionSize", "1")
       .config("spark.shuffle.useOldFetchProtocol", "false")
       .config("spark.driver.host", "127.0.0.1")
       .config("spark.driver.bindAddress", "127.0.0.1")
@@ -96,42 +114,59 @@ object ShuffleRecoveryCelebornColdProcess {
         SparkUtils.fromSparkConf(sc.getConf))
       source.configureProviderReadFormat(format)
       val query = source.buildQuery(spark, 32L, 4, 4, 0)
-      val exchanges = query.queryExecution.executedPlan.collect {
+      val executed = query.queryExecution.executedPlan
+      val exchanges = ShuffleRecoveryIcebergIdentityBridge.physicalPlan(executed).collect {
         case exchange: ShuffleExchangeExec => exchange
       }
       require(exchanges.size == 1)
-      val exchange = exchanges.head
-      val dependency = exchange.shuffleDependency
-      val target = ShuffleRecoveryAdoptionTarget(
-        ShuffleRecoveryMaterializationId(exchange.id, 1L), exchange.shuffleId,
-        dependency.rdd.id.toLong, exchange.numMappers, exchange.numPartitions)
-      val inputs = source.identityInputs(exchange,
-        if (control == "source-token") "different-source" else "fixture", format)
-      val tasks = new TargetTasks(dependency.rdd.id)
-      sc.addSparkListener(tasks)
-      val preparationStarted = System.nanoTime()
+      Files.write(Paths.get(evidence + ".initial-plan.txt"), executed.treeString.getBytes(UTF_8))
+      var exchange: ShuffleExchangeExec = null
+      var tasks: TargetTasks = null
+      var preparationNanos = 0L
       var offered = false
       var missReason = ""
-      if (role == "producer") {
-        val context = ShuffleRecoveryNativePublicationContext(group, 1L,
-          UUID.randomUUID().toString, exchange.shuffleId,
-          inputs.identityFor(target).asInstanceOf[ShuffleRecoveryCanonicalManifestIdentity])
-        publication = ShuffleRecoveryCelebornPublication.attach(sc, context, Paths.get(root),
-          3600000L)
-      } else if (role == "replacement") {
-        val manifestRoot = if (control == "manifest-missing") {
-          Files.createTempDirectory(Paths.get(root), "empty-")
-        } else Paths.get(root)
-        ShuffleRecoveryCelebornPreparation.prepare(sc,
-          ShuffleRecoveryPreparationRequest(group, 2L, target, inputs),
-          manifestRoot, if (control == "lease-expiry") 3000L else 60000L) match {
-          case Right(session) => adoption = session; offered = true
-          case Left(reason) => missReason = reason
+      def prepare(actual: ShuffleExchangeExec): Unit = {
+        require(exchange == null, "proof must prepare exactly one materialized exchange")
+        exchange = actual
+        val preparationStarted = System.nanoTime()
+        val dependency = actual.shuffleDependency
+        val target = ShuffleRecoveryAdoptionTarget(
+          ShuffleRecoveryMaterializationId(actual.id, 1L), actual.shuffleId,
+          dependency.rdd.id.toLong, actual.numMappers, actual.numPartitions)
+        val inputs = source.identityInputs(actual,
+          if (control == "source-token") "different-source" else "fixture", format)
+        tasks = new TargetTasks(dependency.rdd.id)
+        sc.addSparkListener(tasks)
+        if (role == "producer") {
+          val context = ShuffleRecoveryNativePublicationContext(group, 1L,
+            UUID.randomUUID().toString, actual.shuffleId,
+            inputs.identityFor(target).asInstanceOf[ShuffleRecoveryCanonicalManifestIdentity])
+          publication = ShuffleRecoveryCelebornPublication.attach(sc, context, Paths.get(root),
+            3600000L)
+        } else if (role == "replacement") {
+          val manifestRoot = if (control == "manifest-missing") {
+            Files.createTempDirectory(Paths.get(root), "empty-")
+          } else Paths.get(root)
+          ShuffleRecoveryCelebornPreparation.prepare(sc,
+            ShuffleRecoveryPreparationRequest(group, 2L, target, inputs),
+            manifestRoot, if (control == "lease-expiry") 3000L else 60000L) match {
+            case Right(session) => adoption = session; offered = true
+            case Left(reason) => missReason = reason
+          }
         }
+        preparationNanos = System.nanoTime() - preparationStarted
       }
-      val preparationNanos = System.nanoTime() - preparationStarted
       val executionStarted = System.nanoTime()
-      sc.submitMapStage(dependency).get()
+      if (aqeEnabled) {
+        ShuffleRecoveryExchangePreparation.attach(exchanges.head)(prepare)
+        // Materialize through AQE itself, including statistics and reader selection. Do not
+        // pre-submit a different dependency from the initial, pre-stage physical exchange.
+        executed.asInstanceOf[AdaptiveSparkPlanExec].finalPhysicalPlan
+      } else {
+        prepare(exchanges.head)
+        sc.submitMapStage(exchange.shuffleDependency).get()
+      }
+      require(exchange != null && tasks != null, "materialization did not prepare the exchange")
       if (publication != null) {
         val manifest = publication.finish()
         val (application, shuffle) = ShuffleRecoveryDescriptorEvidence.namespace(
@@ -191,6 +226,19 @@ object ShuffleRecoveryCelebornColdProcess {
       require(rows.toVector == (0L until 32L).toVector, "result differs from exact fixture")
       sc.listenerBus.waitUntilEmpty(30000L)
       val adoptedAfterRead = adoption != null && adoption.isAdopted
+      Files.write(Paths.get(evidence + ".final-plan.txt"), executed.treeString.getBytes(UTF_8))
+      val adaptiveFinal = executed match {
+        case adaptive: AdaptiveSparkPlanExec => adaptive.isFinalPlan
+        case _ => false
+      }
+      val adaptiveReads = planNodes(executed).collect { case read: AQEShuffleReadExec => read }
+      val mergedRanges = adaptiveReads.flatMap(_.partitionSpecs).count {
+        case spec: CoalescedPartitionSpec => spec.endReducerIndex - spec.startReducerIndex > 1
+        case _ => false
+      }
+      require(!aqeEnabled || adaptiveFinal, "AQE did not produce a final adaptive plan")
+      require(aqeMode != "coalesced" || mergedRanges > 0,
+        "coalesced proof must actually combine multiple reducers")
       // SQL execution cleanup may release the binding before collect returns. Successful reuse
       // is established by the installed binding and actual tasks/bytes, not post-query retention.
       val reused = adoptedBeforeRead && tasks.count.get() == 0L &&
@@ -202,6 +250,10 @@ object ShuffleRecoveryCelebornColdProcess {
         "pid" -> process.pid().toString,
         "started" -> process.info().startInstant().get().toString,
         "testedCommit" -> sys.env("SPARK_RECOVERY_TESTED_COMMIT"),
+        "aqeMode" -> aqeMode, "adaptiveFinalPlan" -> adaptiveFinal.toString,
+        "adaptiveReadCount" -> adaptiveReads.size.toString,
+        "mergedReducerRangeCount" -> mergedRanges.toString,
+        "targetShuffleId" -> exchange.shuffleId.toString,
         "rowCount" -> rows.length.toString, "resultDigest" -> digest,
         "mapTaskCount" -> tasks.count.get().toString,
         "fetchFailures" -> tasks.fetchFailures.get().toString,
