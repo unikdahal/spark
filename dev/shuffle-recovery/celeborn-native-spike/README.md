@@ -18,9 +18,9 @@ Required environment:
 Run from the Spark repository root. Use paths without whitespace because sbt's
 child command parser splits the arguments. The script compiles the application
 and integration sources once with sbt, then exports its runtime classpath and
-Spark's test JVM options. The normal Core/SQL suites run in their separate CI lane. Each role then runs in a fresh Java process. Use CI for this
-expensive validation. CI compilation and execution are in progress; a committed harness alone is not
-evidence of successful native recovery.
+Spark's test JVM options. The normal Core/SQL suites run in their separate CI lane.
+Each role then runs in a fresh Java process. Use CI for this expensive validation.
+The validated candidate and its evidence are recorded below.
 
 The baseline uses Spark's ordinary shuffle manager. The producer publishes its
 native descriptor and the replacement must return the exact fixture with zero
@@ -74,5 +74,38 @@ certificate remains tied to the actual planned scan; the final producer is encod
 again after stage rules. The harness lets AQE materialize its query stage and select
 readers instead of submitting the initial exchange's potentially obsolete dependency.
 
-These are added validation cases, not evidence of successful AQE recovery until their
-CI results pass. They cover full/coalesced readers, not skew or mapper-local reads.
+## Verified AQE result
+
+Candidate [`ab0052497c019d047fee2bea4b2dba1674ae5db4`](https://github.com/unikdahal/spark/commit/ab0052497c019d047fee2bea4b2dba1674ae5db4)
+passed all three modes in the
+[native proof run](https://github.com/unikdahal/spark/actions/runs/34881546887).
+The [experimental CI run](https://github.com/unikdahal/spark/actions/runs/34881536279)
+also passed the focused Core, SQL/AQE, Iceberg conformance and lint/license checks.
+
+The downloaded `native-proof-evidence-{off,full,coalesced}` artifacts contain these
+replacement-driver measurements:
+
+| Mode | Rows | Target map tasks | Remote bytes read | Fetch failures | Merged reducer ranges |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AQE off | 32 | 0 | 730 | 0 | 0 |
+| AQE full reducers | 32 | 0 | 730 | 0 | 0 |
+| AQE coalesced | 32 | 0 | 730 | 0 | 1 |
+
+All three replacement drivers reported adoption before reading and the same result
+digest as their baseline. Both adaptive modes reported a final adaptive plan; the
+coalesced final plan contains `AQEShuffleRead coalesced` over the four-reducer exchange.
+Its final exchange differs from the initial exchange, exercising preparation after
+AQE stage transformations.
+
+Each mode passed all 13 driver invocations. Concurrent replacements each launched
+zero map tasks. Source-token, source-snapshot, producer-filter, missing-manifest and
+owner-restart controls rejected adoption and recomputed. Artifact-loss and lease-expiry
+controls observed fetch failures, ran one fresh target map task and returned the same
+32-row result. Raw properties and initial/final plans are retained in the artifacts.
+
+This establishes native recovery with full and coalesced AQE readers for this fixture:
+one host, `local[2]`, one source mapper and four reducers. It does not establish skew or
+mapper-local reads, multi-host behavior, production-scale performance, or exact native
+reducer byte statistics. The provider's map-status sizes remain scheduling estimates.
+Adopted SQL runtime statistics report unknown row count because absent current-driver
+write metrics must not be interpreted as proof that the retained exchange is empty.
