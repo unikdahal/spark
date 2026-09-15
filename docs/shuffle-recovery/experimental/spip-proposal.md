@@ -2,9 +2,9 @@
 
 **Spark Project Improvement Proposal — discussion draft**
 
-**Author:** Unik Dahal  
-**Discussion scope:** Optional batch SQL recovery  
-**Implementation baseline:** `ab0052497c0` in the current Spark fork  
+**Author:** Unik Dahal<br/>
+**Discussion scope:** Optional batch SQL recovery<br/>
+**Implementation baseline:** `ab0052497c0` in the current Spark fork<br/>
 **Status:** Early community discussion; no JIRA assignment, shepherd or vote claimed
 
 ## Q1. What are you trying to do?

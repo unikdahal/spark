@@ -227,8 +227,8 @@ The mechanism remains generic because Spark validates semantics and scheduling w
 
 ## 8. Native evidence ledger
 
-**Spark:** `ab0052497c019d047fee2bea4b2dba1674ae5db4`  
-**Native provider:** `unikdahal/celeborn`, `edb413ee3d5e77fbecf43afa7b1a33d6054ab569`  
+**Spark:** `ab0052497c019d047fee2bea4b2dba1674ae5db4`<br/>
+**Native provider:** `unikdahal/celeborn`, `edb413ee3d5e77fbecf43afa7b1a33d6054ab569`<br/>
 **Source runtime:** `apache/iceberg`, `e76d63584d7f83b102026749e1ae0f91813cb78e`
 
 [Native run 34881546887](https://github.com/unikdahal/spark/actions/runs/34881546887) passed all three matrix modes. Artifacts are named `native-proof-evidence-off`, `native-proof-evidence-full` and `native-proof-evidence-coalesced`. Each contains driver properties, initial/final plans, service logs and recorded build information. Dependency artifacts record revisions and checksums.
