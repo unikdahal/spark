@@ -1,38 +1,26 @@
 To: dev@spark.apache.org
-Subject: [DISCUSS] Completed-shuffle reuse across driver attempts — proposal and working PoC
+Subject: [DISCUSS] Reusing completed shuffle output after a driver restart
 
-Hi Spark community,
+Hi everyone,
 
-I would like feedback on an opt-in mechanism that lets a replacement driver reuse a complete retained SQL shuffle when it independently establishes that the output matches its currently planned computation.
+When a batch application's driver fails after an expensive shuffle has finished, resubmitting the application can repeat the producer work even if a shuffle service still holds the output. I'd like to discuss whether Spark should be able to reuse that output when the new driver can establish that it needs the same computation.
 
-Remote shuffle storage can preserve bytes, but a new driver still needs to establish whether those bytes represent its own exchange before skipping producer tasks. In this prototype, the current source is resolved normally, a connector certifies the actual planned read, and Spark constructs a canonical computation identity. A compatible retained candidate can then be adopted through a local scheduler decision; an unavailable or incompatible candidate runs normally. No old source snapshot or driver state is restored.
+The proposal is to resolve the new query's sources normally, compare a certified description of the read and producer with a retained exchange, and let the scheduler skip the producer maps only when the match and provider claim succeed. Otherwise Spark computes normally. Storage stays with the configured shuffle provider.
 
-I have prepared a short SPIP-style proposal and an implementation companion for early discussion:
+I've written up the proposal here:
+https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/docs/shuffle-recovery/experimental/spip-proposal.pdf
 
-Proposal (8 pages, PDF):
-https://github.com/unikdahal/spark/blob/shuffle-recovery-discussion-20260915/docs/shuffle-recovery/experimental/spip-proposal.pdf
+The accompanying design notes cover source identity, publication, scheduler adoption, AQE and failure handling:
+https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/docs/shuffle-recovery/experimental/spip-design-evidence.pdf
 
-Implementation/API contracts and evidence (10 pages, PDF):
-https://github.com/unikdahal/spark/blob/shuffle-recovery-discussion-20260915/docs/shuffle-recovery/experimental/spip-design-evidence.pdf
+Editable Word files and Markdown are linked from:
+https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/docs/shuffle-recovery/experimental/spip-draft.md
 
-Markdown, editable Word files and package index:
-https://github.com/unikdahal/spark/blob/shuffle-recovery-discussion-20260915/docs/shuffle-recovery/experimental/spip-draft.md
+I'd start with a narrow batch SQL path: a certified scan with deterministic filters/projections, one completed blocking exchange, and a reviewed result consumer. Full and coalesced reducer reads are the first AQE targets. Writes, streaming and more complicated consumer graphs would need separate work.
 
-The documents describe the implemented approach: an immutable manifest store, scheduler-accepted map publication, tracker-backed adoption, provider-native reads and integration with Spark's fetch-failure recovery. The source and provider boundaries are generic; Iceberg and Celeborn are the concrete examples used in the native experiment. The integration surfaces are private and are not proposed as stable public APIs in their current form.
+The two questions I most want to understand are whether this captures enough real retry cost to be useful, and whether the adoption and recovery boundary fits Spark's scheduler without spreading complexity through unrelated paths. I'd also appreciate input from source and shuffle maintainers on certification, manifest ownership and access across applications.
 
-The native flow now passes with AQE disabled, AQE full-reducer reads and actual reducer coalescing. In each mode, a replacement driver returned the expected result with zero producer map tasks and native remote bytes read. Concurrent claims, identity misses, artifact loss, lease expiry and owner-restart controls also passed:
-https://github.com/unikdahal/spark/actions/runs/34881546887
-
-The fixture is deliberately small: one host, local[2], one source mapper, four reducers and 32 rows. These results establish mechanism feasibility, not production performance or broad workload coverage. Authentication/encryption, multi-host behavior, shared consumers and partial-result failure boundaries still need further work. The documents distinguish those gaps from the tested behavior.
-
-I would particularly appreciate feedback on:
-
-1. Whether real driver-retry workloads have enough retained producer cost to justify this mechanism.
-2. Whether the tracker/handle adoption and existing recovery path are a suitable integration direction for Core and SQL.
-3. The right source-certification and provider/manifest boundaries, alongside existing remote shuffle work.
-4. Which consumer and AQE shapes would make a useful, manageable first upstream scope.
-
-This is an early discussion request, not a vote or an announcement of an assigned SPIP JIRA. If the direction is useful, I would like to develop a formal SPIP with community feedback and a PMC shepherd. I will drive follow-up implementation and would welcome operators willing to share representative retry scenarios.
+If you've dealt with jobs repeating substantial producer work after driver loss, examples would be especially helpful in choosing the initial scope. I'm happy to drive the implementation and work through the design with interested maintainers. If there's support for the direction, I'd like to take it forward through the SPIP process with a PMC shepherd.
 
 Thanks,
 Unik Dahal

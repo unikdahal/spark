@@ -44,7 +44,7 @@ from reportlab.platypus import (
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "spip-assets"
 PUBLIC = (
-    "https://github.com/unikdahal/spark/blob/shuffle-recovery-discussion-20260915/"
+    "https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/"
     "docs/shuffle-recovery/experimental/"
 )
 INK = "233248"
@@ -296,7 +296,7 @@ def render(stem, short_title):
         c.drawRightString(A4[0] - 52, A4[1] - 31, "DISCUSSION DRAFT")
         c.setStrokeColor(colors.HexColor("#D5DEE7"))
         c.line(52, 43, A4[0] - 52, 43)
-        c.drawString(52, 29, "Unik Dahal | Completed-shuffle reuse | Implementation ab0052497c0")
+        c.drawString(52, 29, "Unik Dahal | Completed-shuffle reuse")
         c.drawRightString(A4[0] - 52, 29, str(doc.page))
         c.restoreState()
 
@@ -329,7 +329,7 @@ def render(stem, short_title):
     footer._p.append(field)
     doc.core_properties.title = short_title
     doc.core_properties.author = "Unik Dahal"
-    doc.core_properties.subject = "SPIP discussion grounded in verified implementation"
+    doc.core_properties.subject = "Completed-shuffle reuse proposal"
     for i, tree in enumerate(trees):
         if i:
             doc.add_page_break()
@@ -365,4 +365,4 @@ if __name__ == "__main__":
         ("Fresh execution", ["Ordinary producer", "Recomputed result"]),
     ])
     render("spip-proposal", "Completed-shuffle reuse | SPIP")
-    render("spip-design-evidence", "Completed-shuffle reuse | Implementation and evidence")
+    render("spip-design-evidence", "Completed-shuffle reuse | Design notes")

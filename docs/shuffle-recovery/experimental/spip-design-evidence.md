@@ -1,36 +1,14 @@
-# Completed-Shuffle Reuse: Implementation and Evidence
+# Design Notes: Completed-Shuffle Reuse
 
-**Companion to the SPIP discussion draft | Author: Unik Dahal**
+Unik Dahal | Companion to the SPIP discussion draft
 
-**Purpose:** Explain the implemented contracts and tested behavior so Core, SQL, source and shuffle maintainers can assess the proposal. This is supporting design material, not an additional proposal or a stable API specification.
+## 1. Establishing that a read is the same
 
-## 1. Implementation baseline and reading map
+A replacement query must resolve its source normally before looking for reusable shuffle output. Otherwise discovery could change the meaning of the query by directing it to a snapshot that the new application did not request.
 
-All implementation descriptions refer to Spark commit **`ab0052497c019d047fee2bea4b2dba1674ae5db4`** in [the current fork](https://github.com/unikdahal/spark/tree/ab0052497c019d047fee2bea4b2dba1674ae5db4). The native validation uses a pinned external source runtime and shuffle-provider fork, with revisions recorded in section 8. Iceberg and Celeborn demonstrate integration; the Spark-side concepts do not depend on their names.
+The source adapter certifies the read Spark has actually planned. That certificate needs to cover the source version, delete semantics, options and row interpretation that affect the returned data. Spark then adds the meaning of the producer's filters, projections and partitioning.
 
-| Sections | Review focus |
-| --- | --- |
-| 2–3 | Source identity, accepted maps and persistent discovery |
-| 4–5 | Local adoption and actual AQE materialization |
-| 6–7 | Recovery, trust and deployment lifecycle |
-| 8–9 | Measurements, test layers and remaining validation |
-| 10 | Reproduction and code navigation |
-
-### Three separate facts
-
-**Computation equivalence:** Spark and the source adapter establish whether the current producer has the same certified semantics, decomposition and output format. **Retained materialization:** the provider exposes native output for accepted attempts. **Permission to read:** the deployment must authorize the current attempt's access. A digest, descriptor or recovery-group string cannot substitute for that permission.
-
-The prototype demonstrates the first two in a trusted test deployment. It has leases and provider incarnation checks, but not a production authenticated retry-lineage service. The proposed use is recovery; the current `recoveryGroup` and caller-supplied generation do not enforce that two submissions are authenticated retries of one logical submission.
-
-### Important implementation choices
-
-The path uses an immutable filesystem manifest store, tracker-backed native map availability and ordinary `FetchFailed` dispatch. These are the implementation choices to evaluate for upstream integration.
-
-<!-- pagebreak -->
-
-## 2. Source certification and computation identity
-
-The internal binding associates certified facts with one actual `BatchScanExec`. The relevant signature is:
+The proposed source boundary follows this shape:
 
 ```scala
 def bind(
@@ -42,33 +20,55 @@ def bind(
     : Either[ShuffleRecoveryMissReason, ShuffleRecoverySourceBinding]
 ```
 
-Partition objects must match `plan.inputPartitions` exactly and in order. The binding copies descriptor bytes and rejects active runtime filters, grouping, empty/mismatched decomposition and oversized data. Planning exceptions propagate. `isCurrent` rechecks plan/partition identity and filters/grouping.
+The partition objects in this call are the same objects, in the same order, that the scan will execute. The adapter must not call a second planning operation and assume it obtained an equivalent answer. The binding owns copies of the certificate bytes and can later check that the scan and partition sequence are still current.
 
-The native adapter captures the connector's actual planning event. Its cached factory revalidates the exchange after AQE transformations. Both source semantics and physical decomposition must match; equivalent rows with different split planning may miss.
+There are two reasons a replacement read might differ: the data's meaning has changed, or the same data has been divided into different physical splits. The first implementation requires both to match. This may reject harmless replanning, but makes mapper correspondence explicit. A future relaxation would need a separate argument for why the changed layout preserves every relevant shuffle property.
 
-This is not a blanket rejection of every class implementing `SupportsRuntimeV2Filtering`: the code checks active runtime filters and actual bound planning state. Broader post-certification partition changes remain outside the demonstrated flow and require review.
+### Planning changes after certification
 
-### Canonical producer contract
+Runtime filtering and grouped partitions complicate the relationship between a source certificate and the rows eventually read. The initial path should reject active runtime filters and grouped scan partitions, and refuse a binding whose planned sequence changes. Supporting a connector interface is not enough; the adapter must account for the actual planning lifecycle.
 
-`ShuffleRecoveryCertifiedBatchInputs.build(exchange, binding, providerReadFormatId)` returns either a rejection reason or canonical inputs. It admits the reviewed scan/filter/project grammar and transparent execution wrappers, then checks mapper count against the actual dependency. Unsupported operators/expressions fail closed. It is not a generic use of Catalyst's incidental plan hash.
+An unavailable certificate means Spark cannot use this optimization. A normal source planning or authorization error remains a query error. These outcomes should not be conflated: falling back to computation cannot make an unreadable source valid.
 
-Identity includes source protocol facts, ordered mapper descriptors, supported expression/type semantics, output partitioning, Spark revision and provider read format. The handoff supplies ANSI mode, session timezone, shuffle compression, codec/block size and I/O encryption settings. Those modeled fields do not imply that every Spark expression, extension or connector version has been audited.
-
-| Bound in this source path | Current value |
-| --- | ---: |
-| Certified partitions | 4,096 |
-| Individual split descriptor | 64 KiB |
-| Combined certificate/decomposition budget | 1 MiB |
-| Framed source token | 64 KiB |
-| Complete canonical identity | 1 MiB |
-
-The Iceberg example uses a 40-byte descriptor per mapper: count, ordinal and ordered decomposition digest. The generic encoding still persists per-split descriptors; this is bounded O(split count) metadata, not a new O(plan)-only identity format. The connector remains trusted for the semantic truth of its certificate.
+The connector is trusted to describe its read correctly. A digest protects comparison and lookup; it cannot establish the truth of a source's certificate.
 
 <!-- pagebreak -->
 
-## 3. Accepted map publication and manifest discovery
+## 2. Describing the computation
 
-The implemented provider boundary is private and native-format agnostic:
+The identity should describe the computation rather than the incidental IDs assigned during planning. Expression IDs, local shuffle IDs and object addresses can change after a restart without changing the query. They are useful for local checks, but should not become cross-driver identity fields.
+
+Spark should use a versioned encoding for a small set of reviewed producer operators and expressions. Unsupported nodes decline reuse. Transparent execution wrappers may be ignored only where they do not change the encoded semantics.
+
+| Part of the identity | What it establishes |
+| --- | --- |
+| Source facts | The resolved read, including source-specific row and delete semantics. |
+| Producer | Supported expressions, literals, types and operations that determine the rows. |
+| Mapper decomposition | The ordered source partitions assigned to producer tasks. |
+| Output partitioning | Partitioning expressions, reducer count and relevant partitioner behavior. |
+| Compatibility | Spark build, serializer and provider read format, plus modeled semantic settings. |
+
+ANSI behavior, timezone and compression settings are examples of dependencies that need explicit treatment. An operator with additional dependencies cannot be admitted merely because some settings are already represented. Connector and provider protocol versions must also have a clear compatibility meaning.
+
+### Exact comparison and bounded metadata
+
+A digest provides a practical discovery key. It should not be the only comparison: the retained record carries the canonical payload so Spark can compare the complete encoded identity before adoption.
+
+The encoding needs limits on depth, node count, string length, certificate size and partition metadata. Lengths must be checked before allocation when decoding records. A source with too many splits should cause an ordinary miss rather than unbounded driver metadata.
+
+Ordered split descriptors preserve ordering and duplicates. A connector may use a framed digest for a large source-specific decomposition, but the generic contract still has to state what each mapper represents. A compact digest is not a reason to stop reviewing those semantics.
+
+### Identity is not authority
+
+Two applications can have identical computation identities and different access rights. A record match does not authorize either discovery or reading. It also does not establish that the applications belong to one logical retry. Those decisions belong to the deployment's access policy, independently of SQL equivalence.
+
+<!-- pagebreak -->
+
+## 3. Publishing completed output
+
+A retained artifact must refer to the map attempts Spark accepted. Speculation makes the logical map number insufficient: two attempts can write output for the same map, while only one is selected for the stage.
+
+The provider-facing publication contract can remain small:
 
 ```scala
 trait ShuffleRecoveryNativePublicationProvider {
@@ -79,31 +79,37 @@ trait ShuffleRecoveryNativePublicationProvider {
 }
 ```
 
-The publication context carries recovery group, generation, incarnation, local shuffle ID and canonical identity. Successful task events supply task ID, stage-attempt ID and task-attempt number. A logical map index alone is not the native winner identity.
+The accepted-attempt vector is ordered by map index and includes task and stage-attempt coordinates. The provider translates these into its own native representation. It must not interpret the call as permission to choose whichever output it happens to find for each map.
 
-`ShuffleRecoveryNativePublicationBackend` requires complete partition-ordered winners matching the certified mapper/reducer counts. It checks tracker agreement before sealing, calls the provider, checks agreement again, then captures map-output estimates under tracker protection. It publishes only a valid bounded descriptor whose format matches the identity.
+![Publication from accepted maps to a discoverable record](spip-assets/publication.png)
 
-In the native example, the adapter validates stage/task attempt coordinates before encoding them into the provider's 16-bit attempt fields. This is implemented attempt-coordinate translation, not an unimplemented generic opaque winner-token protocol.
+Spark checks that the full winner selection agrees with current tracker state before sealing. It checks again after sealing and captures the scheduling metadata for that same selection. Only then is the manifest published. A changed selection or incomplete output prevents publication.
 
-![Publication and replacement preparation](spip-assets/publication.png)
+The descriptor returned by `seal` is opaque to SQL. The configured provider validates its format and uses it to locate native data. The manifest cannot select an arbitrary implementation class or redefine the computation identity.
 
-### Persistence contract
+### Making a record discoverable
 
-`ShuffleRecoveryManifestStore.publish(manifest)` commits an immutable body, then its index reference. Discovery uses `findCompatible(recoveryGroup, identity, currentGeneration)`. Only earlier generations are candidates. It checks group, incarnation, generation, provider compatibility, digest and **full canonical payload equality**. Malformed candidates are skipped individually; overfull discovery namespaces fail closed. Paths and encoded sizes are validated.
+Publication writes an immutable manifest body before committing its discovery reference. A reference must never expose a partially written body as a complete candidate. Repeating publication of the same record should be idempotent; a conflicting record must not overwrite an existing incarnation.
 
-The store is an actual filesystem integration point in the PoC. It is separate from native byte storage. Claiming that discovery already belongs to one provider SPI would misdescribe the implementation.
+The manifest includes the recovery group, publishing generation and incarnation, canonical identity, shape, descriptor and accepted-map scheduling metadata. Native descriptors and dense mapper/reducer metadata require separate size limits.
 
-Native manifests carry an opaque provider descriptor and `ShuffleRecoveryNativeMapOutput(mapTaskId, reducerBytes)`. The latter is scheduling metadata, not native byte offsets or authoritative SQL statistics. Native descriptor size is bounded at 5 MiB, total manifest size at 8 MiB, and the dense map/reducer estimate matrix at 131,072 cells.
-
-The pre/post-seal checks do not establish a distributed revocation protocol for an artifact invalidated later. Caller generations are ordering metadata, not a provider-authoritative security fence. Durable treatment of later semantic invalidity remains a review question.
+Checks around sealing protect the publication operation. They do not solve every later invalidation. If Spark or the provider subsequently learns that an artifact is semantically invalid, future reuse must be prevented. The provider lifecycle needs an explicit treatment of that case; expiry alone is not an answer once the artifact is known to be bad.
 
 <!-- pagebreak -->
 
-## 4. Preparation and local scheduler adoption
+## 4. Discovery and preparation
 
-The configured native adapter discovers a compatible manifest, acquires a provider-backed read binding and offers it against a reservation for the current dependency. Preparation returns a session that the caller retains until completion/cleanup, or a reason to use ordinary execution.
+The manifest store provides two operations: publish an immutable record, and find an earlier compatible record within a recovery group. Lookup compares the canonical identity and provider format, checks the record's generation and incarnation, and rejects malformed references. An overfull discovery namespace should fail closed rather than turn one lookup into an unbounded scan.
 
-The implemented local installation contract is:
+Keeping the manifest store separate from the provider allows Spark to own the record format without imposing a storage service on every shuffle implementation. It does mean the deployment must protect two resources: discovery metadata and retained bytes. Their access policies must agree.
+
+### Preparing a reader
+
+A candidate record is only a starting point. The configured provider must validate its descriptor and prepare a current read claim before Spark can suppress producer work. The claim must refer to the complete materialization, remain independent of other readers and have a defined expiry and release behavior.
+
+Preparation runs outside scheduler serialization. It associates the candidate with a reservation for the current materialization and exact local dependency. The result is either a prepared installation or a reason to compute normally. A reservation should not permit an offer from an older attempt to replace a newer decision.
+
+The local installation has this contract:
 
 ```scala
 trait ShuffleRecoveryNativeInstallation extends AutoCloseable {
@@ -116,199 +122,127 @@ trait ShuffleRecoveryNativeInstallation extends AutoCloseable {
 }
 ```
 
-Compatibility, liveness, installation and invalidation are local operations. `close()` may perform provider I/O and is deferred by the backend. `offerPrepared` takes ownership even when it rejects an offer. The caller cannot keep using a rejected installation.
+`isCurrent`, `install` and `invalidate` must be local operations. `close` may contact the provider and is scheduled outside the scheduler's critical path. Ownership transfers with the offer, including offers that are rejected, so there is one clear party responsible for releasing the claim.
 
-### Adoption transaction
+### What happens on a miss?
 
-`ShuffleRecoveryNativeAdoption.beforeFindMissingPartitions` checks the exact dependency object, current reservation, mapper count, existing tracker entry with zero available outputs and current prepared installation. It installs the handle binding, replaces the expected empty `ShuffleStatus`, records adoption and increments the tracker epoch. If adoption does not commit, ordinary execution wins and the prepared binding is invalidated/released.
+No matching record, an expired claim or an incompatible descriptor should leave the dependency available for ordinary execution. Source errors retain their normal behavior. Preparation needs a finite budget and cancellation handling so an unresponsive provider cannot hold a query indefinitely.
 
-The restored statuses are `ShuffleRecoveryNativeMapStatus` objects with captured estimates and accepted task IDs. Their synthetic location identifies the binding; native bytes are read through the manager's wrapped handle, not an ordinary block reader pointed at a fabricated executor.
-
-### Scope and concurrency limits
-
-The backend associates adoption with the local dependency and binding location/epoch. It does **not** implement exclusive action/query-stage availability outside `MapOutputTracker`. Another consumer of the dependency is therefore a relevant review concern. The native fixture deliberately selects one exchange and does not establish safe automatic reuse across arbitrary shared plans.
-
-Provider preparation finishes before scheduler serialization; remote cleanup is deferred. However, the harness performs discovery and claim work before map-stage submission and may wait for it. There is no demonstrated zero-delay all-miss path. A late or rejected offer cannot overwrite an already running ordinary materialization, but low preparation cost is a performance question still to measure.
-
-The current generic scheduler hooks are `beforeFindMissingPartitions`, `handleFetchFailure`, `consumeWholeStageRetryRequirement` and `isAdopted`. Native managers expose them through `ShuffleRecoverySchedulerBackendProvider`; indexed reference recovery remains available through its resolver. This is an internal PoC integration, not a stable external ABI.
+There is a latency tradeoff here: waiting longer can increase the chance of reuse, but delays every miss. This should be measured and exposed as a bounded policy, rather than described as free because the work happens on another thread.
 
 <!-- pagebreak -->
 
-## 5. AQE lifecycle: implemented and tested
+## 5. The scheduler's adoption decision
 
-AQE can transform an exchange before materializing its shuffle query stage. Preparing the initial exchange's dependency alone can therefore bind the wrong local object. The prototype now attaches a driver preparation callback as a plan tag and executes it on the actual exchange used for materialization.
+Adoption occurs before Spark selects missing producer partitions. The scheduler verifies the current reservation, the exact dependency, the expected mapper count and the absence of accepted ordinary map output. It also verifies that the prepared binding is still current.
+
+If those checks succeed, Spark installs the native reader binding in the current shuffle handle and replaces the dependency's empty tracker status with the complete retained status. The tracker epoch advances so executors do not continue using stale cached metadata. If the installation does not commit, ordinary execution wins and the prepared claim is released.
+
+This must be one local decision. A provider callback cannot independently declare the map stage complete while Spark is submitting fresh maps for the same dependency.
+
+### Availability and the data path
+
+The tracker needs enough information to establish map availability and support scheduling. It does not need to turn native retained storage into local Spark index files. Accepted map IDs and reducer-size estimates can be represented in native map statuses, while the configured shuffle implementation reads through its own handle and descriptor.
+
+The binding's synthetic location identifies this installation for failure handling. Ordinary readers must not interpret it as a physical executor address from which they can fetch conventional blocks.
+
+### Dependency sharing
+
+Tracker-backed availability belongs to a dependency, not a single SQL action. That is important when considering exchange reuse or multiple consumers. Admitting one consumer cannot silently establish that every other consumer is safe to use the retained output.
+
+The first upstream integration should therefore select a dependency whose consumer path is understood and reject shared exchange shapes until their ownership and recovery behavior are reviewed. A separate action-scoped availability system is another possible design, but should be justified by the sharing requirements rather than assumed necessary at the outset.
+
+### Cleanup
+
+Cancellation, rejected offers and shuffle unregistration must fence the binding locally and arrange provider cleanup. A slow or failing release cannot restore an invalid binding. Cleanup queues and per-driver retained state need bounds, just as discovery and encoding do.
+
+The proposed scheduler hooks cover adoption before missing-map selection, classification of an adopted fetch failure, a whole-stage retry requirement and adoption status. Their purpose is to keep provider I/O out of Core's serialized decisions while still letting Core own the outcome.
+
+<!-- pagebreak -->
+
+## 6. Adaptive query execution
+
+AQE can change an exchange before creating and materializing its shuffle query stage. A claim prepared for the initial plan may therefore belong to a different dependency from the one that actually executes.
+
+Preparation needs to follow the exchange through those transformations and run against the final exchange, immediately before map-stage submission. The source certificate remains tied to the read already planned; the producer identity is checked again for the materialized exchange.
 
 ```scala
-ShuffleRecoveryExchangePreparation.attach(initialExchange) { actual =>
-  // Revalidate certified source and producer for this actual exchange.
-  // Attach publication or prepare native adoption before map submission.
+ShuffleRecoveryExchangePreparation.attach(initialExchange) { exchange =>
+  // Validate the current source binding and producer identity.
+  // Prepare adoption for this exchange's actual dependency.
 }
 ```
 
-The hook runs from `ShuffleExchangeExec.mapOutputStatisticsFuture` immediately before `sparkContext.submitMapStage(shuffleDependency)` for a nonempty blocking exchange. The source factory retains its original certificate and verifies the final producer; it does not silently certify another scan.
+After the scheduler decides between adoption and ordinary maps, the existing map-stage completion path supplies statistics to the query stage. AQE can then choose its reducer reads. This avoids treating the initial plan's dependency as if it were guaranteed to survive adaptive planning unchanged.
 
-| Phase | Actual behavior |
-| --- | --- |
-| Initial planning | Capture the source certificate and attach preparation to the selected exchange. |
-| AQE stage construction | Stage rules can copy the exchange; plan tags carry the preparation callback. |
-| Materialization | Prepare the final dependency, then submit its map stage through the existing path. |
-| Scheduler decision | Install a ready retained binding or submit ordinary maps. |
-| Statistics and reader selection | Existing map-stage completion feeds AQE; AQE selects full/coalesced reads in the tested modes. |
-| Consumption | The wrapped handle routes reads through the native retained reader or the ordinary delegate after invalidation. |
+### Reader shapes
 
-### Statistics correction
+The first supported grammar is all maps over one complete reducer or a contiguous range of complete reducers. Coalescing falls within that grammar. Partial mapper ranges, skew splits, local shuffle readers and merged-shuffle representations require additional information and separate review.
 
-Retained adoption launches no current-driver map tasks, so current shuffle-write metrics remain zero. Treating that as exact zero rows can let AQE infer an empty relation incorrectly. `ShuffleExchangeExec.runtimeStatistics` now returns `Statistics(conf.defaultSizeInBytes, None)` while adopted. The row count is unknown, not zero.
+Admission must account for the adaptive rules that can affect the selected exchange, and the actual reader specifications must be checked before tasks are launched. Unknown extension rules cannot be assumed to preserve the supported shapes. If a late rewrite falls outside the agreed contract, Spark must fail closed; it must not route an unsupported read into the retained provider.
 
-Captured reducer sizes still feed the existing map-output statistics path as estimates. The PoC does not introduce a separate authoritative-statistics API. Passing coalescing proves this fixture's behavior; it does not certify every statistics-dependent adaptive rewrite.
+The exact handling of that late case needs SQL review. In particular, a completed query-stage future cannot simply be reset to pending and treated as if no materialization occurred.
 
-### Concrete read coverage
+### Statistics
 
-The `full` mode enables AQE with explicit four-way repartitioning and coalescing disabled. The `coalesced` mode uses column-based repartitioning with four configured shuffle partitions and requires an actual range spanning multiple complete reducers. Its final plan contains `AQEShuffleRead coalesced`; merely enabling AQE is insufficient to pass.
+An adopted exchange has no current-attempt shuffle-write metrics. Zero recorded rows therefore does not mean that the exchange is empty. Its SQL row count must remain unknown unless a trustworthy value is available for the retained materialization.
 
-The native run also exercises misses, expiry and artifact loss in both adaptive modes. Skew/partial-mapper readers, custom AQE rules, shared stages and arbitrary downstream graphs remain unproven. Materialization continues through the existing query-stage future.
+Reducer-size estimates can support the existing scheduling path, but must not be described as exact native byte counts. Broader AQE decisions may require stronger statistics than the initial reader grammar does. Any such requirement belongs in the provider contract with explicit units, shape checks and size limits.
+
+Validation should inspect the final adaptive plan and actual partition specifications. It should also exercise retained-data loss after materialization, because successful coalescing alone says little about recovery.
 
 <!-- pagebreak -->
 
-## 6. Failure dispatch and recomputation
+## 7. Failure after adoption
 
-The native reader verifies the current driver binding and holds an independently renewed provider lease. Native failures before or during iterator consumption are translated to `FetchFailedException` with the retained binding location and current shuffle ID. Cancellation preserves ordinary interruption behavior.
+Retained data can disappear after a successful claim. A lease can expire, a service can restart or a read can discover unavailable data. The reader must report the failure with enough information to identify the exact binding and dependency that were in use.
 
-![Native adopted-shuffle failure path](spip-assets/failure.png)
+The proposed native path translates an adopted-read failure into Spark's fetch-failure machinery. The retained location identifies the binding rather than an ordinary failed executor.
 
-### Local failure transition
+![Invalidating retained availability before recomputation](spip-assets/failure.png)
 
-The scheduler routes a native failure to `handleFetchFailure`. For the current dependency and binding, the backend invalidates the handle, removes adopted state, replaces the adopted tracker registration with an empty `ShuffleStatus`, clears serialized caches and increments the epoch. Provider release is deferred. A stale location or old event does not invalidate a new binding.
+For a current binding, the backend first fences the reader, removes adopted availability, invalidates serialized tracker caches and advances the epoch. It records the whole-stage retry requirement and defers provider release. A stale failure must not clear a new binding or fresh output that belongs to a later generation.
 
-Successful invalidation records a one-shot whole-stage retry requirement. `ShuffleMapStage` consumes and latches it into the existing indeterminate-stage recovery decision. DAGScheduler then uses its established stage retry/rollback machinery. The native failure path also avoids treating the synthetic binding address as an ordinary failed host requiring unrelated output cleanup.
+DAGScheduler can then apply its stage recovery rules. A retained binding address must not trigger unrelated host-wide cleanup. Recomputing the producer means computing the full exchange from the current source, not filling a few missing blocks while leaving the old binding active.
 
-Spark's existing recovery rules may retry or abort according to stage state. The proposal must not promise arbitrary action rollback or exactly-once application effects.
+### Results already in flight
 
-### What the native fault tests establish
+This is the recovery boundary that needs the most careful review. Tasks from the old generation may still be running or completing when the failure arrives. Cancellation does not prove that their completion events have disappeared. Task-attempt and stage-generation checks must prevent stale completions from being accepted as part of fresh execution.
 
-Both artifact loss and lease expiry are injected **after adoption and before the result read**. In every mode, the read observed fetch failure, invalidated adoption, ran one fresh producer map task and returned the baseline 32-row result. These tests validate the native dispatch and recomputation path with AQE full/coalesced readers.
+A pure result path is easier to reason about than a write or callback, but purity alone does not establish that Spark can roll back a result already delivered to application code. The first supported consumer must fit the scheduler's actual retry or abort behavior. There is no general promise of exactly-once application effects in this proposal.
 
-They do not demonstrate a native fault after a user-visible result partition has been accepted, nor revocation during an already-open stream. The surrounding scheduler/reference suites exercise additional boundaries, but those tests are not interchangeable with the exact native scenario. Shared consumers and irreversible actions require their own admission and tests.
+### Availability and invalidity
 
-### Error categories
+Temporary unavailability and known-invalid data have different lifecycles. A later attempt may be able to read an artifact after a transient outage. An artifact with a known semantic contradiction or corruption must not be rediscovered repeatedly as a valid candidate.
 
-Incompatible or missing discovery records and rejected preparation become ordinary execution in the harness. Source planning exceptions retain normal query semantics. Native availability errors enter the fetch-failure path. The current native adapter does not expose a separate production corruption/quarantine protocol; do not infer one from local invalidation or lease expiry.
+The local scheduler can fence its own binding. Preventing future claims requires cooperation from the manifest/provider lifecycle. That durable behavior, including idempotence and failure during invalidation, must be settled before production enablement.
 
-<!-- pagebreak -->
-
-## 7. Trust, lifecycle and deployment contract
-
-### Current operational inputs
-
-The native harness explicitly supplies a manifest root, recovery group, generation, provider format, provider endpoint and lease duration. Producer generation is earlier than replacement generation; publication incarnation distinguishes an artifact. These values support discovery and local lifecycle checks. They are not signed assertions or access credentials.
-
-The source is resolved independently in each driver JVM. Provider-native data and immutable manifests survive driver scratch cleanup. The provider's standalone lifecycle owner outlives the producer. Replacement claims have independent leases; release of one reader must not terminate another. Concurrent replacement JVMs test that property.
-
-### Leases and owner restart
-
-The native adapter renews leases outside scheduler execution. A locally expired lease stays fenced even if a delayed renewal later succeeds. The test pauses the lifecycle owner long enough to expire the replacement lease, then resumes the same owner and verifies recomputation. A separate test restarts the owner with a new incarnation and requires rejection of the old candidate.
-
-These tests do not establish replicated lifecycle metadata or transparent provider control-plane failover. Retention policy, storage quotas and cleanup costs remain provider/operator responsibilities. The Spark backend has bounded state and cleanup work; boundedness does not by itself establish production-scale throughput.
-
-### Production obligations before enablement
-
-| Boundary | Required deployment work |
-| --- | --- |
-| Source access | Preserve normal current source authorization; certify the actual authorized read. |
-| Manifest root | Restrict read/write access and protect canonical source metadata. Filesystem integrity checks are not user authentication. |
-| Retained bytes | Authorize the replacement principal through the provider; a descriptor or matching digest is insufficient. |
-| Retry membership | Decide whether an authorized scope is sufficient or authenticated logical retry lineage is required. The current group string does not enforce lineage. |
-| Encryption | Establish secure cross-attempt key access without copying old application secrets into metadata. The native fixture runs with I/O encryption disabled. |
-| Invalid artifacts | Define provider behavior for known corruption or semantic invalidity, including future discovery/claims. Local invalidation is not durable quarantine. |
-
-The mechanism remains generic because Spark validates semantics and scheduling while providers implement their native read/lifetime model. Genericity does not mean every provider satisfies this contract without adaptation. The reference file provider is an in-tree testing implementation; the native adapter demonstrates a different storage path. Public API placement should be decided with existing shuffle-extension maintainers.
+Fault tests should cover both events and their races: old successes after fencing, duplicate failures, lease renewal replies after expiry, and cancellation during release.
 
 <!-- pagebreak -->
 
-## 8. Native evidence ledger
+## 8. Access, lifetime and interface review
 
-**Spark:** `ab0052497c019d047fee2bea4b2dba1674ae5db4`<br/>
-**Native provider:** `unikdahal/celeborn`, `edb413ee3d5e77fbecf43afa7b1a33d6054ab569`<br/>
-**Source runtime:** `apache/iceberg`, `e76d63584d7f83b102026749e1ae0f91813cb78e`
+Source authorization, discovery authorization and permission to read retained bytes are separate checks. The current principal must pass each applicable check. Matching query semantics cannot bridge an access boundary between applications.
 
-[Native run 34881546887](https://github.com/unikdahal/spark/actions/runs/34881546887) passed all three matrix modes. Artifacts are named `native-proof-evidence-off`, `native-proof-evidence-full` and `native-proof-evidence-coalesced`. Each contains driver properties, initial/final plans, service logs and recorded build information. Dependency artifacts record revisions and checksums.
+A recovery group and publishing generation provide a useful namespace and ordering rule. They do not authenticate retry membership. Deployment integration must establish who may publish into the group, who may discover its records and who may claim its artifacts. If the product requires strict logical-retry confinement, that membership must come from a trusted authority rather than a caller-selected string.
 
-| Driver/control | Count per mode | Target maps | Result |
-| --- | ---: | ---: | --- |
-| Baseline | 1 | 1 | Ordinary execution |
-| Producer; restart producer | 2 | 1 each | Complete native publication |
-| Replacement hit | 1 | 0 | Adopted native read |
-| Concurrent replacements A/B | 2 | 0 each | Independent successful claims |
-| Source token; snapshot; producer filter | 3 | 1 each | Incompatible candidate rejected |
-| Missing manifest | 1 | 1 | Normal recomputation |
-| Owner restart | 1 | 1 | Old candidate rejected |
-| Artifact loss | 1 | 1 | Fetch failure then recomputation |
-| Lease expiry | 1 | 1 | Fetch failure then recomputation |
+The same principle applies to encryption. Retained readers need authorized cross-attempt access through the provider's security model. Canonical records and serialized task metadata should contain references and public compatibility facts, not the earlier application's bearer secrets.
 
-That is **13 invocations per mode, 39 total**, all returning 32 rows with the same result digest within their mode. Positive native replacements each read 730 remote bytes with zero fetch failures and zero producer maps. Both adaptive modes report a final adaptive plan. Every coalesced-mode invocation reports one merged reducer range.
+### Reader lifetime
 
-The common digest is `25a09c0e32dacd10d7ff9c20a605112c38ea0ecaecc0c3bca23f94cce13703b5`. Fault cases may have different fetch-failure counts because task timing differs; the asserted outcome is observed failure plus fresh producer execution and exact result equivalence.
+Each reader needs an independent claim so that one application's cleanup cannot revoke another's access accidentally. Lease expiry must fence local reads even if a delayed renewal reply subsequently arrives. Provider restart needs a defined incarnation policy: either the provider can restore the claim safely, or the replacement computes normally.
 
-### Measurement limits
+Retention, quotas and eventual deletion belong to the provider/operator. Manifest expiry and byte expiry can occur separately; discovery must tolerate that race. Removing a record does not by itself prove that a reader has stopped, and releasing a reader does not necessarily mean the retained artifact should be deleted.
 
-One host, `local[2]`, one source mapper, four reducers and 32 rows. Driver processes are distinct, but executors/services are not distributed across machines. This is functional evidence, not a throughput, cost or latency benchmark. No speedup percentage is inferred from timing fields.
+### Interface decisions for upstream review
 
-Only this exact native candidate is used for the current claim. Older opportunity studies and historical harness runs are not evidence for the present AQE flow. Subsequent documentation-only commits do not change the tested code, and are not relabeled as the implementation tested by this run.
+The contracts in these notes describe required responsibilities. Their current class names need not become public APIs. Source certification should begin as an internal or experimental capability; existing sources must continue to work without it. Provider capability discovery must respect the shuffle implementation selected for the blocking dependency and remain compatible with existing shuffle-extension work.
 
-<!-- pagebreak -->
+Useful review questions are whether the source facts are sufficient, whether tracker-backed adoption can be contained to the initial consumers, and whether the manifest/provider split fits real deployments. Answers to those questions should guide API placement and defaults.
 
-## 9. Validation layers and remaining work
+### Further reading
 
-[Experimental run 34881536279](https://github.com/unikdahal/spark/actions/runs/34881536279) passed focused Core recovery, focused SQL/AQE and harness coverage, pinned source conformance, and lint/license gates. Its exact-candidate gate passed. These are focused checks, not a claim that every Spark test was run.
+[Source and scheduler integration code](https://github.com/unikdahal/spark/tree/ab0052497c019d047fee2bea4b2dba1674ae5db4) is available in the current Spark fork for readers who want to inspect concrete signatures. The proposal's requirements and initial scope are described in the [main document](spip-proposal.md).
 
-| Layer | What it contributes |
-| --- | --- |
-| Identity and source binding | Canonical encoding, negative admission, exact planned-read association and connector conformance. |
-| Manifest/publication and Core recovery | Record validation, accepted winner selection, reservations, tracker invalidation and scheduler integration. |
-| SQL exchange preparation | New suite checks preparation of the actual AQE exchange once, final plan identity and real coalescing. |
-| Native process matrix | Concrete source/provider integration, cross-driver map avoidance, actual native reads and selected failure recovery in all three AQE modes. |
-
-### What still needs proof
-
-- Representative workload value: driver retry frequency, cost-weighted eligible work, retention hit rate, preparation delay and total operational cost.
-- Multiple hosts/executors, many mappers/reducers, speculation and stage retries in the complete native integration, not only component fixtures.
-- Explicit consumer eligibility and recovery behavior for shared exchanges, downstream stages and partial result acceptance.
-- Additional AQE reader shapes and custom rules; authoritative native statistics if broader adaptive decisions require them.
-- Authentication, manifest isolation, encryption and secure cross-attempt provider access in a realistic deployment.
-- Provider failure during open streams, lifecycle failover and durable handling of known-invalid materializations.
-- Generalized connector conformance and API compatibility beyond the demonstration adapter and test fixtures.
-
-### Reproducible opportunity study
-
-Start with real retry incidents rather than queries selected to guarantee reuse. Record the original source and AQE settings; report every exclusion and the cost of the eligible producer. Separate changed semantics from changed physical layout. Include all-miss and first-attempt overhead, not only successful replacements.
-
-Neither the current code nor these documents claims that all those gates must be solved before early discussion. They identify the evidence needed to choose a useful upstream scope. The existing implementation is the baseline for that discussion.
-
-<!-- pagebreak -->
-
-## 10. Reproduction and implementation index
-
-Use the [tested fork tree](https://github.com/unikdahal/spark/tree/ab0052497c019d047fee2bea4b2dba1674ae5db4), not an unpinned moving checkout, to reproduce the recorded result. The native workflow builds pinned source/provider dependencies and runs each mode in its own services and storage. The harness README documents required runtime paths and endpoints.
-
-```bash
-# With pinned runtimes and provider services configured:
-export SPARK_RECOVERY_AQE_MODE=full
-runner=dev/shuffle-recovery/celeborn-native-spike/cold-process.sh
-bash "$runner" /tmp/native-full-new-run
-
-# Use a separate, new directory and isolated services for coalesced/off.
-```
-
-The [native workflow](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/.github/workflows/shuffle-recovery-native.yml) is the complete CI recipe. It runs the service supervisor and the `off`, `full`, `coalesced` matrix. Native validation is tag-triggered on the fork; it is not an ordinary upstream Spark test configuration.
-
-### Code review entry points
-
-- [Source binding](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoverySourceBinding.scala) and [certified exchange inputs](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryCertifiedBatchInputs.scala).
-- [Canonical producer builder](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryComputationIdentityBuilder.scala).
-- [Native publication](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/core/src/main/scala/org/apache/spark/shuffle/ShuffleRecoveryNativePublication.scala) and [manifest/store implementation](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/core/src/main/scala/org/apache/spark/shuffle/ShuffleRecoveryManifest.scala).
-- [Native adoption transaction](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/core/src/main/scala/org/apache/spark/ShuffleRecoveryNativeAdoption.scala) and [scheduler backend contract](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/core/src/main/scala/org/apache/spark/ShuffleRecoverySchedulerAdoption.scala).
-- [AQE preparation hook](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleRecoveryExchangePreparation.scala) and [exchange/statistics integration](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/sql/core/src/main/scala/org/apache/spark/sql/execution/exchange/ShuffleExchangeExec.scala).
-- [DAGScheduler failure handling](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/core/src/main/scala/org/apache/spark/scheduler/DAGScheduler.scala) and [ShuffleMapStage retry marker](https://github.com/unikdahal/spark/blob/ab0052497c019d047fee2bea4b2dba1674ae5db4/core/src/main/scala/org/apache/spark/scheduler/ShuffleMapStage.scala).
-- [Native source/provider harness and reader](https://github.com/unikdahal/spark/tree/ab0052497c019d047fee2bea4b2dba1674ae5db4/dev/shuffle-recovery/celeborn-native-spike) and [source conformance adapter](https://github.com/unikdahal/spark/tree/ab0052497c019d047fee2bea4b2dba1674ae5db4/dev/shuffle-recovery/iceberg-source-spike).
-
-For upstream review, compare these integration points with the intended target branch. The fork is a prototype, and a green experiment is not a substitute for normal API, scheduler and release review.
+Related work: [SPARK-25299](https://issues.apache.org/jira/browse/SPARK-25299), [SPARK-54327](https://issues.apache.org/jira/browse/SPARK-54327) and the [SPIP process](https://spark.apache.org/improvement-proposals.html).

@@ -1,233 +1,171 @@
-# Completed-Shuffle Reuse Across Driver Attempts
+# Reusing Completed Shuffle Output After a Driver Restart
 
 **Spark Project Improvement Proposal — discussion draft**
 
-**Author:** Unik Dahal<br/>
-**Discussion scope:** Optional batch SQL recovery<br/>
-**Implementation baseline:** `ab0052497c0` in the current Spark fork<br/>
-**Status:** Early community discussion; no JIRA assignment, shepherd or vote claimed
+Unik Dahal
 
 ## Q1. What are you trying to do?
 
-Avoid repeating expensive work when a batch application's driver is replaced, if the output of that work still exists and the replacement independently establishes that it needs the same result.
+A batch application can lose its driver after spending a substantial amount of time producing shuffle output. When the application is submitted again, Spark repeats that work even if a shuffle service still holds the completed output.
 
-More specifically, allow a replacement driver to adopt one complete retained SQL shuffle instead of running its producer map tasks again. The new driver plans its query normally. A connector certifies the actual source read; Spark constructs a bounded computation identity; a shuffle provider makes the old output readable. Only a compatible, complete candidate may suppress the new map stage. Otherwise Spark computes normally.
+I propose allowing Spark to reuse that output when the replacement driver can establish that its new query needs exactly the same computation. The replacement still plans the query and resolves its data sources normally. If the source read, producer expressions, partitioning and data format match a complete retained exchange, Spark can skip the producer map tasks and read the retained output. If they do not match, execution proceeds as usual.
 
-### The decision requested
+Consider a query that reads an immutable dataset, applies a filter and projection, and repartitions the result. The driver fails after the repartitioning work has finished. The resubmitted query resolves the same read and requests the same exchange. Keeping those bytes can save work, but their existence is only half the problem: Spark must also determine whether using them would preserve the query's meaning.
 
-Should Spark support this optional semantic check and scheduler adoption mechanism for completed exchanges across driver attempts, building on the working prototype described here?
+This proposal adds that determination and connects it to the scheduler's decision to submit map tasks. Storage remains the responsibility of the configured shuffle provider.
 
-The request concerns the use case, ownership boundaries and integration direction. It does not ask the community to approve every private class, record format or provider protocol in the prototype. Those details are included in the companion so reviewers can assess feasibility against running code.
+### What should change for users?
 
-### What already works
+An operator should be able to enable reuse for eligible batch jobs without rewriting those jobs around durable intermediate tables. Successful reuse should shorten a retry by avoiding completed producer work. Missing data, an unsupported query or a changed source should leave Spark free to recompute.
 
-The prototype runs separate producer and replacement driver JVMs. A real source adapter and native shuffle provider exercise exact read certification, accepted-map publication, persistent discovery, local scheduler adoption and provider-native reads. GitHub Actions passed the original flow and two AQE modes: full reducers and actual reducer coalescing. Positive replacements launched zero producer map tasks; injected loss and expiry caused recomputation with correct results.
+The feature should be optional. Applications that do not enable it, and connectors that do not support read certification, should continue to behave as they do today.
 
-These are mechanism results from a small single-host fixture, not a claim of production readiness or a measured economic benefit. The feature is explicitly wired by the experimental harness; ordinary Spark queries do not automatically discover or reuse exchanges.
-
-**Reading guide:** This proposal describes the product direction and risks. The [implementation and evidence companion](spip-design-evidence.md) contains actual API excerpts, lifecycle diagrams, limits, test results and source links. Both describe the same implementation baseline.
+The rest of this proposal sets out an initial scope, the responsibilities Spark would take on and the questions that need community input. The accompanying [design notes](spip-design-evidence.md) describe the source, provider and scheduler contracts in more detail.
 
 <!-- pagebreak -->
 
 ## Q2. What problem is this proposal NOT designed to solve?
 
-It does not restore a SparkSession, driver heap or arbitrary application continuation. It does not select an older source snapshot, recover incomplete exchanges, checkpoint writes or streaming state, or replace remote shuffle storage. General cross-query caching and arbitrary result delivery are outside the initial discussion scope.
+This work concerns the output of a completed SQL exchange. It does not restore the driver's memory, resume arbitrary application code, checkpoint streaming state or recover side effects from writes. It also does not let retained data choose which source snapshot a new query reads.
 
-### Initial discussion scope and demonstrated boundary
+The initial scope is a batch read with one selected blocking shuffle exchange. Its producer consists of a certified source scan and supported deterministic filters or projections. Consumption is limited initially to a reviewed JVM row-result path. Joins, aggregates and additional stages are useful candidates for later work, but each needs a clear account of identity and recovery before admission.
 
-| Area | Scope |
-| --- | --- |
-| Query | One selected batch SQL exchange with a certified V2 read and supported deterministic scan/filter/project producer. The harness selects the exchange explicitly. |
-| Read identity | Actual planned scan and ordered mapper decomposition must match. Normal source planning errors remain errors. Changed source facts cause a miss. |
-| Planning | No active runtime filtering or grouped scan partitions. No claim that every connector or AQE rewrite is supported. |
-| Shuffle | Complete blocking row shuffle, compatible Spark revision and provider read format. Partial retained/fresh producer adoption is excluded. |
-| Consumer evidence | JVM row collection in the native fixture. Arbitrary actions, writes, shared exchanges and downstream stage graphs need separate admission and recovery review. |
-| AQE evidence | Full-reducer and contiguous coalesced-reducer reads passed. Skew, mapper-local, pipelined and push-merged adoption are not established. |
-| Deployment | Trusted experimental deployment with explicit recovery group, manifest root and provider access. Production identity and authorization integration remain work. |
+Full-reducer reads and contiguous ranges of complete reducers are the first AQE targets. Skew-split, mapper-local, pipelined and push-merged reads have different requirements and are outside this initial scope. Writes, streaming, arbitrary callbacks and shared exchange consumers are also excluded from the first upstream integration.
 
-These boundaries distinguish the tested flow from a general automatic SQL optimizer rule. The prototype has source/producer checks; it does not implement an exhaustive consumer-admission framework for arbitrary applications.
+The intended use is retry recovery. Reusing work between independently submitted queries would raise a separate policy question. An operator-defined recovery group can organize records, but cannot by itself prove that two applications are retries of the same submission.
 
 ## Q3. How is it done today, and what are the limits of current practice?
 
-Spark can recompute lost shuffle output inside an application. External shuffle services, decommissioning and remote storage improve byte survival. A separately planned replacement driver still lacks proof that earlier bytes are the output of its own current exchange.
+Spark tracks shuffle output and recomputes missing partitions during an application's lifetime. External shuffle services and remote storage can extend the lifetime of the bytes. A replacement driver, however, starts with new dependencies and a newly planned query. It cannot treat the previous driver's local shuffle ID as evidence that the old output belongs to its current computation.
 
-Explicit intermediate tables or files provide a durable application checkpoint today. They remain the more general solution, but require application changes and lifecycle choices. This proposal explores a transparent optimization at a narrower boundary.
+Applications can solve this explicitly by writing intermediate tables or files. That is often the right choice, especially when the checkpoint must survive changes to application code or support several consumers. It also requires the application to manage intermediate storage, cleanup and snapshot semantics.
 
-[SPARK-25299](https://issues.apache.org/jira/browse/SPARK-25299) and [SPARK-54327](https://issues.apache.org/jira/browse/SPARK-54327) address remote shuffle storage. Their storage and integration direction should inform this work. The additional question here is semantic equivalence across driver attempts. `ShuffleDataIO` provides sort-shuffle storage hooks; it does not itself certify SQL equivalence or decide whether a replacement dependency may skip map submission.
+[SPARK-25299](https://issues.apache.org/jira/browse/SPARK-25299) and [SPARK-54327](https://issues.apache.org/jira/browse/SPARK-54327) address remote shuffle storage. This proposal depends on suitable retention rather than replacing that work. The additional responsibility is deciding whether a newly planned exchange may use retained output and coordinating that decision with map submission.
+
+`ShuffleDataIO` and external shuffle implementations provide important storage integration points. They do not, on their own, establish SQL equivalence across driver attempts. The final extension interface should fit the direction of that work rather than create a competing storage API.
 
 <!-- pagebreak -->
 
 ## Q4. What is new in your approach and why do you think it will be successful?
 
-The proposed addition is a Spark-owned proof-and-adoption boundary. It combines source certification, canonical producer identity, complete publication and a scheduler decision. Preserved bytes alone are insufficient.
+The approach separates a question only Spark and the source can answer—whether the computation is the same—from a question the shuffle provider can answer—whether its completed output can still be read.
 
-![Responsibilities in the implemented prototype](spip-assets/architecture.png)
+![Source, SQL, discovery and scheduler responsibilities](spip-assets/architecture.png)
 
-### Ownership and invariants
+The source adapter describes the actual planned read. Spark combines those facts with a canonical description of the supported producer, its output schema, mapper decomposition, partitioning and format. A manifest records that identity alongside the retained materialization. Discovery compares the complete identity before a provider claim is prepared.
 
-1. **The current read is authoritative.** Source resolution happens normally. Certification describes the same scan and partition objects the producer will execute; it cannot reconstruct an old read from the retained artifact.
-2. **Spark owns computation identity.** Supported operators, expressions, output types, partitioning, source facts and compatibility settings enter a bounded encoding. Discovery compares the complete canonical payload, not just its lookup digest.
-3. **The provider owns native bytes.** It seals the accepted map attempts and supplies an opaque descriptor and independent read lifecycle. Spark does not require the native provider to expose local index files.
-4. **Spark owns map suppression.** Provider preparation precedes the local scheduler hook. Installation requires the current reservation, exact dependency and no existing map outputs. Otherwise ordinary execution wins.
-5. **Failure invalidates the adopted exchange.** The native path fences its binding, clears retained tracker state and enters Spark's fetch-failure/recomputation machinery. It does not silently mix fresh producer outputs into a still-adopted generation.
+The scheduler then makes a local decision. It can install the prepared reader binding and mark the dependency's producer output available, provided the reservation is current and ordinary map output has not already been accepted. Otherwise the dependency follows normal execution. Provider calls must finish before this scheduler operation.
 
-### Integration that exists today
+This leaves ownership in familiar places. Connectors describe reads. SQL describes the computation. The shuffle provider retains and serves bytes. Core decides whether work can be skipped and how failures affect dependent stages.
 
-The prototype uses an immutable filesystem manifest store and tracker-backed availability. Native reads are selected through the configured manager's wrapped shuffle handle. An opt-in preparation tag follows an exchange through AQE stage transformations; the final exchange is certified and prepared before map-stage submission.
+### Why require such a strict match?
 
-This reuses existing query-stage materialization and scheduler recovery. Upstream review should assess whether these boundaries provide sufficient isolation and maintainability for the initial workload.
+A query can look unchanged while its input has advanced, its mapper layout has changed or a setting changes expression evaluation. A query-text hash or source snapshot ID alone is insufficient. The first implementation should accept only expressions and source properties whose contribution to identity has been reviewed.
 
-The source and provider contracts are generic. Iceberg and Celeborn are concrete integration examples used to test them, not requirements of the proposed Spark mechanism.
+A missed reuse opportunity costs another computation. An incorrect match can change a result. That tradeoff favors conservative admission, particularly while connector contracts are being established.
+
+### AQE and recovery
+
+Preparation belongs to the exchange that AQE actually materializes, after stage transformations. Existing map-stage completion can then supply statistics and allow AQE to choose supported reducer ranges. The retained reader remains behind the configured shuffle implementation.
+
+If retained data becomes unavailable, Spark must invalidate the whole adopted binding before recomputation. The proposed integration uses the existing fetch-failure and stage-retry machinery. Consumer admission must respect what that machinery can safely recover; this proposal does not assume that arbitrary user-visible results or side effects can be rolled back.
 
 <!-- pagebreak -->
 
 ## Q5. Who cares? If you are successful, what difference will it make?
 
-Operators whose expensive batch applications are retried after driver loss could avoid repeating eligible producer work while its complete shuffle remains available. Savings depend on real driver-retry frequency, source stability, retention lifetime and how much of the retry cost precedes the exchange.
+The likely beneficiaries are operators of expensive batch jobs that are resubmitted after driver loss while their shuffle output survives. The saving is the producer work that would otherwise be repeated. It may matter even when retries are uncommon, if the producer is costly and retention is already available.
 
-### Verified mechanism evidence
+There are also cases where this will add little value. A changed source may invalidate the match. Most of the job's cost may occur after the exchange. Retention may expire before the retry begins. Or the application may already use an explicit checkpoint that provides a better recovery boundary.
 
-The [native proof run](https://github.com/unikdahal/spark/actions/runs/34881546887) tested Spark commit `ab0052497c019d047fee2bea4b2dba1674ae5db4`. Each mode ran 13 independent driver invocations covering normal execution, publication, replacement, concurrent claims, misses and failures.
+The relevant measure is therefore the cost of eligible work across real retry incidents, not simply the number of queries that can match. Evaluation should include the cost of publication, discovery, retained storage and failed adoption. First attempts and all-miss retries matter as much as successful hits when deciding whether operators should enable the feature.
 
-| Replacement flow | Result rows | Producer map tasks | Native remote bytes | Actual AQE result |
-| --- | ---: | ---: | ---: | --- |
-| AQE disabled | 32 | 0 | 730 | Ordinary reader |
-| AQE full reducers | 32 | 0 | 730 | Final adaptive plan |
-| AQE coalesced | 32 | 0 | 730 | One merged reducer range |
-
-Every invocation produced the baseline result digest. Source changes and missing manifests recomputed. Artifact loss and lease expiry after adoption produced fetch failures, ran fresh producer work and returned the correct result. The [experimental CI run](https://github.com/unikdahal/spark/actions/runs/34881536279) also passed focused Core, SQL/AQE, source conformance and lint/license checks.
-
-The fixture uses one host, `local[2]`, one source mapper and four reducers. Independent driver JVMs demonstrate the cross-driver boundary, but are not a multi-host deployment. The run proves native reuse and selected fallback behavior; it does not establish speedup, broad query eligibility or production security.
-
-### Evidence to establish value
-
-Seek representative driver-retry incidents from independent operating environments. For each, report eligible producer cost as well as eligible query count, with ordinary AQE and source settings left visible. Include misses caused by changed reads, layout, unsupported expressions and expired retention.
-
-Measure producer work avoided, discovery/preparation delay, first-attempt publication cost, retained storage, hit probability and failed-adoption cost. A single hit timing is not a workload-level benefit. No measured speedup or release threshold is claimed in this proposal.
-
-If this bounded mechanism captures little real retry cost, prefer ordinary recomputation or explicit checkpoints. The working prototype makes the experiment possible; it does not predetermine that Spark should carry the maintenance cost.
-
-<!-- pagebreak -->
+Feedback from operators would help choose the initial workload. Useful examples include the query plan, the point at which the driver was lost, the amount of surviving shuffle data and the producer time repeated on resubmission. Source and AQE settings should be left visible rather than adjusted to make a query eligible.
 
 ## Q6. What are the risks?
 
-| Risk | Current treatment and review needed |
-| --- | --- |
-| Incomplete semantic identity | Closed producer encoding and exact source binding reject unsupported cases. Connector truth remains a correctness assumption; source and expression coverage require review. |
-| Shared dependency or consumer state | Availability is tracker-backed and dependency-scoped. General exchange reuse, simultaneous consumers and arbitrary downstream graphs are not established by the single-exchange fixture. |
-| Loss after consumption starts | Existing fetch-failure and whole-stage retry machinery is used. Native tests inject faults after adoption, before reading; they do not prove every partial-result or side-effect boundary. |
-| AQE statistics | Captured map sizes are scheduling estimates. Adopted SQL row count is unknown, avoiding a false empty-result inference. Broader statistics-driven rewrites require validation. |
-| Access across applications | The PoC uses a trusted manifest root and provider control plane. Recovery-group strings are not authenticated retry credentials. Multi-tenant authorization and encryption need deployment design and tests. |
-| Metadata and overhead | Bounded records and work queues constrain the prototype. Split metadata and map/reducer estimates remain size-limited; preparation may delay map submission. Large-scale cost is unmeasured. |
-| Provider lifetime | Claims and renewal fence local reads; owner restart and expiry are tested. General durable revocation, known-bad artifact handling and service failover need review. |
+The largest correctness risk is an incomplete identity. The source adapter is trusted to describe the read accurately, and Spark is responsible for including the semantics of every admitted producer expression. Hashing cannot compensate for missing facts.
 
-### Compatibility and security boundary
+The largest integration risk is recovery after consumption has begun. A retained exchange must not leave a stale reader active while fresh output is substituted underneath it. Shared dependencies and result delivery need particular attention because their effects extend beyond the producer stage.
 
-Existing applications and connectors continue normally without experimental wiring. This is not a stable public API, and the proposal does not ask to add an obligatory method to Data Source V2 `Batch` or to stabilize the private shuffle-manager interface.
+There is also a maintenance question. If the useful workload is too narrow, or requires extensive changes throughout the scheduler and AQE, ordinary recomputation may remain the better choice. Workload evidence and review of the recovery boundary should guide how far the feature proceeds.
 
-The identity includes the Spark build revision and provider format. Cross-version compatibility is not promised; build provenance and connector format discipline remain necessary. A digest is neither authorization nor confidentiality. The manifest can contain sensitive source metadata and must be protected along with retained data.
+The design notes cover these risks at the contract level. The initial release should stay within the source and consumer shapes that can be both explained and tested convincingly.
 
-Current source access is resolved independently of reuse. That does not automatically authorize reading retained bytes from another application. Before production enablement, the configured provider and manifest store need a coherent access policy. The native fixture disables application I/O encryption and does not validate secure cross-attempt key management.
+<!-- pagebreak -->
 
-The initial product direction is opt-in recovery with ordinary recomputation on an unavailable or incompatible candidate. Normal source errors and Spark failures are not guaranteed to become successful retries. Side-effecting consumers must not be admitted on the strength of this PoC.
+## Access, compatibility and operational cost
+
+A compatible manifest is not permission to read retained data. The replacement must resolve its source under current authorization, and the provider must separately authorize access to retained output. The manifest store also needs access controls because canonical identities can contain sensitive source metadata.
+
+Recovery groups and generations organize attempts and discovery. Production integration must decide who assigns them and how they relate to an authorized retry. There is no need to standardize a new submission controller in this proposal, but a user-provided group name must not be mistaken for an authenticated identity.
+
+Encryption needs the same care. A provider must have a secure way to authorize reads across attempts; copying an earlier application's secret into a manifest is not an acceptable substitute. A deployment without that capability should recompute.
+
+### Compatibility
+
+The first implementation should require matching Spark build and execution-format identities. Connectors and providers must version the facts and descriptors they contribute. Unknown formats, unsupported settings and unrecognized expressions should decline reuse. Cross-version reuse can be considered separately once the compatibility contract is established.
+
+All extension surfaces should remain internal or experimental initially. Existing `Batch` implementations should not acquire an obligatory certification method, and this work should not implicitly make private shuffle-manager APIs stable. Sources and providers that do not participate must retain ordinary behavior.
+
+### Resource use
+
+Identity construction, discovery and publication must have explicit size and work limits. Retained data needs quotas and expiry. Preparation can add delay before maps start, so the lookup budget must be measured on misses as well as hits. Keeping provider calls off the scheduler thread is necessary, but does not by itself make the feature inexpensive.
+
+Operators need enough diagnostics to distinguish an unsupported query, a changed read, a missing artifact and a failed retained read. Routine logs should avoid exposing certificates, sensitive predicates or credentials. Disabling reuse should prevent new adoption while allowing existing readers to complete or be cancelled through their normal lifecycle.
+
+The desired operational behavior is straightforward: reuse completed work when the required checks succeed, and remain able to compute from the current source when they do not.
 
 <!-- pagebreak -->
 
 ## Q7. How long will it take?
 
-The mechanism prototype and native AQE validation are complete for the recorded fixture. Upstream delivery still requires product feedback and Core, SQL and shuffle review. There is no committed release date or maintainer sponsorship.
+I will drive the implementation and discussion, but a release estimate depends on agreement about the initial workload and the Core/SQL integration. The work can be divided into source identity, publication and discovery, scheduler adoption, and SQL/AQE integration. Each should be reviewable on its own, with tests for the boundary it changes.
 
-The author will drive the discussion and follow-up implementation. Work should proceed in independently reviewable increments rather than merge the fork wholesale.
+The first discussion should settle whether the expected benefit justifies the feature and whether the proposed ownership fits Spark's shuffle architecture. Source and shuffle maintainers can then help refine the extension contracts. Scheduler review should happen before broadening consumer support, because recovery behavior is likely to determine the practical scope.
 
-| Increment | Deliverable |
-| --- | --- |
-| Community direction | Agree whether real retry cost warrants this mechanism and which initial workload should be supported. Identify maintainers and a PMC shepherd if proceeding formally. |
-| Contract review | Review source identity, manifest trust, provider capability placement, scheduler installation and the supported consumer/AQE boundary against the current code. |
-| Upstream implementation | Separate canonical identity/source binding, publication/discovery, native adoption and SQL wiring into reviewable changes with targeted tests. |
-| Deployment validation | Exercise distributed executors, authorization/encryption, larger metadata, service failures and representative workloads before broader enablement. |
+Distributed failure testing, production access controls and workload measurements are prerequisites for general enablement. They should be planned alongside implementation rather than treated as documentation work at the end.
 
 ## Q8. What are the mid-term and final exams to check for success?
 
-### Mid-term: reproducible correctness and useful opportunity
+At the mid-point, a replacement application should be able to reuse a complete exchange, launch no producer map tasks and return the same result as recomputation. Changing a certified source fact, an admitted expression's meaning or the output format must prevent reuse. Competing map submission and adoption must have one outcome, and stale failures must not invalidate a newer binding.
 
-A reviewer should be able to inspect one exact candidate, reproduce a retained hit and observe zero producer map tasks, correct results and native byte reads. Identity changes must miss. Adoption races and unavailable data must enter the intended fallback without accepting incompatible outputs. The recorded CI runs provide a starting point, not exhaustive conformance.
+Recovery tests should cover loss before reading and during consumption, lease expiry, cancellation and provider restart. The supported AQE reader shapes must be exercised through actual adaptive planning, including reducer coalescing. A flag saying AQE is enabled is not enough.
 
-In parallel, establish cost-weighted opportunity from real retry incidents. Report the excluded queries and configurations. Do not tune the cohort until only the demonstration query remains.
+Before release, the feature needs distributed execution tests, a reviewed authorization model, bounded behavior at large partition counts and a clear account of consumer recovery. Performance evaluation should show net savings for representative retry workloads without unacceptable overhead on ordinary execution or misses.
 
-### Final: a maintainable, deployable improvement
+No numerical speedup is promised here. If the eligible producer cost is too small to offset storage and coordination, the feature should not be enabled merely because reuse is technically possible.
 
-Require an agreed consumer and source envelope, distributed failure coverage, reviewed access controls, bounded resource behavior and measured net benefit over recomputation. Confirm that disabled behavior remains unchanged and misses impose acceptable cost. Release decisions follow Spark's normal review and testing process.
+### Where feedback would help most
 
-The community can stop or narrow the proposal if benefit is weak or integration costs are disproportionate. Exact sample counts and performance thresholds belong in a prospective evaluation plan rather than the API contract.
-
-### Current review request
-
-Feedback is most useful on workload demand, the tracker/handle adoption boundary, supported AQE readers, source certification and provider/manifest ownership. The next step is discussion, not a formal acceptance vote.
+I would particularly welcome concrete retry workloads and review of three choices: the source's exact-read contract, tracker-backed adoption through the configured shuffle reader, and the consumer scope that existing stage recovery can safely support. Those choices will determine whether this can become a useful and maintainable Spark feature.
 
 <!-- pagebreak -->
 
-## Appendix A. Proposed API changes
+## Appendix A. API direction
 
-The current code uses private integration surfaces. Their names are useful anchors for review, not proposed stable public signatures.
+The source boundary associates certified read facts with the actual planned batch and its ordered partitions. The provider boundary seals accepted map attempts and prepares a retained reader. The scheduler boundary installs or invalidates that reader using only local state.
 
-| Surface | Role |
-| --- | --- |
-| `ShuffleRecoverySourceBinding` | Associates source facts with the exact planned batch scan and ordered partitions. |
-| `ShuffleRecoveryCertifiedBatchInputs` | Produces canonical identity inputs for the actual exchange. |
-| `ShuffleRecoveryNativePublicationProvider` | Seals scheduler-accepted attempts into provider-native output. |
-| `ShuffleRecoveryManifestStore` | Persists immutable records and finds earlier compatible candidates. |
-| `ShuffleRecoveryNativeInstallation` | Exposes local install/invalidate operations and deferred provider cleanup. |
-| `ShuffleRecoverySchedulerBackend` | Hooks adoption and invalidation into map selection and fetch-failure handling. |
-| `ShuffleRecoveryExchangePreparation` | Prepares the final AQE exchange before map-stage submission. |
-
-For example, the implemented provider publication contract is:
-
-```scala
-trait ShuffleRecoveryNativePublicationProvider {
-  def compatibilityId: String
-  def seal(
-      shuffleId: Int,
-      acceptedAttempts: Vector[ShuffleRecoveryMapAttempt]): Vector[Byte]
-}
-```
-
-Visibility annotations are omitted in this excerpt; the actual trait is `private[spark]`. The companion states preconditions and failure behavior. No new public `Batch` method or provider-owned discovery service is required by this draft.
+The [design notes](spip-design-evidence.md) include concrete signatures for these responsibilities and explain their preconditions, ownership and failure behavior. They are a basis for interface review, not a request to stabilize the current private class names.
 
 ## Appendix B. Design sketch
 
-Publication captures accepted map attempts, seals native output, rechecks the winner selection and publishes a manifest. Replacement preparation independently certifies the new exchange, compares full identity, obtains a provider claim and offers a local installation.
+The producer publishes only after the full accepted map selection is available. Native output is sealed, the selection is checked again, and an immutable manifest is made discoverable.
 
-Before missing-map selection, the scheduler verifies the reservation and dependency, installs the native handle binding and replaces empty tracker availability. AQE uses the existing map-stage statistics path. On a native fetch failure, the binding and adopted tracker registration are invalidated, the epoch advances and a whole-stage retry marker feeds existing scheduler recovery.
+A replacement independently plans its read and builds its computation identity. It finds an earlier compatible record, prepares a provider claim and offers the binding against the current dependency. Before missing-map selection, Spark either installs it or submits ordinary work.
 
-The companion diagrams these transitions and identifies what is tested versus still requiring upstream review. The sketch and API excerpts refer to the tested code.
-
-<!-- pagebreak -->
+Retained availability is represented in the dependency's tracker state, while actual reads use the configured provider's handle. An adopted-read failure fences that binding, clears its tracker availability and advances the epoch before entering stage recovery. AQE materializes the final exchange through the existing query-stage path.
 
 ## Appendix C. Alternatives considered
 
-| Alternative | Tradeoff |
+| Alternative | Reason to prefer or avoid it |
 | --- | --- |
-| Always recompute | Simplest maintenance and no new persistent trust boundary. Prefer this when retained-hit opportunity is too small. |
-| Explicit durable checkpoint tables/files | More general and application-controlled. Requires changes to the application and storage lifecycle; remains appropriate outside the narrow exchange scope. |
-| Recover only inside the shuffle provider | Preserves native bytes but cannot independently establish current SQL semantics or decide whether Spark may omit a map stage. |
-| Use query text, plan hash or snapshot ID alone | Insufficient: source read semantics, mapper layout, expression behavior, partitioning and format may differ. |
-| Restore a driver/session | Much broader problem involving arbitrary state and side effects. Not necessary to test completed-exchange adoption. |
-| Design a general semantic cache first | Expands sharing, policy and lifecycle obligations. Retry-driven reuse is the product motivation; strict authenticated lineage is not yet enforced by the PoC. |
-| Replace the current scheduler path with a new retained-stage subsystem | Could offer different isolation, but its cost and need are unproven. Review the working tracker/handle approach first. |
+| Ordinary recomputation | Lowest complexity. Prefer it when retries or eligible producer costs are small. |
+| Explicit intermediate tables/files | More general and application-controlled, but requires application and lifecycle changes. |
+| Provider-only recovery | Can preserve bytes; cannot establish current SQL semantics or decide whether Spark may omit maps. |
+| Query or snapshot hash alone | Omits source, expression, layout or format facts needed for a safe match. |
+| Driver-state recovery | Solves a much broader problem than reuse of one completed exchange. |
 
-### Questions for community discussion
+### References
 
-- Which real driver-retry workloads have enough retained producer cost to justify this feature?
-- Can the existing tracker-backed adoption and fetch-failure path be maintained with a clearly bounded consumer scope?
-- Are source certification and provider publication the right extension boundaries, and how should manifest trust be integrated with deployment authorization?
-- Which AQE and downstream shapes should be the first upstream target beyond the demonstrated full/coalesced reader flow?
-
-### References and package
-
-- [Official SPIP process and template](https://spark.apache.org/improvement-proposals.html). This document follows its questions; no formal SPIP ticket or approval is implied.
-- [SPARK-25299: remote shuffle storage](https://issues.apache.org/jira/browse/SPARK-25299) and [SPARK-54327: remote-storage proposal](https://issues.apache.org/jira/browse/SPARK-54327).
-- [Current Spark fork at the tested implementation](https://github.com/unikdahal/spark/tree/ab0052497c019d047fee2bea4b2dba1674ae5db4).
-- [Native proof and artifacts](https://github.com/unikdahal/spark/actions/runs/34881546887); [focused implementation CI](https://github.com/unikdahal/spark/actions/runs/34881536279).
-- [Implementation and evidence companion](spip-design-evidence.md): API contracts, source links, AQE and failure behavior, measured controls and remaining gaps.
-
-The purpose of circulation is to obtain workload and maintainer feedback on the implemented direction. Production enablement and final interface choices remain subject to that review.
+[SPIP process and template](https://spark.apache.org/improvement-proposals.html); [SPARK-25299](https://issues.apache.org/jira/browse/SPARK-25299); [SPARK-54327](https://issues.apache.org/jira/browse/SPARK-54327); [design notes](spip-design-evidence.md).
