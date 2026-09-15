@@ -8,13 +8,13 @@ When a batch application's driver fails after an expensive shuffle has finished,
 The proposal is to resolve the new query's sources normally, compare a certified description of the read and producer with a retained exchange, and let the scheduler skip the producer maps only when the match and provider claim succeed. Otherwise Spark computes normally. Storage stays with the configured shuffle provider.
 
 I've written up the proposal here:
-https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/docs/shuffle-recovery/experimental/spip-proposal.pdf
+https://github.com/unikdahal/spark/blob/shuffle-reuse-spip-discussion/docs/shuffle-recovery/experimental/spip-proposal.pdf
 
-The accompanying design notes cover source identity, publication, scheduler adoption, AQE and failure handling:
-https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/docs/shuffle-recovery/experimental/spip-design-evidence.pdf
+The proposal includes source, publication, discovery and reader-installation contracts with their Spark integration points. The companion specifies identity scope, admission rules, state transitions, failure outcomes, limits and conformance tests:
+https://github.com/unikdahal/spark/blob/shuffle-reuse-spip-discussion/docs/shuffle-recovery/experimental/spip-design-evidence.pdf
 
 Editable Word files and Markdown are linked from:
-https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/docs/shuffle-recovery/experimental/spip-draft.md
+https://github.com/unikdahal/spark/blob/shuffle-reuse-spip-discussion/docs/shuffle-recovery/experimental/spip-draft.md
 
 I'd start with a narrow batch SQL path: a certified scan with deterministic filters/projections, one completed blocking exchange, and a reviewed result consumer. Full and coalesced reducer reads are the first AQE targets. Writes, streaming and more complicated consumer graphs would need separate work.
 

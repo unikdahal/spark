@@ -20,7 +20,7 @@ An operator should be able to enable reuse for eligible batch jobs without rewri
 
 The feature should be optional. Applications that do not enable it, and connectors that do not support read certification, should continue to behave as they do today.
 
-The rest of this proposal sets out an initial scope, the responsibilities Spark would take on and the questions that need community input. The accompanying [design notes](spip-design-evidence.md) describe the source, provider and scheduler contracts in more detail.
+The rest of this proposal sets out an initial scope, the responsibilities Spark would take on and the questions that need community input. The accompanying [design contracts](spip-design-evidence.md) describe the source, provider and scheduler contracts in more detail.
 
 <!-- pagebreak -->
 
@@ -90,7 +90,7 @@ The largest integration risk is recovery after consumption has begun. A retained
 
 There is also a maintenance question. If the useful workload is too narrow, or requires extensive changes throughout the scheduler and AQE, ordinary recomputation may remain the better choice. Workload evidence and review of the recovery boundary should guide how far the feature proceeds.
 
-The design notes cover these risks at the contract level. The initial release should stay within the source and consumer shapes that can be both explained and tested convincingly.
+The design contracts cover these risks at the contract level. The initial release should stay within the source and consumer shapes that can be both explained and tested convincingly.
 
 <!-- pagebreak -->
 
@@ -142,11 +142,119 @@ I would particularly welcome concrete retry workloads and review of three choice
 
 <!-- pagebreak -->
 
-## Appendix A. API direction
+## Appendix A. Extension contracts and placement
 
-The source boundary associates certified read facts with the actual planned batch and its ordered partitions. The provider boundary seals accepted map attempts and prepares a retained reader. The scheduler boundary installs or invalidates that reader using only local state.
+These are the proposed initial boundaries. Signatures use the existing private types to make ownership and integration concrete. Visibility remains internal during initial upstream development; changing a name does not change the obligations below.
 
-The [design notes](spip-design-evidence.md) include concrete signatures for these responsibilities and explain their preconditions, ownership and failure behavior. They are a basis for interface review, not a request to stabilize the current private class names.
+| Contract | Location in Spark | Caller and responsibility |
+| --- | --- | --- |
+| Source binding | SQL: `execution.exchange` | A source adapter supplies facts for the actual `BatchScanExec`; SQL validates its association with planned partitions. |
+| Computation identity | SQL builder; Core value/codec types | SQL encodes the admitted producer. Core stores and compares an immutable canonical payload. |
+| Publication and discovery | Core: `org.apache.spark.shuffle` | A driver listener captures accepted attempts. A bounded worker seals output and commits the manifest. |
+| Native installation | Core: `org.apache.spark` | The configured blocking shuffle implementation prepares a reader; the scheduler alone installs or invalidates it. |
+| AQE preparation | SQL: `ShuffleExchangeExec` | Prepare the actual materialized exchange before its map-stage submission. |
+| Recovery | Core: `ShuffleMapStage` and `DAGScheduler` | Clear retained availability and apply stage recovery before accepting fresh output. |
+
+### Source-to-SQL handoff
+
+```scala
+def bind(
+    plan: BatchScanExec,
+    protocolId: String,
+    protocolVersion: Int,
+    certificate: Array[Byte],
+    certifiedPartitions: Vector[(InputPartition, Array[Byte])])
+    : Either[ShuffleRecoveryMissReason, ShuffleRecoverySourceBinding]
+```
+
+The adapter must supply the executed scan's partition objects, in order, together with immutable descriptors. SQL copies the bytes, checks object correspondence and rejects active runtime filters, grouped partitions and incompatible decomposition. The certificate must describe the currently resolved read, including row/delete semantics and connector options. It is not a table locator or authorization token.
+
+`ShuffleRecoveryCertifiedBatchInputs.build(exchange, binding, providerReadFormatId)` then either returns canonical inputs or an eligibility rejection. Source-planning exceptions propagate. An unsupported expression is a reuse miss, not permission to substitute a weaker identity. The binding must still be current when the final exchange is prepared.
+
+<!-- pagebreak -->
+
+## Appendix A, continued: publication and discovery
+
+```scala
+trait ShuffleRecoveryNativePublicationProvider {
+  def compatibilityId: String
+  def seal(
+      shuffleId: Int,
+      acceptedAttempts: Vector[ShuffleRecoveryMapAttempt]): Vector[Byte]
+}
+```
+
+The provider receives one accepted attempt per map, in map-index order. Each attempt contains task ID, stage-attempt ID and task-attempt number. `seal` must identify exactly those native outputs and return a bounded immutable descriptor. It cannot choose a speculative loser or a newer output for the same logical map.
+
+The driver verifies tracker agreement before and after sealing. Publication proceeds only for the complete same winner set, shape and provider compatibility ID. Provider work runs on a bounded worker, outside listener and scheduler serialization. Publication failure leaves the successful ordinary computation usable; it merely removes that opportunity for later reuse.
+
+### Persistent record
+
+The manifest contains the recovery group, publishing generation and incarnation; full canonical computation identity; mapper/reducer counts; provider descriptor/version; accepted task IDs and reducer-size estimates; and publication time. Runtime dependency IDs and current reader credentials are not persistent semantic identity.
+
+The immutable store exposes:
+
+```scala
+def publish(manifest: ShuffleRecoveryManifest)
+    : ShuffleRecoveryManifestPublishResult
+
+def findCompatible(
+    recoveryGroup: String,
+    identity: ShuffleRecoveryManifestIdentity,
+    currentGeneration: Long): Option[ShuffleRecoveryManifest]
+```
+
+The body is committed before the discovery reference. Repeating the same publication is idempotent; conflicting bytes cannot replace an existing incarnation. Lookup considers earlier generations, checks the full canonical payload and format, and treats malformed candidates as unusable. Record sizes and candidate counts are bounded before decoding or traversal.
+
+Discovery does not create a read claim. The configured provider must independently validate and authorize the descriptor, establish complete availability and prepare the current reader. A matching record with an expired or unavailable artifact is an ordinary miss. A group name and generation order records; neither authenticates retry membership.
+
+The manifest store remains separate from native byte storage. A deployment must protect both. Combining their storage later does not change Spark's ownership of identity or the provider's responsibility for authorized reads.
+
+<!-- pagebreak -->
+
+## Appendix A, continued: adoption and reader lifetime
+
+```scala
+trait ShuffleRecoveryNativeInstallation extends AutoCloseable {
+  def compatibilityId: String
+  def descriptor: Vector[Byte]
+  def location: BlockManagerId
+  def isCurrent: Boolean
+  def install(): Boolean
+  def invalidate(): Unit
+}
+```
+
+The prepared installation belongs to one local reservation and exact dependency. `isCurrent`, `install` and `invalidate` perform no provider I/O. `invalidate` is idempotent and fences the installed handle locally. `close` releases provider resources outside the scheduler thread. Ownership transfers when an installation is offered, including rejected offers.
+
+At `beforeFindMissingPartitions`, Core checks the reservation, dependency, shape, empty ordinary tracker registration and current claim. Adoption commits only after handle installation and replacement of that expected tracker status succeed. Core records the binding and advances the tracker epoch before missing-map selection. An unsuccessful commit fences/releases the installation and leaves ordinary maps eligible.
+
+The data path uses the configured shuffle implementation's reader entry point:
+
+```scala
+def getReader[K, C](
+    handle: ShuffleHandle,
+    startMapIndex: Int, endMapIndex: Int,
+    startPartition: Int, endPartition: Int,
+    context: TaskContext,
+    metrics: ShuffleReadMetricsReporter): ShuffleReader[K, C]
+```
+
+For retained reads, the handle must resolve to the current binding. The initial contract admits all maps and a half-open interval of complete reducers; a coalesced reader opens that entire interval. The adapter validates bounds and current authorization before consumption. It must not fetch conventional blocks from the binding's synthetic address. Claims remain independent, and task completion/cancellation releases the task's reader without reviving an expired binding.
+
+### Failure outcome
+
+| Event | Required outcome |
+| --- | --- |
+| Identity/capability miss, failed preparation | Compute normally; do not install retained availability. |
+| Ordinary execution or cancellation wins | Reject late offers and release their claims. |
+| Current retained read fails | Fence the binding, clear adopted status, advance the epoch and enter whole-stage recovery. |
+| Stale failure or completion | Do not alter or complete a newer generation. |
+| Consumer cannot be recovered safely | Abort under Spark's stage recovery rules; do not claim arbitrary result rollback. |
+
+The detailed state transitions, admission grammar, limits and conformance cases are in the companion. These are required integration properties, not evidence that arbitrary actions are already eligible.
+
+<!-- pagebreak -->
 
 ## Appendix B. Design sketch
 
@@ -168,4 +276,4 @@ Retained availability is represented in the dependency's tracker state, while ac
 
 ### References
 
-[SPIP process and template](https://spark.apache.org/improvement-proposals.html); [SPARK-25299](https://issues.apache.org/jira/browse/SPARK-25299); [SPARK-54327](https://issues.apache.org/jira/browse/SPARK-54327); [design notes](spip-design-evidence.md).
+[SPIP process and template](https://spark.apache.org/improvement-proposals.html); [SPARK-25299](https://issues.apache.org/jira/browse/SPARK-25299); [SPARK-54327](https://issues.apache.org/jira/browse/SPARK-54327); [design contracts](spip-design-evidence.md).

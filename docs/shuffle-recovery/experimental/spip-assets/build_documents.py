@@ -44,7 +44,7 @@ from reportlab.platypus import (
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "spip-assets"
 PUBLIC = (
-    "https://github.com/unikdahal/spark/blob/completed-shuffle-reuse-discussion/"
+    "https://github.com/unikdahal/spark/blob/shuffle-reuse-spip-discussion/"
     "docs/shuffle-recovery/experimental/"
 )
 INK = "233248"
@@ -143,8 +143,13 @@ STYLES = {
 def table_weights(element):
     header = element.find(".//tr")
     n = len(header)
-    if "".join(header[0].itertext()) == "Surface":
+    first = "".join(header[0].itertext())
+    if first == "Surface":
         return [0.49, 0.51]
+    if first == "Contract":
+        return [0.27, 0.29, 0.44]
+    if first == "State and event":
+        return [0.28, 0.28, 0.44]
     weights = {2: [0.30, 0.70], 3: [0.35, 0.17, 0.48],
                4: [0.42, 0.17, 0.16, 0.25], 5: [0.26, 0.12, 0.17, 0.18, 0.27]}
     return weights.get(n, [1 / n] * n)
@@ -365,4 +370,4 @@ if __name__ == "__main__":
         ("Fresh execution", ["Ordinary producer", "Recomputed result"]),
     ])
     render("spip-proposal", "Completed-shuffle reuse | SPIP")
-    render("spip-design-evidence", "Completed-shuffle reuse | Design notes")
+    render("spip-design-evidence", "Completed-shuffle reuse | Design contracts")

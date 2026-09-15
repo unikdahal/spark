@@ -1,6 +1,11 @@
-# Design Notes: Completed-Shuffle Reuse
+# Design Contracts: Completed-Shuffle Reuse
 
 Unik Dahal | Companion to the SPIP discussion draft
+
+The main proposal defines the extension boundaries. Sections 1–8 explain their design;
+sections 9–13 specify identity scope, admission, transitions, limits and conformance.
+“Must” denotes a requirement for the proposed upstream feature. Private signatures are
+concrete interface sketches; they do not establish a public compatibility promise.
 
 ## 1. Establishing that a read is the same
 
@@ -246,3 +251,153 @@ Useful review questions are whether the source facts are sufficient, whether tra
 [Source and scheduler integration code](https://github.com/unikdahal/spark/tree/ab0052497c019d047fee2bea4b2dba1674ae5db4) is available in the current Spark fork for readers who want to inspect concrete signatures. The proposal's requirements and initial scope are described in the [main document](spip-proposal.md).
 
 Related work: [SPARK-25299](https://issues.apache.org/jira/browse/SPARK-25299), [SPARK-54327](https://issues.apache.org/jira/browse/SPARK-54327) and the [SPIP process](https://spark.apache.org/improvement-proposals.html).
+
+<!-- pagebreak -->
+
+## 9. Data contracts and identity scope
+
+Three identities serve different purposes and must not be interchangeable. Computation identity answers whether work is equivalent. Publication identity selects a retained incarnation. Local binding identity fences the current driver's scheduling decision.
+
+| Field | Lifetime | Meaning and comparison |
+| --- | --- | --- |
+| Canonical payload and digest | Across attempts | Versioned semantic record; full payload equality is required after digest lookup. |
+| Recovery group | Across attempts | Authorized discovery namespace; not a credential or proof of common submission. |
+| Publishing generation | Across attempts | Positive ordering value; only earlier generations are considered. Not a consistency or security epoch. |
+| Incarnation ID | Artifact lifetime | Immutable publication identity; retrying the same publication cannot change its contents. |
+| Local materialization ID | Current driver | Selected exchange and materialization attempt. Never evidence of cross-driver equivalence. |
+| Target shuffle/dependency | Current driver | Exact local dependency to which adoption may apply. A reused integer alone is insufficient. |
+| Decision version | Current driver | Single-use reservation fence. Cancellation or ordinary execution makes old offers terminal. |
+| Binding location and tracker epoch | Installed reader | Identify adopted read failures and invalidate stale metadata for this installation. |
+
+The local reservation carries the following fields:
+
+```scala
+case class ShuffleRecoveryAdoptionReservation(
+    materializationId: ShuffleRecoveryMaterializationId,
+    targetShuffleId: Int,
+    dependencyIdentity: Long,
+    decisionVersion: Long)
+```
+
+The durable record must not contain a live Spark dependency, an application object graph or a current reader's secret. Local references can be used to validate a claim against the executing plan, but cannot enter the cross-driver semantic key.
+
+### Encoding contract
+
+Every variable-length field needs framing and an encoded-length bound. The decoder validates collection sizes before allocation, rejects unknown required versions and rejects inconsistent shape fields. Lookup never loads provider classes from metadata. A provider format is chosen by configuration and compared with the record's declared format.
+
+Canonical equality includes the partitioning method and reducer count, ordered mapper descriptors, admitted producer semantics and compatibility fields. A changed partition order or duplicate count changes identity. Debug strings and Catalyst `toString` output are not an encoding contract.
+
+<!-- pagebreak -->
+
+## 10. Admission contract for the first integration
+
+Admission is required on both publication and replacement paths. Publication cannot make an unsupported producer eligible merely by attaching a source token. Replacement must independently establish all the same facts against its actual planned exchange.
+
+```text
+producer := certified batch scan
+          | filter(admitted predicate, producer)
+          | project(admitted expressions, producer)
+boundary := hash or single-partition blocking row shuffle(producer)
+reader   := all maps, reducers [start, end)
+            where 0 <= start < end <= reducerCount
+```
+
+The initial expression set is references, aliases, supported typed literals, equality/null-safe equality, ordered comparisons, boolean conjunction/disjunction/negation and null tests. Each admitted node needs a reviewed type/encoding rule. Determinism is necessary but insufficient: an unknown deterministic expression still declines. Arithmetic with context-dependent behavior, casts, UDFs and custom expressions are not admitted by implication.
+
+Execution wrappers may be removed from identity only when they preserve the encoded row semantics. Source certificates are associated with the same planned batch and partition objects. Runtime filters, grouping or a changed source decomposition invalidate that association.
+
+### Consumer and AQE checks
+
+| Check | Initial decision |
+| --- | --- |
+| JVM row collection over the selected exchange | Eligible only through the admitted pure row path. |
+| Full reducer or coalesced contiguous complete reducers | Eligible; require provider support for the entire interval. |
+| Partial mapper, skew split, mapper-local read | Decline. Reducer count alone does not establish read compatibility. |
+| Exchange reuse, several actions sharing the dependency | Decline until ownership and recovery are separately designed. |
+| Writes, callbacks, iterators, Python/Connect delivery | Decline; the result lifecycle is outside the initial contract. |
+| Descendant join, aggregate, exchange or broadcast | Decline until producer/consumer recovery has explicit admission. |
+| Unknown AQE extension or late unsupported read spec | Do not open a retained reader. Refuse adoption when knowable early; fail closed if discovered after materialization. |
+
+Source and producer checks run before preparation and again where AQE's final exchange requires revalidation. Reader bounds are checked before task submission and again by the provider reader. The initial integration must either constrain applicable adaptive rewrites to this grammar or decline that exchange. It cannot assume the final reader exists before AQE materializes the stage.
+
+This is the proposed release boundary. It deliberately does not equate an arbitrary query passing a deterministic-expression check with a recoverable action.
+
+<!-- pagebreak -->
+
+## 11. Adoption state and failure contract
+
+The state below belongs to a current local dependency. Provider lookup, sealing, claim acquisition and release are external work; only installation, fencing and tracker updates participate in scheduler serialization.
+
+| State and event | Preconditions | Transition and owner |
+| --- | --- | --- |
+| Unprepared → reserved | Admitted exchange; current target | Coordinator allocates a single-use decision version. |
+| Reserved → ready | Matching manifest; authorized, current complete claim | Provider adapter offers immutable descriptor and local installation. |
+| Reserved/ready → ordinary | Timeout, miss, cancellation or ordinary submission wins | Coordinator/scheduler makes reservation terminal; late resources are released. |
+| Ready → adopted | Exact dependency; current reservation; empty expected tracker status; live claim | Scheduler installs handle, replaces status, records binding and advances epoch. |
+| Adopted → invalidated | Current binding reports failed read, or cancellation/unregistration | Backend fences handle and clears adopted status; caches/epoch change locally. |
+| Invalidated → ordinary recovery | Whole-stage retry marker consumed | DAGScheduler applies its retry/rollback or abort decision; fresh maps do not reuse the old binding. |
+| Any terminal state + old offer/event | Reservation or binding no longer current | Ignore its state change; release any owned external resources. |
+
+A successful install is visible before missing-map selection. If handle installation succeeds but the expected tracker replacement does not, the handle must be invalidated before returning a failed adoption. A partially installed claim cannot remain readable as if map suppression had committed.
+
+### Error and ownership rules
+
+Source planning exceptions propagate unchanged. Unsupported semantics and unavailable certificates decline reuse. Malformed records, incompatible versions and unavailable claims are misses, with bounded diagnostics. A failure while sealing or publishing does not invalidate otherwise successful ordinary computation.
+
+After adoption, a native availability failure is not a discovery miss: it must identify and fence the installed binding before recovery. Corruption or a known semantic contradiction must also prevent future adoption through the provider/manifest lifecycle; local tracker clearing alone is insufficient.
+
+Success acceptance and failure processing must obey Spark's stage/task attempt rules. Old successes cannot count toward a fresh attempt. When those rules cannot undo or safely complete the admitted consumer, the action aborts. This proposal does not introduce a separate transaction around arbitrary application result handlers.
+
+Cleanup is idempotent. Its failure is recorded but cannot resurrect a fenced binding, block the event loop on provider I/O or transfer ownership back to a caller whose offer was consumed.
+
+<!-- pagebreak -->
+
+## 12. Limits, deployment defaults and conformance
+
+Initial limits should be explicit and conservative. The following values provide a concrete starting point for review; larger limits require scaling evidence rather than an unbounded fallback.
+
+| Resource | Initial bound or policy |
+| --- | --- |
+| Source partitions / split descriptor | 4,096 partitions; 64 KiB per descriptor |
+| Framed source token / canonical identity | 64 KiB token; 1 MiB complete identity |
+| Source certificate plus decomposition | 1 MiB combined budget |
+| Native descriptor / complete manifest | 5 MiB / 8 MiB |
+| Dense map/reducer estimate matrix | 131,072 cells; reject before allocation |
+| Enablement | Off unless explicitly enabled for an admitted query and configured provider/store. |
+| Lookup, publication and cleanup | Finite deadlines and bounded queues; limits must be part of configuration, not hidden unbounded retries. |
+| Retention and authorization | Provider/deployment policy; no implicit permission from a record or group name. |
+
+Configuration must cover enablement, manifest location, recovery scope, publication generation/incarnation, provider format, preparation budget and retention/claim policy. Exact user-facing names should be agreed during API review. Existing applications must not need these settings, and an unsupported capability must not prevent ordinary execution.
+
+<!-- pagebreak -->
+
+## 13. Acceptance tests for the contracts
+
+Each test must exercise the stated boundary in the supported execution path. Component tests alone do not establish the behavior of a distributed query. The following outcomes are release requirements for the admitted scope.
+
+| Test | Required observation |
+| --- | --- |
+| Exact match; changed source/expression/format/layout | Match suppresses producer maps; each change independently misses. |
+| Speculative winners; seal/publication interruption | Only the complete accepted winner set becomes discoverable; no partial record. |
+| Map submission versus prepared offer | Exactly one decision wins; the losing claim is released. |
+| Full/coalesced AQE reads; unsupported spec | Correct final ranges and results; unsupported retained read never opens. |
+| Loss/expiry with late old success and duplicate failure | Binding fenced; old output not accepted into fresh execution; correct retry or abort. |
+| Concurrent claims; owner restart; delayed renewal | Independent ownership; obsolete/expired claims cannot revive. |
+| Malformed lengths, huge metadata, false credentials | Bounded rejection without allocation explosion or unauthorized read. |
+
+Release review also requires multi-host execution, consumer-specific partial-result tests, access/encryption coverage and measured first-attempt/all-miss overhead.
+
+
+### What a successful hit must establish
+
+The replacement resolves the source independently, matches the complete canonical identity, installs a current provider claim and launches zero producer map tasks. The result must equal ordinary recomputation. Actual reader specifications and bytes read must establish that the retained provider path was used; a cache hit elsewhere is not evidence of exchange adoption.
+
+### What a successful recovery must establish
+
+The test must place the fault at a known point in the lifecycle: before installation, after installation but before reads, during an open read, or while task completion races failure processing. It must verify the old binding becomes unusable and that fresh work cannot accept old-generation completions. An expected abort is valid only where the admitted consumer's documented recovery rule requires it.
+
+### Disabled and all-miss behavior
+
+With reuse disabled, no discovery or provider claim should occur. With every lookup missing, results and source-error behavior must match ordinary execution. Measure the added delay before map submission, metadata allocation and cleanup load. With publication enabled on the first attempt, measure both successful publication cost and queue saturation behavior.
+
+Run these checks with the intended source, provider and AQE settings. Report exclusions. Every new expression, source feature, limit or consumer shape needs corresponding conformance coverage.
