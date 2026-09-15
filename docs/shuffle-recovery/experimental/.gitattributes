@@ -1,0 +1,5 @@
+# Rendered documents are binary artifacts, including ASCII-encoded PDF containers.
+spip-*.pdf binary
+spip-*.docx binary
+spip-assets/*.pdf binary
+spip-assets/*.png binary
